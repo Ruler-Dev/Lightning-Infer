@@ -19,6 +19,15 @@
 #include <stdexcept>
 #include <utility>
 
+// cicc 13.3 on Windows crashes (ACCESS_VIOLATION) on every instantiation of the fused-conv sliced-K
+// kernels below, at any optimization level. Qwen3.5 Q8 artifacts are the only users; this build
+// leaves them out and throws if one is requested.
+#if defined(_WIN32) && __CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ == 3
+#define INFERNIX_Q8_GDN_SPLITK_CONV 0
+#else
+#define INFERNIX_Q8_GDN_SPLITK_CONV 1
+#endif
+
 namespace infernix::ops::detail {
 namespace {
 
@@ -166,11 +175,13 @@ constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
 
 constexpr auto kProjectionLaunchers = make_projection_launchers(
     std::make_index_sequence<kLastProjectionExactCols - kFirstExactCols + 1>{});
+#if INFERNIX_Q8_GDN_SPLITK_CONV
 constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
     std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>{});
 constexpr auto kRecordLaunchers =
     make_record_launchers(std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>{});
 
+#endif
 } // namespace
 
 void q8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -195,6 +206,9 @@ void q8_gdn_input_splitk_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+#if !INFERNIX_Q8_GDN_SPLITK_CONV
+    throw std::runtime_error("Q8 fused GDN input snapshot is not available in a CUDA 13.3 Windows build");
+#else
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input snapshot requires T=2..16");
@@ -203,6 +217,7 @@ void q8_gdn_input_splitk_conv_snapshot_launch(
                                                initial_slot, snapshot_base_slot, query, key, value,
                                                z, stream);
     CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weight,
@@ -210,6 +225,9 @@ void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
                                             const Tensor& valid_columns, const Tensor& initial_slot,
                                             Tensor& conv_record, Tensor& query, Tensor& key,
                                             Tensor& value, Tensor& z, cudaStream_t stream) {
+#if !INFERNIX_Q8_GDN_SPLITK_CONV
+    throw std::runtime_error("Q8 fused GDN input record is not available in a CUDA 13.3 Windows build");
+#else
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input record requires T=2..16");
@@ -218,6 +236,7 @@ void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
                                              initial_slot, conv_record, query, key, value, z,
                                              stream);
     CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 } // namespace infernix::ops::detail
