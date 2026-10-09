@@ -123,10 +123,15 @@ public:
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
 
-    // Pinned host block backing HostPinned objects (e.g. the vision tower in overlay
-    // mode), exposed so the runtime can stream the weights to device staging.
-    [[nodiscard]] const PinnedHostBuffer& pinned_block() const;
-    [[nodiscard]] std::span<const std::byte> pinned_bytes_range() const;
+    // Pinned host memory backing HostPinned objects (e.g. the vision tower in overlay mode),
+    // exposed so the runtime can stream the weights to device staging. The plan's pinned
+    // offsets form one contiguous space, but it is backed by several cudaMallocHost chunks
+    // split at object boundaries: Windows refuses a single pinned allocation much above half
+    // of physical memory, and only cudaMallocHost memory is addressable by the device at its
+    // host address there (registered memory is not). pinned_address maps a plan offset range,
+    // which must lie inside one object run, to its address.
+    [[nodiscard]] bool has_pinned() const noexcept { return !pinned_chunks_.empty(); }
+    [[nodiscard]] const std::byte* pinned_address(std::uint64_t offset, std::uint64_t bytes) const;
 
     // VMM arena pool present only when the plan reserved an evictable tail.
     [[nodiscard]] EvictableWeightPool* eviction_pool() noexcept {
@@ -151,7 +156,13 @@ private:
     };
 
     std::unique_ptr<DeviceArena> arena_;
-    std::unique_ptr<PinnedHostBuffer> pinned_;
+    struct PinnedChunk {
+        std::uint64_t begin = 0; // plan offset of the chunk's first byte
+        std::uint64_t end   = 0;
+        std::unique_ptr<PinnedHostBuffer> buffer;
+        std::byte* base = nullptr; // address of plan offset `begin`
+    };
+    std::vector<PinnedChunk> pinned_chunks_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
     std::vector<ObjectStorage> objects_;
     StreamSource stream_source_;

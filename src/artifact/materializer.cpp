@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 
 namespace infernix::artifact {
 namespace {
@@ -224,15 +225,14 @@ std::vector<FileSegment> StreamSource::segments(ObjectHandle object, std::uint64
     return out;
 }
 
-const PinnedHostBuffer& MaterializedArtifact::pinned_block() const {
-    if (!pinned_) { throw ArtifactError("materialization has no pinned block"); }
-    return *pinned_;
-}
-
-std::span<const std::byte> MaterializedArtifact::pinned_bytes_range() const {
-    if (!pinned_) { return {}; }
-    return std::span<const std::byte>(static_cast<const std::byte*>(pinned_->data()),
-                                      pinned_->size());
+const std::byte* MaterializedArtifact::pinned_address(std::uint64_t offset, std::uint64_t bytes) const {
+    for (const PinnedChunk& chunk : pinned_chunks_) {
+        if (offset >= chunk.begin && offset < chunk.end) {
+            if (bytes > chunk.end - offset) { throw ArtifactError("pinned range crosses a pinned chunk"); }
+            return chunk.base + (offset - chunk.begin);
+        }
+    }
+    throw ArtifactError("pinned offset outside the pinned chunks");
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
@@ -336,8 +336,35 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                           static_cast<double>(plan.host_reserve_bytes) / gib, static_cast<double>(available) / gib);
             throw ArtifactError(message);
         }
-        out.pinned_ =
-            std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
+        // Chunks of at most kMaxPinnedChunkBytes, split between objects (an object larger than
+        // that gets a chunk of its own). Each chunk starts at a kPinnedChunkAlignment multiple of
+        // the plan space and its base is aligned the same way, so every object keeps the page
+        // phase and alignment the binder gave it.
+        constexpr std::uint64_t kMaxPinnedChunkBytes = 8ULL << 30;
+        constexpr std::uint64_t kPinnedChunkAlignment = 64ULL << 10;
+        std::vector<PinnedPlacement> order = plan.pinned_objects;
+        std::sort(order.begin(), order.end(),
+                  [](const PinnedPlacement& a, const PinnedPlacement& b) { return a.offset < b.offset; });
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+        for (const PinnedPlacement& placement : order) {
+            const std::uint64_t end = checked_add(placement.offset, placement.bytes, "pinned end");
+            if (!spans.empty() && end - spans.back().first <= kMaxPinnedChunkBytes) {
+                spans.back().second = std::max(spans.back().second, end);
+            } else {
+                spans.emplace_back(placement.offset / kPinnedChunkAlignment * kPinnedChunkAlignment, end);
+            }
+        }
+        for (const auto& [begin, end] : spans) {
+            MaterializedArtifact::PinnedChunk chunk;
+            chunk.begin  = begin;
+            chunk.end    = end;
+            chunk.buffer = std::make_unique<PinnedHostBuffer>(
+                static_cast<std::size_t>(end - begin + kPinnedChunkAlignment));
+            const auto raw = reinterpret_cast<std::uintptr_t>(chunk.buffer->data());
+            chunk.base = reinterpret_cast<std::byte*>((raw + kPinnedChunkAlignment - 1) /
+                                                      kPinnedChunkAlignment * kPinnedChunkAlignment);
+            out.pinned_chunks_.push_back(std::move(chunk));
+        }
     }
     const auto bounce =
         plan.pinned_objects.empty() ? nullptr : std::make_unique<DirectBounce>();
@@ -368,16 +395,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
         if (storage.pinned) { throw ArtifactError("duplicate pinned placement"); }
-        if (!out.pinned_) { throw ArtifactError("pinned placement without a pinned block"); }
+        if (!out.has_pinned()) { throw ArtifactError("pinned placement without a pinned block"); }
         const auto& object = reader.directory().object(placement.object);
         if (placement.bytes != object_bytes(object)) {
             throw ArtifactError("pinned placement size differs from object");
         }
         // Read straight into the pinned block: large pinned objects (expert banks) must never be
         // staged through a second Host copy or the file cache.
-        const std::span<std::byte> data(
-            static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
-            static_cast<std::size_t>(placement.bytes));
+        std::byte* const address =
+            const_cast<std::byte*>(out.pinned_address(placement.offset, placement.bytes));
+        const std::span<std::byte> data(address, static_cast<std::size_t>(placement.bytes));
         read_pinned(reader, object_offset(object), data, *bounce);
         out.stats_.read_bytes =
             checked_add(out.stats_.read_bytes, data.size(), "pinned read bytes");
@@ -385,7 +412,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         const auto divisor = read_divisor(reader, placement.object, geometry, data, out.stats_);
         storage.pinned = WeightParent{
             geometry,
-            static_cast<const std::byte*>(out.pinned_->data()) + placement.offset,
+            address,
             divisor};
         out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, placement.bytes,
                                               "pinned bytes");

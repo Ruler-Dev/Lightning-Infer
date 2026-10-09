@@ -177,14 +177,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             throw std::logic_error("overlay vision lost its evictable pool");
         }
         eviction->capture_tail_mirror(device.transfer_stream);
-        const auto pinned = backing.pinned_bytes_range();
-        if (pinned.empty()) {
+        if (!backing.has_pinned()) {
             throw std::logic_error("overlay vision requires a pinned materialization");
         }
+        bind_vision_overlay_layout(*data->vision_overlay, backing);
         overlay = VisionOverlayAssets{
             .pool         = eviction,
-            .pinned_block = pinned.data(),
-            .pinned_bytes = pinned.size(),
             .ladder_bytes = eviction->evictable_tail_bytes(),
             .layout       = std::move(*data->vision_overlay)};
     }
