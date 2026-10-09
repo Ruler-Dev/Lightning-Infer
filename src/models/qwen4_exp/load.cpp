@@ -512,11 +512,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     std::optional<qwen3_5::VisionOverlayAssets> overlay;
     if (data->vision_overlay) {
-        const auto pinned = backing.pinned_bytes_range();
-        if (pinned.empty()) { throw ArtifactError("vision offload requires a pinned materialization"); }
+        if (!backing.has_pinned()) { throw ArtifactError("vision offload requires a pinned materialization"); }
+        qwen3_5::bind_vision_overlay_layout(*data->vision_overlay, backing);
         overlay = qwen3_5::VisionOverlayAssets{.pool         = nullptr,
-                                               .pinned_block = pinned.data(),
-                                               .pinned_bytes = pinned.size(),
                                                .ladder_bytes = 0,
                                                .layout       = std::move(*data->vision_overlay)};
     }

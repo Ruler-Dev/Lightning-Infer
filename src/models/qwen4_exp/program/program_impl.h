@@ -57,6 +57,8 @@
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
+#include <cmath>
+#include <thread>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -3863,10 +3865,31 @@ private:
     // of the experts over the link).
     void measure_link() {
         double rate = options_.link_bytes_per_second;
+        if (rate <= 0.0) {
+            // INFERNIX_LINK_GBPS fixes the rate (GB/s) for machines where the probe cannot be trusted.
+            if (const char* fixed = std::getenv("INFERNIX_LINK_GBPS"); fixed != nullptr && std::atof(fixed) > 0.0) {
+                options_.link_bytes_per_second = std::atof(fixed) * 1e9;
+                rate                           = options_.link_bytes_per_second;
+            }
+        }
         const void* source = parameters_.layers.front().moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
         if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
-            rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
+            // Windows can depress host-to-device DMA to a quarter or less for a few seconds after a
+            // large pin (measured on a Ryzen 5900X + RTX 5080: 28.4 GB/s, 7.1 GB/s right after ~48 GiB
+            // were locked): probe in spaced rounds and keep the best, stopping once three rounds agree.
+            constexpr int kRounds = 16;
+            constexpr auto kGap   = std::chrono::milliseconds(250);
+            double previous       = 0.0;
+            int agreeing          = 0;
+            for (int round = 0; round < kRounds; ++round) {
+                const double r = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
+                rate           = std::max(rate, r);
+                agreeing       = previous > 0.0 && std::abs(r - previous) <= 0.03 * previous ? agreeing + 1 : 0;
+                previous       = r;
+                if (agreeing >= 2 && r >= 0.97 * rate) { break; }
+                std::this_thread::sleep_for(kGap);
+            }
         }
         if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
         link_bytes_per_second_ = rate;

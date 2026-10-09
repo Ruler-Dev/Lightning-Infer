@@ -90,6 +90,17 @@ VisionOverlayLayout make_vision_overlay_layout(const artifact::MaterializationPl
     return out;
 }
 
+void bind_vision_overlay_layout(VisionOverlayLayout& layout, const artifact::MaterializedArtifact& backing) {
+    const auto bind = [&](VisionOverlayGroup& group) {
+        for (VisionOverlaySegment& segment : group.segments) {
+            segment.pinned = backing.pinned_address(segment.pinned_offset, segment.bytes);
+        }
+    };
+    bind(layout.prelude);
+    for (VisionOverlayGroup& group : layout.layers) { bind(group); }
+    bind(layout.merger);
+}
+
 VisionOverlayLayout compute_vision_overlay_layout(const ModelWeights& weights,
                                                   const std::vector<loading::PendingWeight>& pending,
                                                   const artifact::MaterializationPlan& plan) {

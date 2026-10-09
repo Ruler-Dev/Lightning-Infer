@@ -20,9 +20,10 @@ struct PendingWeight;
 // packs pinned objects in registration order, and the converter stores the fused qkv separately
 // from each layer's other weights), so a group is a list of segments rather than one range.
 struct VisionOverlaySegment {
-    std::size_t pinned_offset  = 0;
+    std::size_t pinned_offset  = 0;  // in the materialization plan's pinned space
     std::size_t staging_offset = 0;
     std::size_t bytes          = 0;
+    const std::byte* pinned    = nullptr;  // address of pinned_offset, set by bind_vision_overlay_layout
 };
 
 struct VisionOverlayGroup {
@@ -45,8 +46,6 @@ struct VisionOverlayLayout {
 // the pool's evict()/restore() during an overlay encode.
 struct VisionOverlayAssets {
     EvictableWeightPool* pool               = nullptr;
-    const std::byte* pinned_block           = nullptr;
-    std::size_t pinned_bytes                = 0;
     std::size_t ladder_bytes                = 0;  // evictable tail a window may borrow
     VisionOverlayLayout layout;
 };
@@ -58,6 +57,9 @@ struct VisionOverlayAssets {
     const artifact::MaterializationPlan& plan, const std::vector<artifact::ObjectHandle>& prelude,
     const std::vector<std::vector<artifact::ObjectHandle>>& layers,
     const std::vector<artifact::ObjectHandle>& merger);
+
+// Resolves every segment's address in the materialized pinned chunks (after materialize()).
+void bind_vision_overlay_layout(VisionOverlayLayout& layout, const artifact::MaterializedArtifact& backing);
 
 // Resolve each vision group's contiguous byte range in the pinned block. Throws when a
 // group's objects are not all pinned or are not packed contiguously (gap beyond alignment).
