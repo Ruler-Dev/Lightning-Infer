@@ -1,5 +1,7 @@
 #include "core/vram_budget.h"
 
+#include "core/device_guard.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -155,8 +157,13 @@ public:
         const std::lock_guard<std::mutex> lock(mutex_);
         VramSnapshot out;
         std::size_t free_bytes = 0, total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
-            throw std::runtime_error("VRAM budget: cudaMemGetInfo failed");
+        {
+            // cudaMemGetInfo reports the calling thread's current device, which need not be this
+            // source's (a layer split queries every device from one thread).
+            const DeviceGuard guard(device_);
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                throw std::runtime_error("VRAM budget: cudaMemGetInfo failed");
+            }
         }
         out.device_free  = free_bytes;
         out.device_total = total_bytes;

@@ -44,7 +44,7 @@ std::size_t ProgramImpl::walk_bytes(std::uint32_t tokens, std::size_t chunks) co
 // walk span by span instead of both re-streaming every expert per call.
 std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     const std::size_t first = lane.next_call;
-    if (!expert_stream_ || residency_->frames() == 0 || walk_.active) { return first; }
+    if (!whole().expert_stream || whole().residency->frames() == 0 || walk_.span.active) { return first; }
     std::size_t end     = first;
     std::uint32_t from  = lane.state_tokens;
     std::uint32_t total = 0;
@@ -59,57 +59,58 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         if (prefix_tap_due(lane, end)) { break; }
     }
     if (end - first < 2) { return first; }
-    if (stream_lease_.valid() && walk_bytes(tokens[2], 2) > stream_walk_bytes_) {
+    if (whole().stream_lease.valid() && walk_bytes(tokens[2], 2) > whole().stream_walk_bytes) {
         // Between calls nothing reads the lease; its frames go back and come out again with the area.
-        return_stream_lease();
+        return_stream_lease(whole());
     }
-    if (!stream_lease_.valid()) {
+    if (!whole().stream_lease.valid()) {
         // Sized for the prompt's largest span: as many tokens as remain (at most the cap) in calls
         // of the configured chunk, plus a remainder call.
         const std::uint32_t remaining = std::min(lane.prefill_end - lane.state_tokens, kWalkMaxTokens);
         const std::size_t chunks      = remaining / static_cast<std::uint32_t>(chunk_) + 2;
-        if (!stream_chunk(static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
+        if (!stream_chunk(whole(), static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
                           walk_bytes(remaining, chunks))) {
             return first;
         }
     }
-    while (end - first >= 2 && walk_bytes(tokens[end - first], end - first) > stream_walk_bytes_) { --end; }
+    while (end - first >= 2 && walk_bytes(tokens[end - first], end - first) > whole().stream_walk_bytes) { --end; }
     return end - first >= 2 ? end : first;
 }
 
 void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
-    const cudaStream_t s = device_.stream;
-    walk_                = LayerWalk{};
-    walk_.lane           = index;
-    walk_.first_call     = lane.next_call;
-    walk_.end_call       = end;
-    const std::size_t n  = end - lane.next_call;
+    DeviceSegment& seg    = whole();
+    const cudaStream_t s  = seg.device->stream;
+    walk_.span            = WalkState::LayerWalk{};
+    walk_.span.lane       = index;
+    walk_.span.first_call = lane.next_call;
+    walk_.span.end_call   = end;
+    const std::size_t n   = end - lane.next_call;
     std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens), offset = 0;
     for (std::size_t c = lane.next_call; c < end; ++c) {
         const auto width = static_cast<std::int32_t>(lane.calls[c]) - begin;
-        walk_.begins.push_back(begin);
-        walk_.widths.push_back(width);
-        walk_.offsets.push_back(offset);
+        walk_.span.begins.push_back(begin);
+        walk_.span.widths.push_back(width);
+        walk_.span.offsets.push_back(offset);
         begin += width;
         offset += width;
     }
-    walk_.io_stride      = walk_align(io_layout_.bytes);
-    walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
-    walk_.layers_per_step =
+    walk_.span.io_stride      = walk_align(io_layout_.bytes);
+    walk_.span.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
+    walk_.span.layers_per_step =
         static_cast<std::uint32_t>((c_.num_hidden_layers + n - 1) / n); // about one call's work per step
-    walk_.mtp.assign(n, std::nullopt);
-    walk_.vision.assign(n, std::nullopt);
-    walk_.mtp_vision.assign(n, {});
-    walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
-    if (walk_host_.size() < n * walk_.io_stride) {
-        walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
-        walk_prefetch_ = WalkPrefetch{};
+    walk_.span.mtp.assign(n, std::nullopt);
+    walk_.span.vision.assign(n, std::nullopt);
+    walk_.span.mtp_vision.assign(n, {});
+    walk_.span.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
+    if (walk_.host.size() < n * walk_.span.io_stride) {
+        walk_.host     = PinnedHostBuffer(n * walk_.span.io_stride);
+        walk_.prefetch = WalkState::WalkPrefetch{};
     }
-    walk_.active = true;
+    walk_.span.active = true;
 
-    auto* io        = static_cast<std::byte*>(io_device_.p);
-    auto* area      = walk_area();
-    auto* host_area = static_cast<std::byte*>(walk_host_.data());
+    auto* io        = static_cast<std::byte*>(seg.io_device.p);
+    auto* area      = walk_area(seg);
+    auto* host_area = static_cast<std::byte*>(walk_.host.data());
     // A tensor (or word pointer) into the io image, moved to chunk c's copy.
     const auto rebase = [&](const void* p, std::byte* slot) -> std::byte* {
         const auto* b = static_cast<const std::byte*>(p);
@@ -119,12 +120,12 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         if (t.data != nullptr) { t.data = rebase(t.data, slot); }
         return t;
     };
-    residency_->before_round(s);
-    expert_stream_->begin(ring_span(), residency_->host_table(), s);
+    seg.residency->before_round(s);
+    seg.expert_stream->begin(ring_span(seg), seg.residency->host_table(), s);
     for (std::size_t c = 0; c < n; ++c) {
-        const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
+        const std::int32_t b = walk_.span.begins[c], w = walk_.span.widths[c];
         // Rows the previous span prefetched already stand at this chunk's slot.
-        const bool prefetched = walk_prefetched(index, walk_.first_call, c, b, w);
+        const bool prefetched = walk_prefetched(index, walk_.span.first_call, c, b, w);
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(w));
@@ -132,14 +133,14 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         }
         std::optional<execution::MtpChunk> chunk = stage_mtp_chunk(lane, index, b, w);
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
-        std::byte* host_slot = host_area + c * walk_.io_stride;
-        std::byte* slot      = area + walk_.residual_bytes + c * walk_.io_stride;
+        std::byte* host_slot = host_area + c * walk_.span.io_stride;
+        std::byte* slot      = area + walk_.span.residual_bytes + c * walk_.span.io_stride;
         if (prefetched) {
             const std::size_t rows = static_cast<std::size_t>(w) * hash_.heads() * c_.ple.table.row_bytes;
             const std::size_t tail = io_layout_.ngram + rows;
             std::memcpy(host_slot, io_host_.data(), io_layout_.ngram);
             std::memcpy(host_slot + tail, static_cast<const std::byte*>(io_host_.data()) + tail, io_layout_.bytes - tail);
-            ++walk_prefetched_chunks_;
+            ++walk_.prefetched_chunks;
         } else {
             std::memcpy(host_slot, io_host_.data(), io_layout_.bytes);
         }
@@ -152,24 +153,24 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
             if (chunk->vision != nullptr) {
                 const std::int32_t cells     = (chunk->prepend ? 1 : 0) + chunk->columns;
                 const std::int32_t subchunks = (cells + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
-                auto& copies                 = walk_.mtp_vision[c];
+                auto& copies                 = walk_.span.mtp_vision[c];
                 copies.assign(chunk->vision, chunk->vision + subchunks);
                 for (auto& input : copies) { input.columns = rebase_tensor(input.columns, slot); }
                 chunk->vision = copies.data();
             }
-            walk_.mtp[c] = *chunk;
+            walk_.span.mtp[c] = *chunk;
         }
         if (vision != nullptr) {
-            walk_.vision[c] = execution::VisionInput{vision->embeddings, rebase_tensor(vision->columns, slot)};
+            walk_.span.vision[c] = execution::VisionInput{vision->embeddings, rebase_tensor(vision->columns, slot)};
         }
         // The chunk's embedding and first layer run while the host stages the next chunk.
-        const WideWork wide(*this, w);
+        const WideWork wide(*this, seg, w);
         walk_pass(c, 0);
     }
-    walk_.next_layer = 1;
-    walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
-    ++walk_spans_;
-    walk_calls_ += n;
+    walk_.span.next_layer = 1;
+    walk_.prefetch        = WalkState::WalkPrefetch{}; // consumed; the slots now hold this span's chunks
+    ++walk_.spans_run;
+    walk_.calls_run += n;
 }
 
 std::uint64_t ProgramImpl::window_key() const noexcept {
@@ -183,7 +184,7 @@ std::uint64_t ProgramImpl::window_key() const noexcept {
 
 bool ProgramImpl::walk_prefetched(std::uint32_t index, std::size_t first_call, std::size_t c, std::int32_t begin,
                                   std::int32_t width) {
-    const WalkPrefetch& f = walk_prefetch_;
+    const WalkState::WalkPrefetch& f = walk_.prefetch;
     if (!f.valid || f.lane != index || f.first_call != first_call || c >= f.widths.size() || f.begins[c] != begin ||
         f.widths[c] != width) {
         return false;
@@ -192,18 +193,18 @@ bool ProgramImpl::walk_prefetched(std::uint32_t index, std::size_t first_call, s
     return window_key() == f.keys[c];
 }
 
-// Reads up to `chunks` more chunks of the span after the current one (calls from walk_.end_call, as
-// walk_span_end would group them) into walk_host_'s slots. Only after the span's first device
+// Reads up to `chunks` more chunks of the span after the current one (calls from walk_.span.end_call,
+// as walk_span_end would group them) into walk_.host's slots. Only after the span's first device
 // synchronization: until then its own slots may still be uploading.
 void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_t chunks) {
-    WalkPrefetch& f = walk_prefetch_;
-    if (!f.valid || f.lane != index || f.first_call != walk_.end_call) {
-        f            = WalkPrefetch{};
+    WalkState::WalkPrefetch& f = walk_.prefetch;
+    if (!f.valid || f.lane != index || f.first_call != walk_.span.end_call) {
+        f            = WalkState::WalkPrefetch{};
         f.valid      = true;
         f.lane       = index;
-        f.first_call = walk_.end_call;
+        f.first_call = walk_.span.end_call;
     }
-    const std::size_t slots = walk_host_.size() / walk_.io_stride;
+    const std::size_t slots = walk_.host.size() / walk_.span.io_stride;
     std::uint32_t tokens    = 0;
     for (const auto w : f.widths) { tokens += static_cast<std::uint32_t>(w); }
     for (std::size_t added = 0; added < chunks && !f.done; ++added) {
@@ -221,7 +222,7 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
         const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(width));
         ngram_window(lane.history, static_cast<std::int32_t>(from), static_cast<std::int32_t>(width));
-        auto* slot = static_cast<std::byte*>(walk_host_.data()) + k * walk_.io_stride;
+        auto* slot = static_cast<std::byte*>(walk_.host.data()) + k * walk_.span.io_stride;
         read_ngram_to(lane, static_cast<std::int32_t>(width), slot + io_layout_.ngram);
         f.begins.push_back(static_cast<std::int32_t>(from));
         f.widths.push_back(static_cast<std::int32_t>(width));
@@ -234,68 +235,70 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
 // Layer l of chunk c (with the embedding before layer 0, and the MTP cells and, for the prompt's
 // last chunk, the logits after the last layer).
 void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
-    const std::size_t n   = walk_.widths.size();
+    const std::size_t n   = walk_.span.widths.size();
     const std::uint32_t L = c_.num_hidden_layers;
-    const bool prompt_end = walk_.end_call == lanes_[walk_.lane].calls.size();
-    auto* area            = walk_area();
-    std::byte* slot       = area + walk_.residual_bytes + c * walk_.io_stride;
-    const std::int32_t w  = walk_.widths[c];
+    const bool prompt_end = walk_.span.end_call == lanes_[walk_.span.lane].calls.size();
+    DeviceSegment& seg    = whole();
+    auto* area            = walk_area(seg);
+    std::byte* slot       = area + walk_.span.residual_bytes + c * walk_.span.io_stride;
+    const std::int32_t w  = walk_.span.widths[c];
     execution::ForwardBatch fb = io_batch(slot, 1, w, 1);
-    fb.host_slots      = std::span<const std::int32_t>(&walk_.host_slot, 1);
+    fb.host_slots      = std::span<const std::int32_t>(&walk_.span.host_slot, 1);
     fb.host_table_rows = fb.host_slots;
-    fb.mtp_chunk       = walk_.mtp[c] ? &*walk_.mtp[c] : nullptr;
-    fb.vision          = walk_.vision[c] ? &*walk_.vision[c] : nullptr;
+    fb.mtp_chunk       = walk_.span.mtp[c] ? &*walk_.span.mtp[c] : nullptr;
+    fb.vision          = walk_.span.vision[c] ? &*walk_.span.vision[c] : nullptr;
     // Chunk 0 waits per layer for the lane's restore and in-flight capture. Resolved here, not at the
     // walk's start: the walk spans engine steps, and a poll between them retires a landed batch and
     // frees its events (a landed batch needs no wait).
-    if (c == 0) { fb.layer_waits = prefix_waits(lanes_[walk_.lane]); }
+    if (c == 0) { fb.layer_waits = prefix_waits(lanes_[walk_.span.lane]); }
     fb.stream         = true;
     fb.release_stream = c + 1 == n;
-    Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
+    Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.span.offsets[c]),
                     DType::BF16, {width_, w});
     const bool logits_here = l + 1 == L && prompt_end && c + 1 == n;
-    Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
-    forward_->begin_call(fb, logits_here ? &logits : nullptr);
-    if (l == 0) { forward_->embed(fb, residual); }
-    forward_->layer(l, fb, residual);
-    if (l + 1 == L) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
+    Tensor logits(seg.logits32.p, DType::FP32, {vocab_, 1});
+    seg.forward->begin_call(fb, logits_here ? &logits : nullptr);
+    if (l == 0) { seg.forward->embed(fb, residual); }
+    seg.forward->layer(l, fb, residual);
+    if (l + 1 == L) { seg.forward->finish(fb, residual, logits_here ? &logits : nullptr); }
 }
 
 void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
-    for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
-        for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
+    for (std::uint32_t l = walk_.span.next_layer; l < to_layer; ++l) {
+        for (std::size_t c = 0; c < walk_.span.widths.size(); ++c) { walk_pass(c, l); }
     }
-    walk_.next_layer = std::max(walk_.next_layer, to_layer);
+    walk_.span.next_layer = std::max(walk_.span.next_layer, to_layer);
 }
 
 PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::time_point start) {
     const std::uint32_t L = c_.num_hidden_layers;
     std::uint32_t tokens  = 0;
-    for (const auto w : walk_.widths) { tokens += static_cast<std::uint32_t>(w); }
+    for (const auto w : walk_.span.widths) { tokens += static_cast<std::uint32_t>(w); }
     // The first step already ran layer 0 while staging.
     const std::uint32_t to =
-        std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
+        std::min(L, walk_.span.next_layer + walk_.span.layers_per_step - (walk_.span.steps == 0 ? 1U : 0U));
     {
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
-        const WideWork wide(*this, *std::max_element(walk_.widths.begin(), walk_.widths.end()));
+        const WideWork wide(*this, whole(),
+                            *std::max_element(walk_.span.widths.begin(), walk_.span.widths.end()));
         walk_enqueue(to);
     }
-    ++walk_.steps;
+    ++walk_.span.steps;
     if (to < L) {
         // While the device runs this step, read the next span's n-gram rows (one span's chunks spread
         // over the remaining steps; ~35-70 ms of NVMe reads per 4,096-token chunk).
-        if (walk_.steps > 1 && walk_.end_call < lane.calls.size()) {
-            const std::size_t remaining = (L - to + walk_.layers_per_step - 1) / walk_.layers_per_step + 1;
-            const std::size_t slots     = walk_host_.size() / walk_.io_stride;
-            const std::size_t have      = walk_prefetch_.valid ? walk_prefetch_.widths.size() : 0;
+        if (walk_.span.steps > 1 && walk_.span.end_call < lane.calls.size()) {
+            const std::size_t remaining = (L - to + walk_.span.layers_per_step - 1) / walk_.span.layers_per_step + 1;
+            const std::size_t slots     = walk_.host.size() / walk_.span.io_stride;
+            const std::size_t have      = walk_.prefetch.valid ? walk_.prefetch.widths.size() : 0;
             walk_prefetch_rows(lane, index, slots > have ? (slots - have + remaining - 1) / remaining : 0);
         }
         {
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
-            device_.synchronize();
+            synchronize();
         }
-        residency_->tier_step(device_.stream);
+        whole().residency->tier_step(whole().device->stream);
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
@@ -305,30 +308,30 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         return out;
     }
     // The span is enqueued: the lane's state is at its end in every layer.
-    const std::int32_t begin = walk_.begins.back(), width = walk_.widths.back();
-    const bool last          = walk_.end_call == lane.calls.size();
-    lane.state_tokens = lane.calls[walk_.end_call - 1];
-    lane.next_call    = walk_.end_call;
-    residency_->enqueue_route_download(device_.stream, width);
-    expert_stream_->end();
-    walk_.active   = false;
-    host_lanes_[0] = static_cast<std::int32_t>(index);
+    const std::int32_t begin = walk_.span.begins.back(), width = walk_.span.widths.back();
+    const bool last          = walk_.span.end_call == lane.calls.size();
+    lane.state_tokens = lane.calls[walk_.span.end_call - 1];
+    lane.next_call    = walk_.span.end_call;
+    whole().residency->enqueue_route_download(whole().device->stream, width);
+    whole().expert_stream->end();
+    walk_.span.active = false;
+    host_lanes_[0]    = static_cast<std::int32_t>(index);
     if (last && !prefilling_besides(index)) {
-        return_stream_lease();
-        return_wide_work();
+        return_stream_lease(whole());
+        return_wide_work(whole());
     }
     prefix_after_prefill_call(lane, index, last);
     if (last && lane.vision) { vision_release(lane); }
     if (!last) {
         {
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
-            device_.synchronize();
+            synchronize();
         }
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).
         trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
-        residency_->after_round(device_.stream, width, 0);
+        whole().residency->after_round(whole().device->stream, width, 0);
         apply_vram_target(false);
     }
     // A walk promotes no experts (its routes still count toward the cache's scores). Between spans
@@ -341,13 +344,13 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
 }
 
 void ProgramImpl::walk_abandon() noexcept {
-    if (!walk_.active) { return; }
+    if (!walk_.span.active) { return; }
     try {
-        device_.synchronize();
+        synchronize();
     } catch (...) {}
-    expert_stream_->end();
-    walk_          = LayerWalk{};
-    walk_prefetch_ = WalkPrefetch{};
+    whole().expert_stream->end();
+    walk_.span     = WalkState::LayerWalk{};
+    walk_.prefetch = WalkState::WalkPrefetch{};
 }
 
 } // namespace infernix::models::qwen4_exp::detail

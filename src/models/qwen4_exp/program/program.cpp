@@ -27,9 +27,16 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
     return detail::ProgramImpl::plan_device(options, config, static_cast<std::int32_t>(public_tokens)).bytes;
 }
 
+ProgramDevicePlan Program::plan_segment(const ProgramOptions& options, const Config& config, std::int32_t public_tokens,
+                                        const SegmentSpec& segment) {
+    return detail::ProgramImpl::plan_segment(options, config, public_tokens, segment).bytes;
+}
+
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_layout().bytes; }
 
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
+
+std::span<const VramSizing> Program::segment_vram_sizing() const noexcept { return impl_->segment_vram_sizing(); }
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 

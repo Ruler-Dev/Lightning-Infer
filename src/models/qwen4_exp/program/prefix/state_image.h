@@ -53,6 +53,11 @@ struct KvWindowGeometry {
 
 [[nodiscard]] KvWindowGeometry kv_window_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp,
                                                   std::uint32_t lanes);
+// The window of a layer subset (a segment of a layer-split Program): `attention_layers` attention
+// layers, then MTP's when `mtp`. KV layer j is the segment's j-th; global_kv_plane names its place in
+// the whole model's order. A subset without KV layers has no window.
+[[nodiscard]] KvWindowGeometry kv_window_geometry(const TextConfig& config, KvCacheStorage storage,
+                                                  std::uint32_t attention_layers, bool mtp, std::uint32_t lanes);
 // KV layer k's window planes at `base` (slots unset: the forward pass sets each call's).
 [[nodiscard]] PagedKVWindowView kv_window_view(const KvWindowGeometry& geometry, void* base, std::uint32_t kv_layer);
 
@@ -187,6 +192,11 @@ struct KvPageGeometry {
 };
 
 [[nodiscard]] KvPageGeometry kv_page_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp);
+// The page group of a layer subset: `attention_layers` KV layers, then MTP's when `mtp`. Every KV
+// layer has the same planes, so a segment's pool holds a slice of the whole model's page group over
+// the same page indices (no KV layer: no planes).
+[[nodiscard]] KvPageGeometry kv_page_geometry(const TextConfig& config, KvCacheStorage storage,
+                                              std::uint32_t attention_layers, bool mtp);
 
 struct PlaneRange {
     std::size_t begin = 0;
@@ -195,5 +205,13 @@ struct PlaneRange {
 
 // The planes of KV layer `kv_layer` (attention layer index, or attention_layers for MTP).
 [[nodiscard]] PlaneRange kv_layer_planes(const KvPageGeometry& geometry, std::uint32_t kv_layer);
+
+// The whole model's plane (kv_page_geometry(config, storage, mtp)) that holds plane `segment_plane`
+// of a segment's page group: the segment's KV layer j below its attention layers is global KV layer
+// attention_base + j, and its MTP layer (the last, when segment_has_mtp) is global KV layer
+// global_attention_layers. Prefix records, state images and persisted files keep the global order.
+[[nodiscard]] std::size_t global_kv_plane(const KvPageGeometry& segment, std::uint32_t attention_base,
+                                          std::uint32_t global_attention_layers, std::size_t segment_plane,
+                                          bool segment_has_mtp);
 
 } // namespace infernix::models::qwen4_exp::prefix

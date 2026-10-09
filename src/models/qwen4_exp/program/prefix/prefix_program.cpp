@@ -39,62 +39,62 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
-    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
-    lane_image_      = std::make_unique<prefix::LaneStateImage>(
-        image_layout_,
-        prefix::LaneStateBuffers{.gdn       = gdn_.get(),
+    prefix_.image_layout = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
+    prefix_.lane_image   = std::make_unique<prefix::LaneStateImage>(
+        prefix_.image_layout,
+        prefix::LaneStateBuffers{.gdn       = whole().gdn.get(),
                                  .lanes     = lanes,
-                                 .ple       = static_cast<std::byte*>(ple_backing_.p),
-                                 .tails     = static_cast<std::byte*>(tails_backing_.p),
-                                 .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
-                                 .window    = static_cast<std::byte*>(window_backing_.p),
-                                 .window_geometry = window_geometry_});
+                                 .ple       = static_cast<std::byte*>(ple().ple_backing.p),
+                                 .tails     = static_cast<std::byte*>(whole().tails_backing.p),
+                                 .mtp_saved = mtp_ ? static_cast<std::byte*>(head().mtp_saved.p) : nullptr,
+                                 .window    = static_cast<std::byte*>(whole().window_backing.p),
+                                 .window_geometry = whole().window_geometry});
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;
     config.kv_pages   = kv_pages_;
-    prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
-                                                            options_.prefix_host_bytes);
+    prefix_.cache     = std::make_unique<prefix::PrefixCache>(config, *head().pool, whole().kv_geometry,
+                                                              *prefix_.lane_image, options_.prefix_host_bytes);
     if (mtp_) {
         // The MR3 flush cell's inputs: token, cell, slot and table row.
         // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
-        flush_host_   = PinnedHostBuffer(kFlushWords * sizeof(std::int32_t));
-        flush_device_ = DeviceBuffer(kFlushWords * sizeof(std::int32_t));
-        CUDA_CHECK(cudaEventCreateWithFlags(&flush_uploaded_, cudaEventDisableTiming));
+        prefix_.flush_host   = PinnedHostBuffer(kFlushWords * sizeof(std::int32_t));
+        prefix_.flush_device = DeviceBuffer(kFlushWords * sizeof(std::int32_t));
+        CUDA_CHECK(cudaEventCreateWithFlags(&prefix_.flush_uploaded, cudaEventDisableTiming));
     }
 }
 
 PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
                                                              const StartupObserver& observer) {
-    if (!prefix_) { return {.message = "the prefix cache is not enabled"}; }
+    if (!prefix_.cache) { return {.message = "the prefix cache is not enabled"}; }
     if (path.empty()) { throw std::invalid_argument("prefix cache file path is empty"); }
-    PrefixCachePersistence loaded = public_result(prefix_->load(path, fingerprint, observer));
+    PrefixCachePersistence loaded = public_result(prefix_.cache->load(path, fingerprint, observer));
     prefix_file_                  = path;
     prefix_fingerprint_           = std::move(fingerprint);
-    prefix_saved_writes_          = prefix_->counters().host_write_bytes;
+    prefix_saved_writes_          = prefix_.cache->counters().host_write_bytes;
     return loaded;
 }
 
 std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
-    if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
+    if (!prefix_.cache || prefix_file_.empty() || prefix_.cache->counters().host_write_bytes == prefix_saved_writes_) {
         return std::nullopt;
     }
     // As at shutdown: Host writes and copy-outs land, then the save reads the slabs (lanes pinning a
     // path do not matter, the save only reads).
-    device_.synchronize();
-    prefix_->drain();
-    const std::uint64_t written = prefix_->counters().host_write_bytes;
-    PrefixCachePersistence saved = public_result(prefix_->save(prefix_file_, prefix_fingerprint_, abandoned));
+    synchronize();
+    prefix_.cache->drain();
+    const std::uint64_t written = prefix_.cache->counters().host_write_bytes;
+    PrefixCachePersistence saved = public_result(prefix_.cache->save(prefix_file_, prefix_fingerprint_, abandoned));
     if (saved.ok) { prefix_saved_writes_ = written; }
     return saved;
 }
 
 // After every lane is released: Host writes and copy-outs land, then the save reads the slabs.
 void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
-    if (!prefix_ || prefix_file_.empty()) { return; }
+    if (!prefix_.cache || prefix_file_.empty()) { return; }
     try {
-        device_.synchronize();
-        prefix_->drain();
+        synchronize();
+        prefix_.cache->drain();
         // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
         // from here, so an exit never waits for the Device work above.
         const PrefixCacheSaveControl& control = options_.prefix_save;
@@ -108,7 +108,7 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
             ~Ended() { control.end(saved); }
         } ended{control};
         prefix_shutdown_save_ = public_result(
-            prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); })));
+            prefix_.cache->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); })));
         ended.saved = prefix_shutdown_save_->ok;
     } catch (const std::exception& error) {
         prefix_shutdown_save_ = PrefixCachePersistence{.message = error.what()};
@@ -116,18 +116,18 @@ void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
 }
 
 void ProgramImpl::pc_make_room(std::uint32_t pages) {
-    pc::PrefixCacheIndex& cache = prefix_->index();
-    while (pool_->available_pages() < pages) {
-        if (cache.evict_device_blocks(pages - pool_->available_pages()) == 0) { return; }
+    pc::PrefixCacheIndex& cache = prefix_.cache->index();
+    while (head().pool->available_pages() < pages) {
+        if (cache.evict_device_blocks(pages - head().pool->available_pages()) == 0) { return; }
     }
 }
 
 // MR3: one kv-only MTP cell for the pending position (cell state_tokens - 1 from the saved residual
 // and token history[state_tokens]), the cell the next round's step 0 or catch-up would write.
 void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
-    const cudaStream_t stream = device_.stream;
-    CUDA_CHECK(cudaEventSynchronize(flush_uploaded_)); // the previous flush has read the staging words
-    auto* words      = static_cast<std::int32_t*>(flush_host_.data());
+    const cudaStream_t stream = head().device->stream;
+    CUDA_CHECK(cudaEventSynchronize(prefix_.flush_uploaded)); // the previous flush has read the staging words
+    auto* words      = static_cast<std::int32_t*>(prefix_.flush_host.data());
     const auto cell  = lane.state_tokens - 1U;
     words[0]         = lane.history[lane.state_tokens];
     words[1]         = static_cast<std::int32_t>(cell);
@@ -136,9 +136,10 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
     stage_rope_value(rope_of(lane.rope, cell), std::span<std::int32_t>(words + 4, 3), 1, 0);
     stage_rope_value(block_start_rope(lane.rope, cell, static_cast<std::uint32_t>(r_)), std::span<std::int32_t>(words + 7, 3),
                      1, 0);
-    CUDA_CHECK(cudaMemcpyAsync(flush_device_.p, words, kFlushWords * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaEventRecord(flush_uploaded_, stream));
-    auto* device = static_cast<std::int32_t*>(flush_device_.p);
+    CUDA_CHECK(cudaMemcpyAsync(prefix_.flush_device.p, words, kFlushWords * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaEventRecord(prefix_.flush_uploaded, stream));
+    auto* device = static_cast<std::int32_t*>(prefix_.flush_device.p);
     execution::MtpCall call{.residuals        = saved_column(index).view({width_, 1}),
                             .ids              = Tensor(device, DType::I32, {1}),
                             .positions        = Tensor(device + 1, DType::I32, {1}),
@@ -149,7 +150,7 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
                             .batch            = 1,
                             .width            = 1,
                             .kv_only          = true};
-    forward_->run_mtp(call);
+    head().forward->run_mtp(call);
     lane.mtp_cells = lane.state_tokens;
 }
 
@@ -160,7 +161,7 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
 std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::PreparedPromptData& prompt,
                                                                        const BasePlanImpl& base,
                                                                        std::uint32_t lane) {
-    pc::PrefixCacheIndex& index = prefix_->index();
+    pc::PrefixCacheIndex& index = prefix_.cache->index();
     const auto n                = static_cast<std::uint32_t>(prompt.token_ids.size());
     const std::uint32_t E       = binding_pages(base, n);
     const auto fits = [&](PrefixSelection& s) {
@@ -178,8 +179,8 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             if (view.tail_device_copy == pc::CopyState::Resident && view.pins == 0) { ++evictable_on_path; }
         }
         s.need                     = (E - s.shared) + host_only;
-        const std::uint64_t room   = static_cast<std::uint64_t>(pool_->available_pages()) + index.device_evictable_blocks() +
-                                   kv_grow_pages();
+        const std::uint64_t room   = static_cast<std::uint64_t>(head().pool->available_pages()) +
+                                   index.device_evictable_blocks() + kv_grow_pages();
         return static_cast<std::uint64_t>(s.need) + evictable_on_path <= room;
     };
     std::uint32_t cached_tokens = 0; // the prompt prefix held as cached blocks
@@ -191,9 +192,9 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     PrefixSelection root;
     root.need = E;
     if (base.reuse && n > 1) {
-        prefix_->poll();
+        prefix_.cache->poll();
         pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-        if (prefix_->await_extended_endpoint(match.path, prompt.token_ids)) {
+        if (prefix_.cache->await_extended_endpoint(match.path, prompt.token_ids)) {
             // The endpoint this prompt continues has just been published.
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
@@ -201,7 +202,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
                                               [](const pc::MatchCandidate& c) { return c.filling_blocks != 0; })) {
             // A prefetch is copying blocks this prompt resumes over: they land within a batch's copy
             // time, and skipping them would pick a shallower source.
-            prefix_->await_restore(*prefetch_ticket_);
+            prefix_.cache->await_restore(*prefetch_ticket_);
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
         cached_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
@@ -214,8 +215,8 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         const std::optional<pc::SnapshotRef> resident =
             lane < lanes_.size() ? prefix_resident(lanes_[lane]) : std::nullopt;
         for (pc::MatchCandidate& c : match.candidates) {
-            if (resident && *resident == c.snapshot && c.restore_bytes >= image_layout_.image_bytes) {
-                c.restore_bytes -= image_layout_.image_bytes;
+            if (resident && *resident == c.snapshot && c.restore_bytes >= prefix_.image_layout.image_bytes) {
+                c.restore_bytes -= prefix_.image_layout.image_bytes;
             }
         }
         const pc::AdmissionChoice choice = index.choose(match, n);
@@ -237,7 +238,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             s.shared              = k;
             if (c.frontier % kBlock != 0) {
                 s.cow = PrefixCow::Tail;
-            } else if (mtp_ && k > 0 && prefix_->mtp_next(s.path[k - 1]) != prompt.token_ids[c.frontier]) {
+            } else if (mtp_ && k > 0 && prefix_.cache->mtp_next(s.path[k - 1]) != prompt.token_ids[c.frontier]) {
                 // MR6: the anchor's last MTP cell encodes another continuation; the lane rewrites it
                 // in a private copy of the anchor page.
                 s.cow    = PrefixCow::Anchor;
@@ -250,17 +251,17 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         return std::nullopt;
         };
         if (std::optional<PrefixSelection> s = select()) { return s; }
-        if (!match.candidates.empty() && prefix_->transfers_pending()) {
+        if (!match.candidates.empty() && prefix_.cache->transfers_pending()) {
             // Blocks pinned only by in-flight Host writes become evictable once those land: a cached
             // source is not given up for the root while a finished lane's writes land.
-            prefix_->drain();
+            prefix_.cache->drain();
             if (std::optional<PrefixSelection> s = select()) { return s; }
         }
     }
     if (fits(root)) { return planned(std::move(root)); }
-    if (prefix_->transfers_pending()) {
+    if (prefix_.cache->transfers_pending()) {
         // Blocks pinned only by in-flight copies become evictable once those land.
-        prefix_->drain();
+        prefix_.cache->drain();
         if (fits(root)) { return planned(std::move(root)); }
     }
     return std::nullopt;
@@ -271,18 +272,18 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
 // Host-backed cached blocks, least recently used first, so a prefetch never waits for a transfer,
 // never grows the pool into the expert frames, and never drops a block's last copy.
 std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base) {
-    if (!prefix_ || !prefix_->host_tier() || base.impl_ == nullptr || !base.impl_->reuse || !base.impl_->prompt) {
+    if (!prefix_.cache || !prefix_.cache->host_tier() || base.impl_ == nullptr || !base.impl_->reuse || !base.impl_->prompt) {
         return 0U;
     }
-    if (transaction_lane_ || prefix_->restore_open()) { return std::nullopt; }
-    prefix_->poll();
+    if (transaction_lane_ || prefix_.cache->restore_open()) { return std::nullopt; }
+    prefix_.cache->poll();
     if (prefetch_landing()) { return std::nullopt; }
     prefetch_ticket_.reset();
     const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base.impl_->prompt);
     const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { return 0U; }
     // The source the admission would choose now, as in prefix_select.
-    pc::PrefixCacheIndex& index = prefix_->index();
+    pc::PrefixCacheIndex& index = prefix_.cache->index();
     pc::MatchResult match       = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
     const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
@@ -295,31 +296,31 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     std::uint32_t started = 0;
     try {
         std::uint32_t wanted = std::min(match.candidates[*choice.candidate].host_only_blocks, kPrefetchBatchBlocks);
-        while (pool_->available_pages() < wanted && index.evict_backed_device_blocks(1) != 0) {}
-        wanted = std::min(wanted, pool_->available_pages());
+        while (head().pool->available_pages() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        wanted = std::min(wanted, head().pool->available_pages());
         std::optional<DeviceKVPageReservation> reservation;
-        if (wanted != 0) { reservation = pool_->reserve(wanted); }
+        if (wanted != 0) { reservation = head().pool->reserve(wanted); }
         if (reservation) {
             std::vector<DeviceKVPageLease> pages;
             pages.reserve(wanted);
-            pool_->materialize(*reservation, wanted, pages);
-            prefix_->open_restore(device_.stream);
+            head().pool->materialize(*reservation, wanted, pages);
+            prefix_.cache->open_restore(whole().device->stream);
             for (const pc::NodeRef node : path) {
                 if (started == wanted) { break; }
                 const pc::NodeView view = index.node(node);
                 if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Resident) { continue; }
-                prefix_->restore_block(node, std::move(pages[started]));
+                prefix_.cache->restore_block(node, std::move(pages[started]));
                 ++started;
             }
             if (started != 0) {
-                prefetch_ticket_ = prefix_->submit_restore();
-                prefix_->counters().prefetched_blocks += started;
+                prefetch_ticket_ = prefix_.cache->submit_restore();
+                prefix_.cache->counters().prefetched_blocks += started;
             } else {
-                prefix_->abort_restore();
+                prefix_.cache->abort_restore();
             }
         }
     } catch (...) {
-        prefix_->abort_restore();
+        prefix_.cache->abort_restore();
         index.release_path(path);
         throw;
     }
@@ -328,16 +329,16 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
 }
 
 std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
-    if (!prefix_ || !prefix_->host_tier()) { return 0U; }
-    return pool_->available_pages() + prefix_->index().device_backed_evictable_blocks();
+    if (!prefix_.cache || !prefix_.cache->host_tier()) { return 0U; }
+    return head().pool->available_pages() + prefix_.cache->index().device_backed_evictable_blocks();
 }
 
 // The snapshot each queued request would resume from now, as prefix_select would choose it, is
 // held in admission order (hybrid-prefix-cache-spec §9.6). A block landing for another admission
 // does not change what the request needs, so filling candidates stay eligible.
 void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
-    if (!prefix_) { return; }
-    pc::PrefixCacheIndex& index = prefix_->index();
+    if (!prefix_.cache) { return; }
+    pc::PrefixCacheIndex& index = prefix_.cache->index();
     std::vector<pc::SnapshotRef> holds;
     for (const RequestBasePlan* base : queue) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
@@ -356,7 +357,7 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
 }
 
 std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
-    return prefix_ ? prefix_->index().snapshot_epoch() : 0U;
+    return prefix_.cache ? prefix_.cache->index().snapshot_epoch() : 0U;
 }
 
 // A fresh request whose prompt shares a prefix with a lane still prefilling waits for that lane's
@@ -394,15 +395,15 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         if (shared <= reuse) { continue; }
         // A capture of the lane's inside the shared prefix that has not landed publishes within a
         // copy time.
-        if (lane.prefix.capture != 0 && !prefix_->capture_result(lane.prefix.capture) &&
+        if (lane.prefix.capture != 0 && !prefix_.cache->capture_result(lane.prefix.capture) &&
             lane.prefix.deepest > reuse && lane.prefix.deepest <= shared) {
             consider(Wait{.lane = i, .target = lane.prefix.deepest, .plan_tap = false});
         }
         if (lane.phase != Phase::Prefill) { continue; }
         // Taps after the lane's frontier can still be realized, except inside a running layer walk's
         // span: its calls are enqueued, and its span end is realized when the span completes.
-        const bool walking            = walk_.active && walk_.lane == i;
-        const std::uint32_t walk_end  = walking ? lane.calls[walk_.end_call - 1] : 0U;
+        const bool walking            = walk_.span.active && walk_.span.lane == i;
+        const std::uint32_t walk_end  = walking ? lane.calls[walk_.span.end_call - 1] : 0U;
         const auto realizable = [&](std::uint32_t position) {
             return position > lane.state_tokens && (!walking || position >= walk_end);
         };
@@ -485,16 +486,16 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
 void ProgramImpl::prefix_pin(const PrefixSelection& s) {
     if (!s.snapshot) { return; }
     const std::span<const pc::NodeRef> path(s.path.data(), s.frontier / kBlock);
-    if (!path.empty()) { prefix_->index().acquire_path(path); }
-    prefix_->index().pin_snapshot(*s.snapshot);
+    if (!path.empty()) { prefix_.cache->index().acquire_path(path); }
+    prefix_.cache->index().pin_snapshot(*s.snapshot);
 }
 
 void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
     if (!s.snapshot) { return; }
     try {
         const std::span<const pc::NodeRef> path(s.path.data(), s.frontier / kBlock);
-        if (!path.empty()) { prefix_->index().release_path(path); }
-        prefix_->index().unpin_snapshot(*s.snapshot);
+        if (!path.empty()) { prefix_.cache->index().release_path(path); }
+        prefix_.cache->index().unpin_snapshot(*s.snapshot);
     } catch (...) {}
 }
 
@@ -502,10 +503,10 @@ void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
 // restores and copy-on-write sources, and sets the lane's frontier and MTP state (plan §7.2).
 void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& s,
                                   DeviceKVPageReservation& reservation, std::uint32_t pages) {
-    pc::PrefixCacheIndex& cache = prefix_->index();
-    const cudaStream_t stream   = device_.stream;
+    pc::PrefixCacheIndex& cache = prefix_.cache->index();
+    const cudaStream_t stream   = whole().device->stream;
     // A copy-out of this lane's previous state must land before anything overwrites the slot.
-    for (const cudaEvent_t event : prefix_->capture_events(lane.prefix.capture)) {
+    for (const cudaEvent_t event : prefix_.cache->capture_events(lane.prefix.capture)) {
         CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
     }
     const std::uint32_t k = s.frontier / kBlock;
@@ -513,38 +514,38 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     lane.prefix.path.assign(s.path.begin(), s.path.begin() + s.shared);
     lane.pages.clear();
     lane.pages.reserve(pages - s.shared);
-    pool_->materialize(reservation, pages - s.shared, lane.pages);
+    head().pool->materialize(reservation, pages - s.shared, lane.pages);
     lane.prefix.page_base = s.shared;
     const bool restores   = s.snapshot && (s.image_restore || s.cow != PrefixCow::None ||
                                          std::any_of(lane.prefix.path.begin(), lane.prefix.path.end(), [&](pc::NodeRef n) {
                                              return cache.node(n).device != pc::CopyState::Resident;
                                          }));
     if (s.snapshot) {
-        if (restores) { prefix_->open_restore(stream); }
+        if (restores) { prefix_.cache->open_restore(stream); }
         for (const pc::NodeRef node : lane.prefix.path) {
             if (cache.node(node).device != pc::CopyState::Resident) {
-                prefix_->restore_block(node, pool_->materialize_one(reservation));
+                prefix_.cache->restore_block(node, head().pool->materialize_one(reservation));
             }
         }
         const DeviceKVPageHandle first_private = lane.pages.empty() ? DeviceKVPageHandle{} : lane.pages.front().handle();
         if (s.cow == PrefixCow::Tail) {
             const pc::SnapshotView view = cache.snapshot(*s.snapshot);
             if (view.tail_device_copy == pc::CopyState::Resident) {
-                pool_->copy_page(prefix_->page(view.tail_device), first_private, stream);
+                whole().pool->copy_page(prefix_.cache->page(view.tail_device), first_private, stream);
             } else {
-                prefix_->restore_tail_page(*s.snapshot, first_private);
+                prefix_.cache->restore_tail_page(*s.snapshot, first_private);
             }
         } else if (s.cow == PrefixCow::Anchor) {
             const pc::NodeRef anchor = s.path[k - 1];
             const pc::NodeView view  = cache.node(anchor);
             if (view.device == pc::CopyState::Resident) {
-                pool_->copy_page(prefix_->page(view.device_id), first_private, stream);
+                whole().pool->copy_page(prefix_.cache->page(view.device_id), first_private, stream);
             } else {
-                prefix_->restore_node_page(anchor, first_private);
+                prefix_.cache->restore_node_page(anchor, first_private);
             }
         }
-        if (s.image_restore) { prefix_->restore_image(*s.snapshot, index); }
-        if (restores) { lane.prefix.restore = prefix_->submit_restore(); }
+        if (s.image_restore) { prefix_.cache->restore_image(*s.snapshot, index); }
+        if (restores) { lane.prefix.restore = prefix_.cache->submit_restore(); }
         if (s.cow == PrefixCow::Anchor) {
             // The anchor's copy is stream-ordered (or pinned by the restore batch): drop its pin.
             const std::span<const pc::NodeRef> to_anchor(s.path.data(), k);
@@ -555,27 +556,27 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         cache.unpin_snapshot(*s.snapshot); // the restore batch holds its own pin while it lands
         lane.prefix.resume  = s.snapshot;
         lane.prefix.deepest = s.frontier;
-        ++prefix_->counters().admissions;
-        prefix_->counters().reused_tokens += s.frontier;
+        ++prefix_.cache->counters().admissions;
+        prefix_.cache->counters().reused_tokens += s.frontier;
     }
     // The slot no longer holds the endpoint image once anything is admitted into it.
-    prefix_->forget_capture(lane.prefix.resident_capture);
+    prefix_.cache->forget_capture(lane.prefix.resident_capture);
     lane.prefix.resident_capture = 0;
     lane.prefix.lineage_capture  = 0;
     if (!s.snapshot) { reset_slot(index); }
     // The block table: shared cache pages, then the private leases.
     std::vector<DeviceKVPageHandle> handles;
     handles.reserve(pages);
-    for (const pc::NodeRef node : lane.prefix.path) { handles.push_back(prefix_->page(cache.node(node).device_id)); }
+    for (const pc::NodeRef node : lane.prefix.path) { handles.push_back(prefix_.cache->page(cache.node(node).device_id)); }
     for (const DeviceKVPageLease& lease : lane.pages) { handles.push_back(lease.handle()); }
-    tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageHandle>(handles), stream);
+    whole().tables->publish(lane.row.handle(), 0, std::span<const DeviceKVPageHandle>(handles), stream);
     lane.state_tokens = s.frontier;
     if (s.snapshot) {
         // MR6: whether the drafter's cell F - 1 holds this prompt's continuation.
-        const prefix::StateImageHeader& meta = prefix_->meta(*s.snapshot);
+        const prefix::StateImageHeader& meta = prefix_.cache->meta(*s.snapshot);
         // The opener of an echo lineage serves only when the endpoint after it did not: the client
         // did not echo the generated turn exactly (design §19.3.1, "Generation opener").
-        if (meta.opener && meta.lineage_echo) { ++prefix_->counters().endpoint_mismatch_fallbacks; }
+        if (meta.opener && meta.lineage_echo) { ++prefix_.cache->counters().endpoint_mismatch_fallbacks; }
         const bool continues = static_cast<std::size_t>(s.frontier) < lane.history.size() &&
                                meta.mtp_next == lane.history[s.frontier];
         if (s.cow == PrefixCow::Tail) {
@@ -585,11 +586,12 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         } else {
             lane.mtp_cells = s.frontier;
         }
-        if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_->counters().mtp_continuation_mismatches; }
+        if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_.cache->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
         // Penalty counts restart with the request; the lane's state came from the snapshot.
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
-                                   0, 4ULL * token_domain_, stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(head().token_counts.p) +
+                                       index * static_cast<std::size_t>(token_domain_),
+                                   0, 4ULL * token_domain_, head().device->stream));
     }
     // Taps for this prompt beyond the resume frontier, realized at the plan's call boundaries.
     lane.prefix.taps = s.plan.taps;
@@ -601,9 +603,9 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
                                            std::span<const std::uint32_t> existing, bool taps) const {
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     std::vector<pc::PlannedTap> planned;
-    if (taps && prefix_) {
+    if (taps && prefix_.cache) {
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
-        planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
+        planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_.cache->taps());
     }
     return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned,
                               prefix::CallCost{.model = options_.prefix_cost, .span_seconds = options_.prefix_span_seconds});
@@ -611,16 +613,16 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
 
 HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     HybridPrefixCacheStats out;
-    if (!prefix_) { return out; }
-    const pc::PrefixIndexStats index         = prefix_->index().stats();
-    const prefix::PrefixCacheCounters& count = prefix_->counters();
+    if (!prefix_.cache) { return out; }
+    const pc::PrefixIndexStats index         = prefix_.cache->index().stats();
+    const prefix::PrefixCacheCounters& count = prefix_.cache->counters();
     out.nodes                   = index.nodes;
     out.snapshots               = index.snapshots;
     out.device_resident_blocks  = index.device_resident_blocks;
     out.device_evictable_blocks = index.device_evictable_blocks;
-    out.host_slabs              = prefix_->host_layout().slabs;
+    out.host_slabs              = prefix_.cache->host_layout().slabs;
     out.host_free_slabs         = index.host_free_slabs;
-    out.host_slab_bytes         = prefix_->host_layout().slab_bytes;
+    out.host_slab_bytes         = prefix_.cache->host_layout().slab_bytes;
     out.snapshot_hits           = index.snapshot_hits;
     out.reused_tokens           = count.reused_tokens;
     out.blocks_inserted         = count.blocks_inserted;
@@ -702,8 +704,8 @@ std::uint32_t ProgramImpl::prefix_frontier(const Lane& lane, bool finishing) con
 }
 
 void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
-    if (!prefix_ || !lane.prefix.reuse) { return; }
-    pc::PrefixCacheIndex& cache = prefix_->index();
+    if (!prefix_.cache || !lane.prefix.reuse) { return; }
+    pc::PrefixCacheIndex& cache = prefix_.cache->index();
     // Blocks past the prompt (generated output) chain their lookup hash from the previous block's
     // and carry the prompt's trailing Vision key, as Qwen3.5's publication does.
     const std::uint32_t blocks =
@@ -724,12 +726,12 @@ void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
         // MR5: adopt a Host-only twin only when its last MTP cell encodes this lane's next token.
         bool attach = true;
         if (const auto existing = cache.find_child(parent, lane.prefix.hashes[b], tokens, extra); existing && mtp_) {
-            attach = prefix_->mtp_next(*existing) == next;
-            if (!attach) { ++prefix_->counters().mtp_branch_mismatches; }
+            attach = prefix_.cache->mtp_next(*existing) == next;
+            if (!attach) { ++prefix_.cache->counters().mtp_branch_mismatches; }
         }
         DeviceKVPageLease& lease = lane.pages.at(b - lane.prefix.page_base);
         const pc::InsertResult result =
-            prefix_->insert_block(parent, lane.prefix.hashes[b], tokens, extra, lease, attach, next);
+            prefix_.cache->insert_block(parent, lane.prefix.hashes[b], tokens, extra, lease, attach, next);
         lane.prefix.path.push_back(result.node);
     }
 }
@@ -740,7 +742,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     const std::uint32_t k = F / kBlock;
     if (F == 0 || lane.prefix.path.size() < k) { return; }
     prefix::PrefixCache::Capture c;
-    c.id       = ++next_capture_;
+    c.id       = ++prefix_.next_capture;
     c.anchor   = k == 0 ? pc::NodeRef{} : lane.prefix.path[k - 1];
     c.frontier = F;
     c.tail.assign(lane.history.begin() + static_cast<std::ptrdiff_t>(k) * kBlock, lane.history.begin() + F);
@@ -750,12 +752,12 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
         if (hand_over_tail) { c.tail_lease.emplace(std::move(page)); }
     }
     c.kind             = kind;
-    c.claim            = prefix_->index().estimate_priority(lane.prefix.deepest, F, !c.tail.empty());
+    c.claim            = prefix_.cache->index().estimate_priority(lane.prefix.deepest, F, !c.tail.empty());
     c.meta.frontier    = F;
     c.meta.mtp_written = lane.mtp_live && lane.mtp_cells == F;
     c.meta.mtp_next    = lane.history.size() > F ? lane.history[F] : -1;
-    c.meta.lineage_echo = lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume) &&
-                          prefix_->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
+    c.meta.lineage_echo = lane.prefix.resume && prefix_.cache->index().valid(*lane.prefix.resume) &&
+                          prefix_.cache->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
     c.meta.opener = kind != pc::SnapshotKind::Endpoint &&
                     std::any_of(lane.prefix.hints.begin(), lane.prefix.hints.end(), [&](const pc::TapHint& hint) {
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
@@ -763,7 +765,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     c.meta.mtp_accept = lane.mtp_accept;
     // The lineage's previous snapshot serves only requests diverging before this one: this request's
     // last capture, else the snapshot it resumed from (never an earlier request's capture on the slot).
-    if (const auto previous = lane.prefix.lineage_capture != 0 ? prefix_->capture_result(lane.prefix.lineage_capture)
+    if (const auto previous = lane.prefix.lineage_capture != 0 ? prefix_.cache->capture_result(lane.prefix.lineage_capture)
                                                                : std::nullopt;
         previous && previous->snapshot.valid()) {
         c.supersedes = previous->snapshot;
@@ -771,8 +773,8 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
         c.supersedes = *lane.prefix.resume;
     }
     const std::uint64_t id = c.id;
-    if (prefix_->capture(index, std::move(c), device_.stream)) {
-        prefix_->forget_capture(lane.prefix.capture);
+    if (prefix_.cache->capture(index, std::move(c), whole().device->stream)) {
+        prefix_.cache->forget_capture(lane.prefix.capture);
         lane.prefix.capture         = id;
         lane.prefix.lineage_capture = id;
         lane.prefix.deepest         = F;
@@ -782,7 +784,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
 // After a prefill call ending at the lane's frontier: publish its blocks and realize the taps due
 // at this call boundary.
 void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last) {
-    if (!prefix_ || !lane.prefix.reuse) { return; }
+    if (!prefix_.cache || !lane.prefix.reuse) { return; }
     prefix_publish(lane, prefix_frontier(lane, false));
     if (last || lane.prefix.taps.empty()) { return; }
     const std::uint32_t B = lane.state_tokens;
@@ -807,7 +809,7 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 // Whether prefix_after_prefill_call after the call that ends at calls[next_call - 1] would realize a
 // tap (the layer walk ends its span there: the capture needs that boundary's state in every layer).
 bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const {
-    if (!prefix_ || !lane.prefix.reuse || lane.prefix.taps.empty() || next_call == 0 ||
+    if (!prefix_.cache || !lane.prefix.reuse || lane.prefix.taps.empty() || next_call == 0 ||
         next_call >= lane.calls.size()) {
         return false;
     }
@@ -821,7 +823,7 @@ bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const 
 
 // Finish or a consistent abort: the M3 flush, the remaining blocks, the endpoint and write-through.
 void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
-    if (!prefix_ || !lane.prefix.reuse) { return; }
+    if (!prefix_.cache || !lane.prefix.reuse) { return; }
     // MR3: write the pending MTP cell when its token is known, so the endpoint is final.
     if (lane.mtp_live && lane.mtp_cells + 1U == lane.state_tokens && lane.history.size() > lane.state_tokens) {
         mtp_flush_cell(lane, index);
@@ -832,10 +834,10 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
     if (F >= lane.prefix.deepest + kBlock && full_blocks && lane.prefix.path.size() >= F / kBlock) {
         prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true);
     } else if (!full_blocks) {
-        ++prefix_->counters().endpoint_skipped_mtp;
+        ++prefix_.cache->counters().endpoint_skipped_mtp;
     }
     // Blocks reach the Host after the endpoint (one transfer stream, FIFO).
-    prefix_->write_blocks(lane.prefix.path, device_.stream);
+    prefix_.cache->write_blocks(lane.prefix.path, whole().device->stream);
     // The lane's slot holds the image of its latest capture until the lane is reused, but only when
     // that capture is at the lane's frontier: when the endpoint was not captured (too close to the
     // deepest snapshot, unfinished MTP blocks), the latest capture is an earlier tap whose state the
@@ -855,16 +857,16 @@ std::uint64_t ProgramImpl::prefix_trailing_extra(const qwen3_5::PreparedPromptDa
 
 std::optional<pc::SnapshotRef> ProgramImpl::prefix_resident(const Lane& lane) const {
     if (lane.prefix.resident_capture == 0) { return std::nullopt; }
-    const auto result = prefix_->capture_result(lane.prefix.resident_capture);
-    if (!result || !result->created || !prefix_->index().valid(result->snapshot)) { return std::nullopt; }
+    const auto result = prefix_.cache->capture_result(lane.prefix.resident_capture);
+    if (!result || !result->created || !prefix_.cache->index().valid(result->snapshot)) { return std::nullopt; }
     return result->snapshot;
 }
 
 void ProgramImpl::prefix_release(Lane& lane) noexcept {
-    if (!prefix_) { return; }
+    if (!prefix_.cache) { return; }
     try {
-        if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
-        prefix_->poll();
+        if (!lane.prefix.path.empty()) { prefix_.cache->index().release_path(lane.prefix.path); }
+        prefix_.cache->poll();
     } catch (...) {}
     lane.prefix.path.clear();
     lane.prefix.taps.clear();
@@ -877,9 +879,9 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
 }
 
 std::array<std::span<const cudaEvent_t>, 2> ProgramImpl::prefix_waits(const Lane& lane) const noexcept {
-    if (!prefix_) { return {}; }
-    return {lane.prefix.restore ? prefix_->restore_events(*lane.prefix.restore) : std::span<const cudaEvent_t>{},
-            prefix_->capture_events(lane.prefix.capture)};
+    if (!prefix_.cache) { return {}; }
+    return {lane.prefix.restore ? prefix_.cache->restore_events(*lane.prefix.restore) : std::span<const cudaEvent_t>{},
+            prefix_.cache->capture_events(lane.prefix.capture)};
 }
 
 } // namespace infernix::models::qwen4_exp::detail

@@ -1,7 +1,8 @@
 // A focused regression test for the Windows-only NVFP4 W4A4 TMA descriptor-staging race.
 //
 // The Windows staging path stores the over-aligned CUtensorMap descriptor struct into one
-// persistent device buffer that every eager launch reuses, and gives each launch captured into a
+// persistent device buffer that every eager launch of a stream reuses (this harness uses one
+// stream; infernix_multidevice_ops_streams_test races two), and gives each launch captured into a
 // CUDA Graph a device copy of its own (core/tma_descriptor_staging.cuh). A launch that reads
 // another launch's descriptors (staged too early, too late, or a stale tensor map in the TMA
 // proxy) computes against a foreign weight. This harness fires the TMA route

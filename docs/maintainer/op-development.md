@@ -276,6 +276,13 @@ cache (for example the fast-prompt split count) follows the current device, so s
 workspace with the target device current, as its launch will be; passing the device's
 multiprocessor count explicitly removes the dependency.
 
+A launch decomposition whose result bits depend on the SM count (split counts, persistent grids,
+tile or wave choices) reads `numerics_multiprocessor_count(current_device())`
+(`src/core/per_device.h`) or `DeviceExecutionView::multiprocessor_count`, never
+`cudaDevAttrMultiProcessorCount` directly. `INFERNIX_NUMERICS_SMS` pins that count so that GPUs
+with different SM counts give the same bits, as a layer split across them requires. Occupancy-only
+choices that leave the result unchanged may keep the physical count.
+
 ### 4.3 Kernel and common facilities
 
 The kernel layer owns `__global__` functions and Op-local `__device__` computation. A kernel may

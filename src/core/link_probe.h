@@ -8,10 +8,12 @@
 
 namespace infernix {
 
-// Copies `bytes` from `source` (pinned host memory) to `destination` (device memory) on a private
-// stream, once to warm up and then `repetitions` times, and returns the best rate in bytes per
-// second. `destination` is overwritten; the caller's streams are not involved.
-[[nodiscard]] double measure_h2d_bytes_per_second(const void* source, void* destination, std::size_t bytes,
-                                                  int repetitions);
+// Copies `bytes` from `pinned_src` (pinned host memory) to `device_dst` (memory of `device`) on a
+// private stream of `device`, once to warm up and then `repetitions` times, and returns the best
+// rate in bytes per second. `device_dst` is overwritten; the caller's streams are not involved.
+// `device` -1 is the calling thread's current device; another ordinal is made current for the
+// measurement only (DeviceGuard), so each device of a layer split measures its own link.
+[[nodiscard]] double measure_h2d_bytes_per_second(const void* pinned_src, void* device_dst, std::size_t bytes,
+                                                  int repetitions, int device = -1);
 
 } // namespace infernix

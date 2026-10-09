@@ -13,6 +13,7 @@ add_library(infernix_core STATIC
   device.cu
   direct_read_queue.cpp
   dtype.cpp
+  handoff.cu
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cpp

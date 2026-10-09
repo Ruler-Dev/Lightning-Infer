@@ -180,13 +180,10 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
     return w;
 }
 
+// In SMs of numerics_multiprocessor_count, which INFERNIX_NUMERICS_SMS pins so that GPUs with
+// different SM counts launch the same grids.
 int persistent_ctas() {
-    static PerDevice<int> ctas;
-    return ctas.get([](int device) {
-        int sms = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        return sms * Schedule::kMinBlocksPerSm;
-    });
+    return numerics_multiprocessor_count(current_device()) * Schedule::kMinBlocksPerSm;
 }
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,

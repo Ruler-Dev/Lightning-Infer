@@ -908,15 +908,9 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
     // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide each
     // tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
     // §19.3.15). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
-    // two stages.
-    static PerDevice<int> multiprocessors;
-    const int sms = multiprocessors.get([](int device) {
-        int count = 0;
-        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
-            throw std::runtime_error("qsa prompt: cannot query the multiprocessor count");
-        }
-        return count;
-    });
+    // two stages. The SMs are numerics_multiprocessor_count's, which INFERNIX_NUMERICS_SMS pins so
+    // that GPUs with different SM counts choose the same stages.
+    const int sms = numerics_multiprocessor_count(current_device());
     constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
     if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
         run.template operator()<1>();

@@ -21,12 +21,15 @@ namespace infernix {
 // fence.proxy.tensormap acquire before its first cp.async.bulk.tensor.
 //
 // An eager launch: MSVC does pass the same bytes as an 8-byte-aligned word array, so stage()
-// launches a one-block kernel that takes the words by value and stores them into one persistent
-// device buffer. Kernel parameters are copied when the launch is issued, so the launch never
-// reads host memory the host may since have rewritten, and the host never waits for the GPU. The
-// staging kernel and the TMA kernel that reads the buffer are ordinary stream-ordered launches,
-// so a launch's descriptors are stored only after the previous TMA kernel on the stream has
-// finished reading them.
+// launches a one-block kernel that takes the words by value and stores them into the persistent
+// device buffer of the launch's stream. Kernel parameters are copied when the launch is issued,
+// so the launch never reads host memory the host may since have rewritten, and the host never
+// waits for the GPU. The staging kernel and the TMA kernel that reads the buffer are ordinary
+// launches on that stream, so a launch's descriptors are stored only after the previous TMA
+// kernel on the stream has finished reading them. Launches on another stream of the device (the
+// segments of a layer split that share one GPU) stage into a buffer of their own: one shared
+// buffer would let one stream's staging kernel overwrite descriptors that a TMA kernel of the
+// other stream is still reading.
 //
 // A launch being captured into a CUDA Graph: its descriptors never change across replays, so
 // they are copied once, while capturing, into a device copy of their own that is never
@@ -38,8 +41,10 @@ namespace infernix {
 // Invariants, documented here because this is the single staging site:
 //   - one instance per device: buffers are allocated on the device current at their first use,
 //     so every accessor keeps one instance per CUDA device (PerDevice, core/per_device.h);
-//   - one stream: every eager staged launch runs on its device's single compute stream, so the
-//     persistent device buffer orders against itself in-stream;
+//   - one eager buffer per (device, stream): an eager staged launch reads only its own stream's
+//     buffer, which orders against itself in-stream. A stream handle reused after
+//     cudaStreamDestroy (which releases it only once the stream's work has completed) inherits
+//     its predecessor's buffer;
 //   - allocation and copies outside the graph: buffers are allocated, and captured descriptors
 //     copied, in relaxed capture mode by synchronous calls, so a route first reached while a
 //     decode graph is being captured still works and the copy has landed before any replay;
@@ -84,13 +89,13 @@ class TmaDescriptorStaging {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
         if (capture == cudaStreamCaptureStatusActive) return captured(descriptors);
-        if (device_ == nullptr) device_ = allocate(1);
+        Descriptor* const buffer = eager(stream);
         tma_staging_detail::DescriptorWords<kWords> words;
         std::memcpy(words.words, &descriptors, sizeof(Descriptor));
         tma_staging_detail::store_descriptor_words<kWords>
-            <<<1, 64, 0, stream>>>(words, reinterpret_cast<std::uint64_t*>(device_));
+            <<<1, 64, 0, stream>>>(words, reinterpret_cast<std::uint64_t*>(buffer));
         CUDA_CHECK(cudaGetLastError());
-        return device_;
+        return buffer;
     }
 
   private:
@@ -108,6 +113,14 @@ class TmaDescriptorStaging {
         CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
         CUDA_CHECK(status);
         return static_cast<Descriptor*>(buffer);
+    }
+
+    // The persistent buffer the eager launches on `stream` read, allocated at the stream's first.
+    Descriptor* eager(cudaStream_t stream) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        Descriptor*& buffer = eager_[stream];
+        if (buffer == nullptr) buffer = allocate(1);
+        return buffer;
     }
 
     // The device copy a captured launch reads, written now by a synchronous copy (which the
@@ -132,8 +145,8 @@ class TmaDescriptorStaging {
         return slot;
     }
 
-    Descriptor* device_ = nullptr;
-    std::mutex mutex_;
+    std::mutex mutex_; // guards eager_, captured_, chunks_ and used_
+    std::map<cudaStream_t, Descriptor*> eager_;
     std::map<Key, Descriptor*> captured_;
     std::vector<Descriptor*> chunks_;
     std::size_t used_ = 0;

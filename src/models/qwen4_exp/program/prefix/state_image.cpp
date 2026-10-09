@@ -55,10 +55,19 @@ void for_each_segment_run(std::size_t offset, std::size_t bytes, std::size_t seg
 } // namespace
 
 KvWindowGeometry kv_window_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp, std::uint32_t lanes) {
+    return kv_window_geometry(c, storage, c.attention_layers, mtp, lanes);
+}
+
+KvWindowGeometry kv_window_geometry(const TextConfig& c, KvCacheStorage storage, std::uint32_t attention_layers,
+                                    bool mtp, std::uint32_t lanes) {
+    if (attention_layers > c.attention_layers) {
+        throw std::invalid_argument("Qwen4Exp window: more attention layers than the model has");
+    }
     KvWindowGeometry g;
-    if (!kv_storage_has_exact_window(storage)) { return g; }
+    const std::uint32_t kv_layers = attention_layers + (mtp ? 1U : 0U);
+    if (!kv_storage_has_exact_window(storage) || kv_layers == 0) { return g; }
     g.kv_heads  = static_cast<std::int32_t>(c.attention.kv_heads);
-    g.kv_layers = c.attention_layers + (mtp ? 1U : 0U);
+    g.kv_layers = kv_layers;
     g.lanes     = lanes;
     return g;
 }
@@ -343,10 +352,17 @@ void LaneStateImage::copy_group_from_packed(std::uint32_t group, const std::byte
 }
 
 KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp) {
+    return kv_page_geometry(c, storage, c.attention_layers, mtp);
+}
+
+KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, std::uint32_t attention_layers, bool mtp) {
+    if (attention_layers > c.attention_layers) {
+        throw std::invalid_argument("Qwen4Exp KV geometry: more attention layers than the model has");
+    }
     const auto layout   = paged_kv_storage_layout(storage, static_cast<std::int32_t>(c.attention.head_dim));
     const auto kv_heads = static_cast<std::int32_t>(c.attention.kv_heads);
     KvPageGeometry out;
-    out.kv_layers = c.attention_layers + (mtp ? 1U : 0U);
+    out.kv_layers = attention_layers + (mtp ? 1U : 0U);
     for (std::uint32_t l = 0; l < out.kv_layers; ++l) {
         out.geometry.planes.push_back({layout.key.data_dtype, layout.key.data_leading_extent, kv_heads});
         if (layout.key.has_scale()) {
@@ -367,6 +383,22 @@ PlaneRange kv_layer_planes(const KvPageGeometry& geometry, std::uint32_t kv_laye
     if (kv_layer >= geometry.kv_layers) { throw std::out_of_range("Qwen4Exp KV layer out of range"); }
     const std::size_t begin = static_cast<std::size_t>(kv_layer) * geometry.planes_per_layer;
     return PlaneRange{begin, begin + geometry.planes_per_layer};
+}
+
+std::size_t global_kv_plane(const KvPageGeometry& segment, std::uint32_t attention_base,
+                            std::uint32_t global_attention_layers, std::size_t segment_plane, bool segment_has_mtp) {
+    if (segment.geometry.planes.size() != static_cast<std::size_t>(segment.kv_layers) * segment.planes_per_layer ||
+        (segment_has_mtp && segment.kv_layers == 0)) {
+        throw std::invalid_argument("Qwen4Exp KV geometry: the segment's planes do not match its KV layers");
+    }
+    const std::uint32_t attention = segment.kv_layers - (segment_has_mtp ? 1U : 0U);
+    if (attention_base > global_attention_layers || attention > global_attention_layers - attention_base) {
+        throw std::out_of_range("Qwen4Exp KV geometry: the segment's attention layers are outside the model");
+    }
+    if (segment_plane >= segment.geometry.planes.size()) { throw std::out_of_range("Qwen4Exp KV plane out of range"); }
+    const auto local          = static_cast<std::uint32_t>(segment_plane / segment.planes_per_layer);
+    const std::uint32_t layer = local < attention ? attention_base + local : global_attention_layers;
+    return static_cast<std::size_t>(layer) * segment.planes_per_layer + segment_plane % segment.planes_per_layer;
 }
 
 } // namespace infernix::models::qwen4_exp::prefix

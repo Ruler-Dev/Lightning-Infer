@@ -442,6 +442,10 @@ private:
     std::uint32_t generation_    = 0;
 };
 
+// Belongs to the device current at construction: its row fences record on the publishing stream,
+// which must run on that device. A layer-split Program gives each segment its own page pool (over
+// that segment's planes, with the head's page count) and its own tables on the segment's device,
+// and publishes the head pool's page indices to every segment's tables in lockstep.
 class KVExecutionTablePool {
 public:
     KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
@@ -463,6 +467,18 @@ public:
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream);
+    // The same by physical page index, for tables whose pages another pool of the same page
+    // count hands out (indices_of). Each index must lie below this pool's backed limit; whether
+    // that page is live is the caller's ledger.
+    void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                         std::span<const std::int32_t> page_indices, cudaStream_t stream);
+    void publish_repeated_index(KVExecutionRowHandle row, std::int32_t page_index,
+                                std::uint32_t count, cudaStream_t stream);
+    // The physical indices of live pages, each checked against the pool that minted it.
+    [[nodiscard]] static std::vector<std::int32_t>
+    indices_of(std::span<const DeviceKVPageLease> pages);
+    [[nodiscard]] static std::vector<std::int32_t>
+    indices_of(std::span<const DeviceKVPageHandle> pages);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 
@@ -475,6 +491,7 @@ private:
     // not when it is enqueued. The fence records the entries a row's queued copies still read, so
     // a later publication - by the same owner or by the next owner of a released row - waits for
     // them before rewriting any of those entries. Disjoint entries are written without waiting.
+    // The event belongs to the pool's device, so a fence never spans two devices.
     struct RowFence {
         cudaEvent_t event   = nullptr;
         cudaStream_t stream = nullptr;
@@ -484,13 +501,16 @@ private:
 
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
+    void check_backed_index(std::int32_t page_index) const;
     [[nodiscard]] std::int32_t* writable_shadow(KVExecutionRowHandle row,
                                                 std::uint32_t logical_begin, std::size_t count,
                                                 cudaStream_t stream);
-    void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                         std::span<const std::int32_t> indices, cudaStream_t stream);
+    // Enqueues the copy of a filled shadow slice and fences it.
+    void upload_shadow(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                       std::span<const std::int32_t> shadow, cudaStream_t stream);
 
     KVExecutionTableSpec spec_;
+    int device_                    = 0;
     const DeviceKVPagePool* pages_ = nullptr;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;

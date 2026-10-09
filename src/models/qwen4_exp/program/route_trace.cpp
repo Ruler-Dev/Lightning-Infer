@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/program/route_trace.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -108,8 +109,18 @@ void set_route_trace(std::filesystem::path path) {
 }
 
 std::filesystem::path route_trace() {
-    const std::lock_guard lock(seam_mutex());
-    return seam_path();
+    {
+        const std::lock_guard lock(seam_mutex());
+        if (!seam_path().empty()) { return seam_path(); }
+    }
+    // Without the seam, INFERNIX_ROUTE_TRACE names the file, so baseline runs of the CLI and the
+    // server record traces for the planner and the expert-cache replay.
+#ifdef _WIN32
+    if (const wchar_t* path = _wgetenv(L"INFERNIX_ROUTE_TRACE"); path != nullptr && *path != L'\0') { return path; }
+#else
+    if (const char* path = std::getenv("INFERNIX_ROUTE_TRACE"); path != nullptr && *path != '\0') { return path; }
+#endif
+    return {};
 }
 
 } // namespace testing

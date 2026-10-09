@@ -342,6 +342,24 @@ The Engine-ready log reports the selected mode. Empty or unrecognized values, or
 the schedule, fail startup. This controls device scheduling (including stream synchronization);
 it does not override individual CUDA event creation flags.
 
+## Numerics SM count
+
+`INFERNIX_NUMERICS_SMS=N` pins the multiprocessor count that Ops use for launch decompositions
+whose results depend on it: the QSA decode, prompt and selection splits and grids, the wide
+experts' persistent grid, and the count every device context reports to its Ops (which includes
+the GDN chunked prefill). With the same `N` on GPUs of different SM counts, those Ops produce
+bit-identical results on each, as a layer split across two GPUs and its tests require. When unset,
+empty or `0`, each device uses its own count, which is the default and the fastest choice. A count
+below a device's own leaves SMs idle in those launches.
+
+The value is read once per process for both the CLI and HTTP server. A malformed value, or a count
+above the SM count of a device the process opens, fails startup when that device's context is
+created.
+
+```bash
+INFERNIX_NUMERICS_SMS=70 ./build/apps/infernix model.infernix --prompt "Hello"
+```
+
 ## Context and memory
 
 The official artifacts have a native context limit of 262,144 tokens. The practical allocation

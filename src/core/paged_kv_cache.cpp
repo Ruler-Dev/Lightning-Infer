@@ -1054,6 +1054,7 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
         block_tables_.ne[1] != spec_.table_rows) {
         throw std::logic_error("Paged KV execution-table layout is inconsistent");
     }
+    CUDA_CHECK(cudaGetDevice(&device_));
     for (RowFence& fence : row_fences_) {
         const cudaError_t status = cudaEventCreateWithFlags(&fence.event, cudaEventDisableTiming);
         if (status != cudaSuccess) {
@@ -1116,8 +1117,8 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
     for (std::size_t index = 0; index < page_handles.size(); ++index) {
         shadow[index] = pages_->physical_index(page_handles[index]);
     }
-    publish_indices(row_handle, logical_begin,
-                    std::span<const std::int32_t>(shadow, page_handles.size()), stream);
+    upload_shadow(row_handle, logical_begin,
+                  std::span<const std::int32_t>(shadow, page_handles.size()), stream);
 }
 
 void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_t logical_begin,
@@ -1136,8 +1137,8 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
     for (std::size_t index = 0; index < page_leases.size(); ++index) {
         shadow[index] = pages_->physical_index(page_leases[index].handle());
     }
-    publish_indices(row_handle, logical_begin,
-                    std::span<const std::int32_t>(shadow, page_leases.size()), stream);
+    upload_shadow(row_handle, logical_begin,
+                  std::span<const std::int32_t>(shadow, page_leases.size()), stream);
 }
 
 void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
@@ -1149,7 +1150,64 @@ void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
     const std::int32_t physical = pages_->physical_index(page);
     std::int32_t* shadow        = writable_shadow(row_handle, 0, count, stream);
     std::fill_n(shadow, count, physical);
-    publish_indices(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
+    upload_shadow(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
+}
+
+void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
+                                           std::uint32_t logical_begin,
+                                           std::span<const std::int32_t> page_indices,
+                                           cudaStream_t stream) {
+    if (!valid_handle(row_handle) || logical_begin > logical_page_capacity() ||
+        page_indices.size() > logical_page_capacity() - logical_begin) {
+        throw std::invalid_argument("Paged KV mapping publication is outside its execution row");
+    }
+    for (const std::int32_t index : page_indices) { check_backed_index(index); }
+    // The caller's indices are copied into the row's pinned shadow, which the queued copy reads.
+    std::int32_t* shadow = writable_shadow(row_handle, logical_begin, page_indices.size(), stream);
+    std::copy(page_indices.begin(), page_indices.end(), shadow);
+    upload_shadow(row_handle, logical_begin,
+                  std::span<const std::int32_t>(shadow, page_indices.size()), stream);
+}
+
+void KVExecutionTablePool::publish_repeated_index(KVExecutionRowHandle row_handle,
+                                                  std::int32_t page_index, std::uint32_t count,
+                                                  cudaStream_t stream) {
+    if (!valid_handle(row_handle) || count > logical_page_capacity()) {
+        throw std::invalid_argument("Repeated Paged KV mapping is outside its execution row");
+    }
+    check_backed_index(page_index);
+    std::int32_t* shadow = writable_shadow(row_handle, 0, count, stream);
+    std::fill_n(shadow, count, page_index);
+    upload_shadow(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
+}
+
+std::vector<std::int32_t>
+KVExecutionTablePool::indices_of(std::span<const DeviceKVPageLease> pages) {
+    std::vector<std::int32_t> indices;
+    indices.reserve(pages.size());
+    for (const DeviceKVPageLease& page : pages) {
+        const DeviceKVPageHandle handle = page.handle();
+        if (!handle.valid()) { throw std::invalid_argument("Paged KV page lease is empty"); }
+        indices.push_back(handle.owner_->physical_index(handle));
+    }
+    return indices;
+}
+
+std::vector<std::int32_t>
+KVExecutionTablePool::indices_of(std::span<const DeviceKVPageHandle> pages) {
+    std::vector<std::int32_t> indices;
+    indices.reserve(pages.size());
+    for (const DeviceKVPageHandle page : pages) {
+        if (!page.valid()) { throw std::invalid_argument("Paged KV page handle is empty"); }
+        indices.push_back(page.owner_->physical_index(page));
+    }
+    return indices;
+}
+
+void KVExecutionTablePool::check_backed_index(std::int32_t page_index) const {
+    if (page_index < 0 || static_cast<std::uint32_t>(page_index) >= pages_->backed_pages()) {
+        throw std::invalid_argument("Paged KV page index is outside the backed pages");
+    }
 }
 
 std::int32_t* KVExecutionTablePool::writable_shadow(KVExecutionRowHandle row_handle,
@@ -1158,6 +1216,14 @@ std::int32_t* KVExecutionTablePool::writable_shadow(KVExecutionRowHandle row_han
     RowFence& fence = row_fences_[static_cast<std::size_t>(row_handle.row_)];
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (stream != nullptr && capture == cudaStreamCaptureStatusNone) {
+        // The fence event can only be recorded on a stream of the pool's own device.
+        int stream_device = 0;
+        CUDA_CHECK(cudaStreamGetDevice(stream, &stream_device));
+        if (stream_device != device_) {
+            throw std::invalid_argument("Paged KV tables are published on another device");
+        }
+    }
     if (count != 0 && fence.end > fence.begin && capture == cudaStreamCaptureStatusNone) {
         const std::uint64_t end = static_cast<std::uint64_t>(logical_begin) + count;
         const bool overlaps     = logical_begin < fence.end && fence.begin < end;
@@ -1177,20 +1243,20 @@ std::int32_t* KVExecutionTablePool::writable_shadow(KVExecutionRowHandle row_han
            static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() + logical_begin;
 }
 
-void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
-                                           std::uint32_t logical_begin,
-                                           std::span<const std::int32_t> indices,
-                                           cudaStream_t stream) {
-    if (indices.empty()) { return; }
+void KVExecutionTablePool::upload_shadow(KVExecutionRowHandle row_handle,
+                                         std::uint32_t logical_begin,
+                                         std::span<const std::int32_t> shadow,
+                                         cudaStream_t stream) {
+    if (shadow.empty()) { return; }
     Tensor destination_row = row(row_handle);
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
-    CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
+    CUDA_CHECK(cudaMemcpyAsync(destination, shadow.data(), shadow.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture != cudaStreamCaptureStatusNone) { return; }
     RowFence& fence            = row_fences_[static_cast<std::size_t>(row_handle.row_)];
-    const std::uint32_t end    = logical_begin + static_cast<std::uint32_t>(indices.size());
+    const std::uint32_t end    = logical_begin + static_cast<std::uint32_t>(shadow.size());
     CUDA_CHECK(cudaEventRecord(fence.event, stream));
     fence.stream = stream;
     fence.begin  = fence.end > fence.begin ? std::min(fence.begin, logical_begin) : logical_begin;

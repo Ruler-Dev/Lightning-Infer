@@ -37,7 +37,8 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::P
     const std::size_t pass_bytes = patches.empty() ? 0 : vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
     const auto& overlay          = parameters_.model.overlay_vision();
     const std::size_t staging    = overlay ? vx::vision_staging_align(overlay->layout.staging_bytes) : 0;
-    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->frame_stride(),
+    out->window = plan_vision_window(items, reused, pass_bytes, staging, first().work_capacity,
+                                     first().residency->frame_stride(),
                                      static_cast<std::uint32_t>(parameters_.vision->merger_fc2.weight.n),
                                      config.hidden_size, config.depth);
     return out;
@@ -78,14 +79,14 @@ void ProgramImpl::vision_step(Lane& lane) {
     LaneVision& v                        = *lane.vision;
     const VisionWindowPlan& window       = v.admission->window;
     const qwen3_5::VisionConfig& config  = *parameters_.model.config().vision;
-    const cudaStream_t s                 = device_.stream;
+    const cudaStream_t s                 = first().device->stream;
     const auto out                       = parameters_.vision->merger_fc2.weight.n;
     if (!v.pass) {
         // Lend the handoff (W) or handoff and window (L); promotions still landing in the run are
         // waited for by compute and the weight stream's transfer stream.
-        const cudaStream_t writers[] = {device_.transfer_stream};
-        return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
-        v.lease   = residency_->lend(window.frames, s, writers);
+        const cudaStream_t writers[] = {first().device->transfer_stream};
+        return_stream_lease(first()); // a prefill ring is lent again by the next streamed chunk
+        v.lease   = first().residency->lend(window.frames, s, writers);
         v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {
@@ -94,14 +95,15 @@ void ProgramImpl::vision_step(Lane& lane) {
         } else {
             // Placement W: the whole pass runs in this call from the prefill workspace, idle between
             // units and stream-ordered on compute.
-            work_->reset();
-            memory = work_->alloc_bytes(window.window_bytes);
+            first().work->reset();
+            memory = first().work->alloc_bytes(window.window_bytes);
         }
         const vx::VisionParameters* weights = &*parameters_.vision;
         std::size_t staging                 = 0;
         if (const auto& overlay = parameters_.model.overlay_vision()) {
             staging   = vx::vision_staging_align(overlay->layout.staging_bytes);
-            v.stream  = std::make_unique<vx::VisionWeightStream>(device_, *overlay, static_cast<std::byte*>(memory.data));
+            v.stream  = std::make_unique<vx::VisionWeightStream>(*first().device, *overlay,
+                                                                 static_cast<std::byte*>(memory.data));
             v.weights = v.stream->window_weights(*parameters_.vision);
             weights   = &*v.weights;
         }
@@ -119,10 +121,10 @@ void ProgramImpl::vision_step(Lane& lane) {
         }
         v.layout = std::make_unique<vx::VisionPassLayout>(vx::plan_vision_pass(config, *parameters_.vision, patches));
         if (v.layout->bytes > arena.bytes) { throw std::logic_error("Qwen4Exp: the Vision pass exceeds its window"); }
-        v.timer.emplace(device_);
+        v.timer.emplace(*first().device);
         v.timer->start();
-        v.pass = std::make_unique<vx::VisionTowerPass>(device_, config, *weights, std::move(items), arena, *v.layout,
-                                                       v.stream.get());
+        v.pass = std::make_unique<vx::VisionTowerPass>(*first().device, config, *weights, std::move(items), arena,
+                                                       *v.layout, v.stream.get());
     }
     // Placement W: every stage now. L: `layers_per_step` layers per call; the embedding rides with the
     // first step and the merger with the last.
@@ -139,11 +141,11 @@ void ProgramImpl::vision_step(Lane& lane) {
     v.timer->record_stop();
     if (window.lease) {
         // Only the handoff stays lent; the window's frames go back once compute reaches here.
-        const auto handoff_frames = static_cast<std::uint32_t>(
-            (align(window.handoff_bytes) + residency_->frame_stride() - 1) / residency_->frame_stride());
+        const std::uint64_t stride = first().residency->frame_stride();
+        const auto handoff_frames  = static_cast<std::uint32_t>((align(window.handoff_bytes) + stride - 1) / stride);
         if (handoff_frames < v.lease.count) {
             ExpertResidency::FrameLease tail{.first = v.lease.first + handoff_frames, .count = v.lease.count - handoff_frames};
-            residency_->give_back(tail, s);
+            first().residency->give_back(tail, s);
             v.lease.count = handoff_frames;
         }
     }
@@ -158,7 +160,7 @@ void ProgramImpl::vision_step(Lane& lane) {
 void ProgramImpl::vision_release(Lane& lane) noexcept {
     try {
         LaneVision& v        = *lane.vision;
-        const cudaStream_t s = device_.stream;
+        const cudaStream_t s = first().device->stream;
         // Compute is ordered after every upload into the window before its memory goes back.
         if (v.stream) { v.stream->finish(s); }
         if (v.encoded && v.timer) { lane.vision_seconds = v.timer->elapsed_ms() * 1e-3; }
@@ -166,7 +168,7 @@ void ProgramImpl::vision_release(Lane& lane) noexcept {
         v.layout.reset();
         v.weights.reset();
         v.stream.reset();
-        if (v.lease.valid()) { residency_->give_back(v.lease, s); }
+        if (v.lease.valid()) { first().residency->give_back(v.lease, s); }
     } catch (...) {}
     lane.vision.reset();
 }
@@ -180,7 +182,7 @@ const execution::VisionInput* ProgramImpl::stage_vision(Lane& lane, std::uint32_
                      std::span<std::int32_t>(words, static_cast<std::size_t>(columns_)));
     if (slice.count == 0) { return nullptr; }
     const std::int32_t out = v.handoff.ne[0];
-    auto* base             = static_cast<std::byte*>(io_device_.p);
+    auto* base             = static_cast<std::byte*>(first().io_device.p);
     vision_input_          = {Tensor(static_cast<std::byte*>(v.handoff.data) + 2ULL * out * slice.first, DType::BF16,
                                      {out, static_cast<std::int32_t>(slice.count)}),
                               Tensor(base + io_layout_.vision_columns, DType::I32, {static_cast<std::int32_t>(slice.count)})};
@@ -193,7 +195,7 @@ const execution::VisionInput* ProgramImpl::stage_mtp_vision(Lane& lane, std::uin
     const LaneVision& v    = *lane.vision;
     const std::int32_t out = v.handoff.ne[0];
     auto* words            = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.mtp_vision_columns);
-    auto* base             = static_cast<std::byte*>(io_device_.p);
+    auto* base             = static_cast<std::byte*>(head().io_device.p);
     mtp_vision_inputs_.assign(static_cast<std::size_t>(subchunks), execution::VisionInput{});
     for (std::int32_t k = 0; k < subchunks; ++k) {
         // Cell c of sub-chunk k sits at first + 512k + c and takes token first + 512k + c + 1.

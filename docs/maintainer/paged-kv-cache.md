@@ -510,9 +510,16 @@ block\_tables[N_{logical},C]
 \]
 
 where \(N_{logical}=L\) and \(C=max\_concurrency\). Each active address space leases one row, whose
-entries are I32 pool-local physical page IDs. Activation publishes the Device page IDs of the membership
+entries are I32 physical page IDs. Activation publishes the Device page IDs of the membership
 in bulk; a resume can lease a different row.
 An execution row does not own logical pages, a frontier or a reservation.
+
+The IDs are pool-local unless a pool of the same page count mints them: a layer-split Program gives
+each segment its own page pool over that segment's planes and its own tables on the segment's device.
+Only the head segment's pool reserves pages; `KVExecutionTablePool::indices_of` reads the head
+leases' physical indices and `publish_indices`/`publish_repeated_index` publish the same indices to
+every segment's tables in lockstep. Each published index must lie below the publishing pool's backed
+pages; whether the page is live is the head pool's ledger.
 
 ## 7. Finite execution units and lifecycle
 
@@ -852,7 +859,8 @@ a replay is in flight.
 17. A block-table publication's H2D reads the execution row's pinned shadow only when the stream reaches
     it. A later publication of the same row (including the next owner's publication after release) waits
     for that copy to complete before rewriting shadow entries that overlap a copy still in the queue;
-    non-overlapping entries do not wait.
+    non-overlapping entries do not wait. A table pool and its row fences belong to the device current
+    at its construction: an eager publication on a stream of another device is refused.
 
 ---
 

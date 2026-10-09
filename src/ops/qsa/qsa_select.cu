@@ -769,14 +769,9 @@ int ceil_div(std::int64_t a, std::int64_t b) { return static_cast<int>((a + b - 
 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
-int multiprocessors() {
-    static PerDevice<int> count;
-    return count.get([](int device) {
-        int value = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device));
-        return value;
-    });
-}
+// The SMs the score and selection grids are sized in: numerics_multiprocessor_count's, which
+// INFERNIX_NUMERICS_SMS pins so that GPUs with different SM counts launch the same grids.
+int multiprocessors() { return numerics_multiprocessor_count(current_device()); }
 
 struct Layout {
     std::int32_t group  = 0; // columns per score pass

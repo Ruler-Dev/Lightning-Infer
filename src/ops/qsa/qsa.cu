@@ -885,18 +885,13 @@ constexpr int kSmallCallColumns = 8;
 //   this costs ~2 us at W = 5 and ~10 us at W = 8 per call, under 0.2 % of a round; W = 1-2 are equal.
 // - Wider calls: one wave of the decode kernel's CTAs (one 512-thread CTA per SM), at most 48 and at
 //   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. Against the
-//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §19.3.15).
+//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §19.3.15). Their split, and
+//   with it their route and bits, depends on the SM count (at 9-42 columns on 170 SMs), so the count is
+//   numerics_multiprocessor_count's, which INFERNIX_NUMERICS_SMS pins for the same bits on every GPU.
 int attention_splits(int columns, const QsaGeometry& g) {
     const int attended = g.budget + g.ratio - 1;
     if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }
-    static PerDevice<int> multiprocessors;
-    const int sms = multiprocessors.get([](int device) {
-        int count = 0;
-        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
-            throw std::runtime_error("qsa: cannot query the multiprocessor count");
-        }
-        return count;
-    });
+    const int sms    = numerics_multiprocessor_count(current_device());
     const int splits = std::clamp(sms / (columns * g.kv_heads), 1, 48);
     return splits == 1 ? 1 : std::max(splits, 4);
 }

@@ -53,8 +53,10 @@ public:
     }
 
 private:
+    // A mutex rather than std::once_flag: a build that throws must leave its slot buildable by
+    // the next call, which std::call_once does not guarantee on every standard library.
     struct Slot {
-        std::once_flag once;
+        std::mutex mutex;
         std::atomic<bool> ready{false};
         std::optional<T> value;
     };
@@ -64,10 +66,11 @@ private:
         const int device = current_device();
         Slot& slot       = slots_[static_cast<std::size_t>(device)];
         if (!slot.ready.load(std::memory_order_acquire)) {
-            std::call_once(slot.once, [&] {
+            const std::lock_guard<std::mutex> lock(slot.mutex);
+            if (!slot.ready.load(std::memory_order_relaxed)) {
                 build(slot.value, device);
                 slot.ready.store(true, std::memory_order_release);
-            });
+            }
         }
         return *slot.value;
     }
@@ -84,5 +87,16 @@ void once_per_device(PerDevice<bool>& done, Action&& action) {
         return true;
     });
 }
+
+// The multiprocessor count of `device` for launch decompositions whose results depend on it:
+// split counts, persistent grids and tile choices sized in waves of SMs. It is the device's
+// cudaDevAttrMultiProcessorCount (queried once per device), or INFERNIX_NUMERICS_SMS when that
+// is set to a positive count (read once per process). Pinning one count on every device makes
+// those Ops give the same bits on GPUs with different SM counts, as a layer split across two
+// GPUs and its tests need; unset, empty or 0 keeps each device's own count. A pinned count
+// above the device's own (whose cooperative grids could then not be resident) or a malformed
+// value throws std::invalid_argument, a device outside [0, kMaxDevices) std::out_of_range.
+// DeviceContext::multiprocessor_count() and execution_view() report this count.
+int numerics_multiprocessor_count(int device);
 
 } // namespace infernix

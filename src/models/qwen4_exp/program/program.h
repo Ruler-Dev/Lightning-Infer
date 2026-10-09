@@ -45,6 +45,8 @@ namespace execution {
 class Parameters;
 }
 
+struct SegmentSpec;
+
 namespace detail {
 class ProgramImpl;
 struct BasePlanImpl;
@@ -467,6 +469,7 @@ struct ProgramOptions {
 
 class Program {
 public:
+    // One device segment: the whole model on `device`.
     Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options);
     ~Program() noexcept;
 
@@ -474,9 +477,16 @@ public:
     // public token count; validates the options.
     [[nodiscard]] static ProgramDevicePlan plan_device(const ProgramOptions& options, const Config& config,
                                                        std::uint32_t public_tokens);
+    // The device plan of one segment of a Program (segment_map.h); plan_device is the whole model's
+    // segment's. Only the whole model's segment can be planned until split execution.
+    [[nodiscard]] static ProgramDevicePlan plan_segment(const ProgramOptions& options, const Config& config,
+                                                        std::int32_t public_tokens, const SegmentSpec& segment);
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
+    // How each segment's expert frames were sized at construction, in segment order (an unsplit
+    // Program's one entry is vram_sizing()).
+    [[nodiscard]] std::span<const VramSizing> segment_vram_sizing() const noexcept;
 
     // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
     // its own thread when the cache should resize; the engine then calls maintain() from its

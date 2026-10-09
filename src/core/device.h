@@ -11,8 +11,10 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::infernix::cuda_check((expr), #expr, __FILE__, __LINE__)
 
-// Non-owning execution facts passed to Ops whose launch policy depends on physical device
-// capacity. DeviceContext remains the owner and authoritative source of both values.
+// Non-owning execution facts passed to Ops whose launch policy depends on the device's capacity:
+// the multiprocessor count is the numerics count (numerics_multiprocessor_count: the physical one
+// unless INFERNIX_NUMERICS_SMS pins it). DeviceContext remains the owner and authoritative source
+// of both values.
 struct DeviceExecutionView {
     cudaStream_t stream               = nullptr;
     std::int32_t multiprocessor_count = 0;
@@ -43,7 +45,8 @@ struct DeviceContext {
     int multiprocessor_count() const noexcept;
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
-    // Device memory currently free on this device (cudaMemGetInfo).
+    // Device memory currently free on this device (cudaMemGetInfo with `device` current, from any
+    // thread; the thread's current device is restored).
     std::size_t free_bytes() const;
     const char* sync_mode() const;
     // Waits for the compute stream only. Work on transfer_stream is ordered separately: callers
@@ -76,6 +79,40 @@ void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t by
 // Releases the gates waiting for `value`: orders every earlier store to pinned memory (including
 // non-temporal ones) before the word's store.
 void publish_pinned_word(std::uint32_t* pinned_ready, std::uint32_t value) noexcept;
+
+// The bound of a gate whose producer is another device's stream (a layer split's handoff,
+// core/handoff.h) and where it reports running out of it.
+struct PinnedGateBound {
+    std::uint64_t timeout_ns  = 1'000'000'000ULL; // 1 s: under the display GPU's 2 s TDR limit
+    std::uint32_t* error_word = nullptr;          // mapped pinned word the host checks after the round
+    std::uint32_t error_value = 0;                // stored on a timeout: (layer << 16) | code
+};
+
+// upload_pinned_when without the trap, for a word published by another device
+// (download_pinned_publish): a producer that stalls or faults there must fail the round, not this
+// device's context. Each CTA's polling thread gives up once the word has not matched for
+// `bound.timeout_ns`; it then stores `bound.error_value` to `*bound.error_word` (volatile store,
+// system fence) and its CTA skips its share of the copy. The stream stays usable and the host
+// reports the failure from the error word after the round; `device_dst` then holds an unspecified
+// mix of the earlier contents and the round's data, since CTAs time out independently. The other
+// arguments and requirements are upload_pinned_when's; `bound.error_word` must be set. Capturable.
+void upload_pinned_when_bounded(void* device_dst, const void* pinned_src, std::size_t bytes,
+                                const std::uint32_t* pinned_ready,
+                                const std::uint32_t* device_expected, std::uint64_t* wait_stats,
+                                const std::int32_t* wait_row, const PinnedGateBound& bound,
+                                cudaStream_t stream);
+
+// The device side of publish_pinned_word: copies `bytes` from device memory to mapped pinned memory
+// with SM stores (at most 16 CTAs of 256 threads, each thread's stores fenced at system scope),
+// then a second launch of one thread loads `*device_value` and stores it to `*pinned_ready` with a
+// system-scope release. A gate that reads that value (upload_pinned_when and _bounded on any
+// device, or the host) then reads the copied data. The values must strictly increase, as for
+// publish_pinned_word; the word is published also when `bytes` is 0. Both are plain launches
+// without programmatic dependent launch, so they keep stream order and are capturable. `bytes`
+// and both buffers are 16-byte multiples/aligned.
+void download_pinned_publish(void* pinned_dst, const void* device_src, std::size_t bytes,
+                             std::uint32_t* pinned_ready, const std::uint32_t* device_value,
+                             cudaStream_t stream);
 
 class CudaEventTimer {
 public:
