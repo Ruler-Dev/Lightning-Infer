@@ -2,6 +2,7 @@
 
 #include "ops/qsa/qsa_prompt.h"
 
+#include "core/per_device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -888,8 +889,11 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
     const auto run = [&]<int Stages>() {
         constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
-        static const cudaError_t configured = cudaFuncSetAttribute(
-            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        static PerDevice<cudaError_t> reservations;
+        const cudaError_t configured = reservations.get([&](int) {
+            return cudaFuncSetAttribute(qsa_prompt_kernel<Storage, Stages>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        });
         require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
@@ -905,14 +909,14 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
     // tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
     // §19.3.15). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
     // two stages.
-    static const int sms = [] {
-        int device = 0, count = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
+    static PerDevice<int> multiprocessors;
+    const int sms = multiprocessors.get([](int device) {
+        int count = 0;
+        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
             throw std::runtime_error("qsa prompt: cannot query the multiprocessor count");
         }
         return count;
-    }();
+    });
     constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
     if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
         run.template operator()<1>();

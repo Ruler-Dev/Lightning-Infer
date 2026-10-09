@@ -4,6 +4,7 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
 
 #include "core/device.h"
+#include "core/per_device.h"
 
 #include <cuda_bf16.h>
 
@@ -130,17 +131,18 @@ Descriptors make_descriptors(const std::uint8_t* x_plane, const std::uint8_t* h_
 }
 
 #ifdef _WIN32
-// The single staging of the wide route's descriptors (core/tma_descriptor_staging.cuh); every wide
-// launch runs on the compute stream that stages them.
+// The current device's staging of the wide route's descriptors (core/tma_descriptor_staging.cuh);
+// every wide launch runs on the compute stream that stages them.
 TmaDescriptorStaging<Descriptors>& descriptor_staging() {
-    static TmaDescriptorStaging<Descriptors> staging;
-    return staging;
+    static PerDevice<TmaDescriptorStaging<Descriptors>> staging;
+    return staging.get();
 }
 #else
-// Kernel parameters are copied at launch, so one host copy serves every call in turn.
+// Kernel parameters are copied at launch, so one host copy per device serves that device's calls
+// in turn; the maps address that device's workspace.
 Descriptors& host_descriptors() {
-    static Descriptors descriptors;
-    return descriptors;
+    static PerDevice<Descriptors> descriptors;
+    return descriptors.get();
 }
 #endif
 
@@ -179,13 +181,12 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
 }
 
 int persistent_ctas() {
-    static const int ctas = [] {
-        int device = 0, sms = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    static PerDevice<int> ctas;
+    return ctas.get([](int device) {
+        int sms = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
         return sms * Schedule::kMinBlocksPerSm;
-    }();
-    return ctas;
+    });
 }
 
 Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,

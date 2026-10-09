@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/per_device.h"
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
@@ -18,11 +19,11 @@ struct alignas(128) Bf16TmaDescriptors {
 };
 
 #ifdef _WIN32
-// The single Windows descriptor staging for Bf16TmaDescriptors. See
+// The current device's Windows descriptor staging for Bf16TmaDescriptors. See
 // core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
 inline TmaDescriptorStaging<Bf16TmaDescriptors>& bf16_tma_descriptor_staging() {
-    static TmaDescriptorStaging<Bf16TmaDescriptors> staging;
-    return staging;
+    static PerDevice<TmaDescriptorStaging<Bf16TmaDescriptors>> staging;
+    return staging.get();
 }
 #endif
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -23,8 +24,8 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
     if constexpr (requires { Epilogue::kRowTokens; }) {
         static_assert(Epilogue::kRowTokens == 1, "BF16 GEMV row consumers require one token");
     }
-    constexpr auto kernel = bf16_a16_gemv_kernel<Schedule, Output, Epilogue>;
-    int bytes             = 0;
+    static constexpr auto kernel = bf16_a16_gemv_kernel<Schedule, Output, Epilogue>;
+    int bytes                    = 0;
     if constexpr (Schedule::kActivationAccess == Bf16ActivationAccess::Shared) {
         constexpr int static_bytes = sizeof(Bf16GemvSharedStorage<Schedule>);
         constexpr int max_dynamic  = (99 * 1024 - static_bytes) / 128 * 128;
@@ -32,9 +33,11 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
             throw std::invalid_argument("BF16 GEMV activation exceeds shared memory capacity");
         bytes = p.k * 2;
         if (bytes + static_bytes > 48 * 1024) {
-            static const auto status = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic);
-            CUDA_CHECK(status);
+            static PerDevice<bool> configured;
+            once_per_device(configured, [&] {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                max_dynamic));
+            });
         }
     }
     kernel<<<p.rows / Schedule::kBlockRows, Schedule::kThreads, bytes, stream>>>(
@@ -112,8 +115,8 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
     if ((!bf16_predicated_rows<Schedule> && p.rows % Schedule::kBlockRows) ||
         p.k % (bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK))
         throw std::invalid_argument("BF16 sliced-K requires compatible row/K tiles");
-    constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
+    static constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
+    const int bytes              = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(bf16_predicated_rows<Schedule> ? div_up(p.rows, Schedule::kBlockRows)
                                                        : p.rows / Schedule::kBlockRows,

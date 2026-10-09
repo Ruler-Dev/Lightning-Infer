@@ -1,6 +1,7 @@
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/kv_cache/append/vq2_kernel.cuh"
 
 #include <algorithm>
@@ -27,14 +28,12 @@ KVCacheVqWindowTarget window_slots(const PagedKVWindowView& window) {
 
 // The selected device's SM count: the append grids are sized in whole waves of it.
 int vq_append_multiprocessors() {
-    static const int count = [] {
-        int device = 0;
-        int value  = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    static PerDevice<int> count;
+    return count.get([](int device) {
+        int value = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device));
         return value;
-    }();
-    return count;
+    });
 }
 
 template <typename Geometry, KVCacheVqKeyCodec Codec, KVCacheVqWindowMode Mode, bool MultiBatch,

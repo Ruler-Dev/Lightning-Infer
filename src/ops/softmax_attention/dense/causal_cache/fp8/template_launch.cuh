@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/grouped_mma.cuh"
 #include "ops/softmax_attention/common/causal_merge.cuh"
 #include <stdexcept>
@@ -30,13 +31,15 @@ void launch_fp8_kv_grouped_mma(const CausalAttentionOperands& p, Fp8KvCacheView<
     if (!TreeCapable && cache.tree_masks)
         throw std::invalid_argument("FP8 grouped attention: this route has no tree");
     const auto launch = [&]<bool Tree>() {
-        constexpr auto kernel =
+        static constexpr auto kernel =
             fp8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Tree>;
         constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
         if constexpr (S::kDynamicArena) {
-            static const auto status =
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-            CUDA_CHECK(status);
+            static PerDevice<bool> configured;
+            once_per_device(configured, [&] {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                bytes));
+            });
         }
         const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
                         partition.capacity, p.batch);

@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
@@ -35,11 +36,13 @@ void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadV
     const auto invoke = [&]<class Metadata>(Metadata metadata, const std::int32_t* valid) {
         const auto launch = [&]<int Warps, bool Pv8, bool Split>() {
             using Shape = CausalPromptI8FastShape<Warps>;
-            constexpr auto kernel =
+            static constexpr auto kernel =
                 causal_attention_prompt_i8_fast_kernel<G, Metadata, Warps, Pv8, Split>;
-            static const auto status = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
-            CUDA_CHECK(status);
+            static PerDevice<bool> configured;
+            once_per_device(configured, [&] {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                Shape::SmemBytes));
+            });
             const dim3 grid(div_up(p.width, Shape::Br), G::QHeads, plan.splits);
             kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,

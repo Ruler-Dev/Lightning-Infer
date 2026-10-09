@@ -2,6 +2,8 @@
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
 
+#include "core/per_device.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -463,11 +465,12 @@ __global__ void __launch_bounds__(kTallThreads, 1)
 
 template <class Codec>
 void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
-    static const bool configured = [] {
+    static PerDevice<bool> configured;
+    const bool ready = configured.get([](int) {
         return cudaFuncSetAttribute(projection_tall_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
-    }();
-    require(configured, "the tall kernel's shared memory could not be configured");
+    });
+    require(ready, "the tall kernel's shared memory could not be configured");
     const int rows_per_cta   = kTallWarps * kTallRowsPerWarp;
     const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
     projection_tall_kernel<Codec><<<(rows + rows_per_cta - 1) / rows_per_cta, kTallThreads, staged, stream>>>(
@@ -573,11 +576,12 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
     } else if (columns <= kTallMaxColumns && tall_route(rows, columns, kTallMinColumnsBf16, route)) {
         launch_tall(x, k, columns, rows, TallBf16{segments, k}, out, stream);
     } else if (columns >= kWideMinColumns) {
-        static const bool configured = [] {
+        static PerDevice<bool> configured;
+        const bool ready = configured.get([](int) {
             return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         kWideSharedBytes) == cudaSuccess;
-        }();
-        require(configured, "the wide kernel's shared memory could not be configured");
+        });
+        require(ready, "the wide kernel's shared memory could not be configured");
         projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
                                  kWideThreads, kWideSharedBytes, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));

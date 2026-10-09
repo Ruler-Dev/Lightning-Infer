@@ -12,6 +12,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
@@ -822,7 +823,8 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All) {
-    static const bool configured = [] {
+    static PerDevice<bool> configured;
+    once_per_device(configured, [] {
         cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(GateUpShared<Columns>)));
         cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -831,9 +833,7 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                              cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
                              cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
+    });
     gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
     check_launch("gate/up");

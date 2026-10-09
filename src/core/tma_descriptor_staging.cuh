@@ -36,7 +36,9 @@ namespace infernix {
 // captured again over the same workspace reuses them instead of adding more.
 //
 // Invariants, documented here because this is the single staging site:
-//   - one stream: every eager staged launch runs on the engine's single compute stream, so the
+//   - one instance per device: buffers are allocated on the device current at their first use,
+//     so every accessor keeps one instance per CUDA device (PerDevice, core/per_device.h);
+//   - one stream: every eager staged launch runs on its device's single compute stream, so the
 //     persistent device buffer orders against itself in-stream;
 //   - allocation and copies outside the graph: buffers are allocated, and captured descriptors
 //     copied, in relaxed capture mode by synchronous calls, so a route first reached while a

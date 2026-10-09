@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/per_device.h"
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
@@ -30,12 +31,12 @@ struct alignas(128) Nvfp4A4TmaDescriptors {
 };
 
 #ifdef _WIN32
-// The single Windows descriptor staging for Nvfp4A4TmaDescriptors, shared by every A4 TMA launch
-// route (linear, attention and GDN input projections, linear-add, LinearSwiGLU). See
+// The current device's Windows descriptor staging for Nvfp4A4TmaDescriptors, shared by every A4
+// TMA launch route (linear, attention and GDN input projections, linear-add, LinearSwiGLU). See
 // core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
 inline TmaDescriptorStaging<Nvfp4A4TmaDescriptors>& nvfp4_a4_tma_descriptor_staging() {
-    static TmaDescriptorStaging<Nvfp4A4TmaDescriptors> staging;
-    return staging;
+    static PerDevice<TmaDescriptorStaging<Nvfp4A4TmaDescriptors>> staging;
+    return staging.get();
 }
 #endif
 
@@ -430,8 +431,8 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     const Nvfp4A4TmaDescriptors* staged =
         nvfp4_a4_tma_descriptor_staging().stage(descriptors, stream);
 #endif
-    constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
-    constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
+    constexpr int bytes          = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
+    static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));

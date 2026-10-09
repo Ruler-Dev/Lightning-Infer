@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_mma.cuh"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include <stdexcept>
@@ -20,10 +21,12 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
     if (pv8 && !Values::kE4m3Values)
         throw std::invalid_argument("MXFP8 tiled attention: no 8-bit PV form for this V storage");
     const auto launch = [&]<class Metadata, bool Pv8>(Metadata metadata) {
-        constexpr auto kernel    = mxfp8_kv_tiled_mma_kernel<G, S, Keys, Values, Metadata, Pv8>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
-        CUDA_CHECK(status);
+        static constexpr auto kernel = mxfp8_kv_tiled_mma_kernel<G, S, Keys, Values, Metadata, Pv8>;
+        static PerDevice<bool> configured;
+        once_per_device(configured, [&] {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            S::kSharedBytes));
+        });
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, partition.capacity);
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,

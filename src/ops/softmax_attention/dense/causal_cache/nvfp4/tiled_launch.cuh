@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_mma.cuh"
 #include <stdexcept>
 
@@ -11,10 +12,12 @@ void launch_nvfp4_kv_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvReadView
     if (p.batch != 1)
         throw std::invalid_argument("NVFP4 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel    = nvfp4_kv_tiled_mma_kernel<G, S, Metadata>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
-        CUDA_CHECK(status);
+        static constexpr auto kernel = nvfp4_kv_tiled_mma_kernel<G, S, Metadata>;
+        static PerDevice<bool> configured;
+        once_per_device(configured, [&] {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            S::kSharedBytes));
+        });
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);
         kernel<<<grid, S::kThreads, S::kSharedBytes, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,

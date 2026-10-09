@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -10,9 +11,11 @@ template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
     static_assert(Bytes <= 99 * 1024);
     if constexpr (Bytes > 48 * 1024) {
-        static const auto status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(status);
+        static PerDevice<bool> configured;
+        once_per_device(configured, [] {
+            CUDA_CHECK(
+                cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes));
+        });
     }
     return Bytes;
 }

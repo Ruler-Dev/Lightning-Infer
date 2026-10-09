@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/per_device.h"
 
 #include <algorithm>
 #include <atomic>
@@ -410,12 +411,12 @@ void publish_pinned_word(std::uint32_t* pinned_ready, std::uint32_t value) noexc
 
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) { return; }
-    static const bool unified = [] {
-        int device = 0, value = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    static PerDevice<bool> unified_addressing;
+    const bool unified = unified_addressing.get([](int device) {
+        int value = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrUnifiedAddressing, device));
         return value != 0;
-    }();
+    });
     if (!unified) { throw std::runtime_error("upload_pinned needs unified addressing"); }
     constexpr int kThreads = 256;
     // One 16-byte load per thread: every load of a call is in flight at once.

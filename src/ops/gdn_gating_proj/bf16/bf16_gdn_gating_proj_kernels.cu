@@ -7,6 +7,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/per_device.h"
 
 #include <cuda_bf16.h>
 
@@ -291,12 +292,14 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                         static_cast<unsigned>(Geometry::kHeads / kBf16GdnBlockM),
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
-            constexpr bool FullTokens     = decltype(full_tokens)::value;
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                     NormalizeInput, NormTokenCapacity>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-            CUDA_CHECK(attr);
+            constexpr bool FullTokens = decltype(full_tokens)::value;
+            static PerDevice<bool> configured;
+            once_per_device(configured, [&] {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                         NormalizeInput, NormTokenCapacity>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            });
             if constexpr (SplitK > 1) {
                 cudaLaunchConfig_t config{};
                 config.gridDim          = grid;

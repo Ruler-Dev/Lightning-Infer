@@ -23,6 +23,7 @@
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
+#include "core/per_device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -328,16 +329,15 @@ template <class Codec>
 void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
             typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
             void* partials, cudaStream_t stream) {
-    static const bool configured = [] {
+    static PerDevice<bool> configured;
+    once_per_device(configured, [] {
         const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Codec>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                        static_cast<int>(kDownSharedBytes));
         if (error != cudaSuccess) {
             throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") + cudaGetErrorString(error));
         }
-        return true;
-    }();
-    (void)configured;
+    });
     const int columns = residual.ne[1];
     auto* partial     = static_cast<float*>(partials);
     const std::size_t partial_bytes =

@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/pdl.cuh"
+#include "core/per_device.h"
 #include "ops/common/score_id_order.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
@@ -769,13 +770,12 @@ int ceil_div(std::int64_t a, std::int64_t b) { return static_cast<int>((a + b - 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 int multiprocessors() {
-    static const int count = [] {
-        int device = 0, value = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    static PerDevice<int> count;
+    return count.get([](int device) {
+        int value = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device));
         return value;
-    }();
-    return count;
+    });
 }
 
 struct Layout {
@@ -809,10 +809,13 @@ ScoreTiles score_tiles(std::int32_t begin, std::int32_t columns, std::int32_t wi
     return tiles;
 }
 
-// Opts a kernel into `bytes` of dynamic shared memory beyond the default 48 KiB, once per size.
+// Opts a kernel into `bytes` of dynamic shared memory beyond the default 48 KiB, once per size and
+// device: `reservations` holds each device's largest reservation.
 template <class Kernel>
-void reserve_shared(Kernel kernel, std::size_t bytes, std::atomic<std::size_t>& reserved) {
-    if (bytes <= 48 * 1024 || bytes <= reserved.load(std::memory_order_acquire)) { return; }
+void reserve_shared(Kernel kernel, std::size_t bytes, PerDevice<std::atomic<std::size_t>>& reservations) {
+    if (bytes <= 48 * 1024) { return; }
+    std::atomic<std::size_t>& reserved = reservations.get();
+    if (bytes <= reserved.load(std::memory_order_acquire)) { return; }
     int device = 0, limit = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
@@ -822,8 +825,8 @@ void reserve_shared(Kernel kernel, std::size_t bytes, std::atomic<std::size_t>& 
     while (seen < bytes && !reserved.compare_exchange_weak(seen, bytes, std::memory_order_acq_rel)) {}
 }
 
-std::atomic<std::size_t> g_global_reserved{0};
-std::atomic<std::size_t> g_wide_reserved{0};
+PerDevice<std::atomic<std::size_t>> g_global_reserved;
+PerDevice<std::atomic<std::size_t>> g_wide_reserved;
 
 } // namespace
 

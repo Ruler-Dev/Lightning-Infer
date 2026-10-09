@@ -17,6 +17,7 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
@@ -408,15 +409,14 @@ struct DownEpilogue {
 
 template <Matrix M, class Epilogue>
 void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
-    using S               = Schedule;
-    constexpr int bytes   = static_cast<int>(sizeof(Storage<S>));
-    constexpr auto kernel = grouped_kernel<M, Epilogue>;
-    static const bool configured = [] {
+    using S                      = Schedule;
+    constexpr int bytes          = static_cast<int>(sizeof(Storage<S>));
+    static constexpr auto kernel = grouped_kernel<M, Epilogue>;
+    static PerDevice<bool> configured;
+    once_per_device(configured, [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));
-        return true;
-    }();
-    (void)configured;
+    });
     const int dynamic = detail::nvfp4_prepare_shared<bytes, kernel, true>();
 #ifdef _WIN32
     kernel<<<persistent_ctas(), S::kThreads, dynamic, stream>>>(static_cast<const Descriptors*>(call.descriptors),

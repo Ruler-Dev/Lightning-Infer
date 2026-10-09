@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 
@@ -66,14 +67,12 @@ inline bool fast_prompt_split_admissible(std::int32_t q_heads, std::int32_t widt
 }
 
 inline int fast_prompt_multiprocessors() {
-    static const int count = [] {
-        int device = 0;
-        int value  = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+    static PerDevice<int> count;
+    return count.get([](int device) {
+        int value = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device));
         return value;
-    }();
-    return count;
+    });
 }
 
 } // namespace infernix::ops::detail

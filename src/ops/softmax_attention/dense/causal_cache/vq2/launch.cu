@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/common/causal_merge.cuh"
@@ -110,12 +111,14 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
     if (!TreeCapable && cache.tree_masks)
         throw std::invalid_argument("VQ grouped attention: this route has no tree");
     const auto launch = [&]<bool Tree>() {
-        constexpr auto kernel =
+        static constexpr auto kernel =
             vq_kv_grouped_kernel<G, Tokens, MultiBatch, Masked, Codec,
                                  kVqGroupedKeyRows<G, Tokens, Codec>, Parallel, Tree>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
-        CUDA_CHECK(status);
+        static PerDevice<bool> configured;
+        once_per_device(configured, [&] {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            Shape::kArenaBytes));
+        });
         const dim3 grid(G::KVHeads * (Parallel ? div_up(p.width, Tokens) : 1),
                         window_splits + partition.capacity, p.batch);
         CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), Shape::kArenaBytes, stream}, kernel,
@@ -203,11 +206,13 @@ void prompt(const CausalAttentionOperands& p, const VqKvCacheView& cache,
                 : VqPromptStaging{nullptr, nullptr, nullptr, nullptr};
     const auto launch_prompt = [&]<int Warps, bool Split, bool Pv8, int Bc, class Metadata>(
                                    Metadata metadata) {
-        using Shape           = VqPromptShape<Codec, Warps, Bc>;
-        constexpr auto kernel = vq_prompt_kernel<G, Metadata, Codec, Warps, Split, Pv8, Bc>;
-        static const auto status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
-        CUDA_CHECK(status);
+        using Shape                  = VqPromptShape<Codec, Warps, Bc>;
+        static constexpr auto kernel = vq_prompt_kernel<G, Metadata, Codec, Warps, Split, Pv8, Bc>;
+        static PerDevice<bool> configured;
+        once_per_device(configured, [&] {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            Shape::SmemBytes));
+        });
         const dim3 grid(G::QHeads, div_up(p.width, Shape::Br), plan.splits);
         kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
             p.q, cache, metadata, stage_source, p.positions, p.scale, p.out, p.width,

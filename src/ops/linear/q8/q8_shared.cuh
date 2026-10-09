@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/per_device.h"
 
 namespace infernix::ops::detail {
 template <int Bytes>
@@ -17,9 +18,11 @@ __device__ __forceinline__ unsigned char* q8_shared_storage() {
 template <int Bytes, auto Kernel>
 int q8_prepare_shared() {
     if constexpr (Bytes > 48 * 1024) {
-        static const cudaError_t attribute =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(attribute);
+        static PerDevice<bool> configured;
+        once_per_device(configured, [] {
+            CUDA_CHECK(
+                cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes));
+        });
         return Bytes;
     } else
         return 0;

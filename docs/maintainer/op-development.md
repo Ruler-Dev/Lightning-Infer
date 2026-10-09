@@ -268,6 +268,14 @@ policy, template instantiation, and launch-error handling. Launcher headers are 
 contract headers, models, product code, permanent tests, and public benchmarks do not include
 them.
 
+Launch state that belongs to a device context (kernel attributes set with `cudaFuncSetAttribute`,
+cached device attributes such as the SM count, staging buffers) is keyed by the current device
+through `PerDevice` or `once_per_device()` (`src/core/per_device.h`). A process-wide static would
+apply the first device's state to every other device. A plan or workspace size read from such a
+cache (for example the fast-prompt split count) follows the current device, so size the
+workspace with the target device current, as its launch will be; passing the device's
+multiprocessor count explicitly removes the dependency.
+
 ### 4.3 Kernel and common facilities
 
 The kernel layer owns `__global__` functions and Op-local `__device__` computation. A kernel may

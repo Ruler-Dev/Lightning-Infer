@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/per_device.h"
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
@@ -23,12 +24,12 @@ struct alignas(128) Fp8TmaDescriptors {
 };
 
 #ifdef _WIN32
-// The single Windows descriptor staging for Fp8TmaDescriptors, shared by every FP8 A8 TMA launch
-// route (linear, linear-add, attention and GDN input projections, LinearSwiGLU). See
+// The current device's Windows descriptor staging for Fp8TmaDescriptors, shared by every FP8 A8
+// TMA launch route (linear, linear-add, attention and GDN input projections, LinearSwiGLU). See
 // core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
 inline TmaDescriptorStaging<Fp8TmaDescriptors>& fp8_tma_descriptor_staging() {
-    static TmaDescriptorStaging<Fp8TmaDescriptors> staging;
-    return staging;
+    static PerDevice<TmaDescriptorStaging<Fp8TmaDescriptors>> staging;
+    return staging.get();
 }
 #endif
 

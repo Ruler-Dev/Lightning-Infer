@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/per_device.h"
 
 namespace infernix::ops::detail {
 template <int Bytes>
@@ -18,9 +19,11 @@ template <int Bytes, auto Kernel, bool Dynamic = false>
 int nvfp4_prepare_shared() {
     static_assert(Bytes <= 99 * 1024);
     if constexpr (Bytes > 48 * 1024) {
-        static const cudaError_t status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(status);
+        static PerDevice<bool> configured;
+        once_per_device(configured, [] {
+            CUDA_CHECK(
+                cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes));
+        });
         return Bytes;
     } else {
         return Dynamic ? Bytes : 0;

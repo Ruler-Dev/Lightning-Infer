@@ -7,6 +7,7 @@
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
+#include "core/per_device.h"
 #include "ops/common/memory.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/launch.h"
@@ -888,14 +889,14 @@ constexpr int kSmallCallColumns = 8;
 int attention_splits(int columns, const QsaGeometry& g) {
     const int attended = g.budget + g.ratio - 1;
     if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }
-    static const int sms = [] {
-        int device = 0, count = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
+    static PerDevice<int> multiprocessors;
+    const int sms = multiprocessors.get([](int device) {
+        int count = 0;
+        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
             throw std::runtime_error("qsa: cannot query the multiprocessor count");
         }
         return count;
-    }();
+    });
     const int splits = std::clamp(sms / (columns * g.kv_heads), 1, 48);
     return splits == 1 ? 1 : std::max(splits, 4);
 }
@@ -1157,11 +1158,12 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         using Shared                = AttentionShared<Storage, Group, Stages>;
         constexpr std::size_t bytes = Shared::kBytes;
         constexpr auto kernel       = attention_kernel<Storage, Group, Exact, Stages>;
-        static const bool reserved  = [] {
+        static PerDevice<bool> reservations;
+        const bool reserved = reservations.get([](int) {
             return cudaFuncSetAttribute(attention_kernel<Storage, Group, Exact, Stages>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(Shared::kBytes)) == cudaSuccess;
-        }();
+        });
         require(reserved, "attention shared memory cannot be reserved");
         const cudaError_t error = pdl::launch_consumer(
             {grid, dim3(kAttentionThreads), bytes, stream}, kernel, static_cast<const bf16*>(q.data), geometry.heads,
