@@ -1,0 +1,279 @@
+#include "core/gdn_replay_records.h"
+#include "core/linear_attention_state.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
+namespace {
+
+// 256-byte aligned backing storage; std::aligned_alloc is C++26, so on MSVC use the
+// CRT's _aligned_malloc (which must be released with _aligned_free).
+#ifdef _WIN32
+inline void* aligned_backing_alloc(std::size_t bytes) {
+    return _aligned_malloc(bytes, 256);
+}
+inline void aligned_backing_free(void* data) { _aligned_free(data); }
+#else
+inline void* aligned_backing_alloc(std::size_t bytes) {
+    return std::aligned_alloc(256, bytes);
+}
+inline void aligned_backing_free(void* data) { std::free(data); }
+#endif
+
+using AlignedBacking = std::unique_ptr<void, decltype(&aligned_backing_free)>;
+
+AlignedBacking make_backing(std::size_t bytes) {
+    void* data = aligned_backing_alloc(bytes);
+    if (data == nullptr) { throw std::bad_alloc(); }
+    return AlignedBacking(data, &aligned_backing_free);
+}
+
+int fail(const char* label) {
+    std::cerr << label << '\n';
+    return 1;
+}
+
+int expect(bool condition, const char* label) {
+    if (condition) { return 0; }
+    std::cerr << label << '\n';
+    return 1;
+}
+
+int expect_size(std::size_t actual, std::size_t expected, const char* label) {
+    if (actual == expected) { return 0; }
+    std::cerr << label << " expected " << expected << ", got " << actual << '\n';
+    return 1;
+}
+
+int expect_shape(const infernix::Tensor& tensor, std::int32_t d0, std::int32_t d1, std::int32_t d2,
+                 std::int32_t d3, const char* label) {
+    if (tensor.ne[0] == d0 && tensor.ne[1] == d1 && tensor.ne[2] == d2 && tensor.ne[3] == d3) {
+        return 0;
+    }
+    std::cerr << label << " shape differs\n";
+    return 1;
+}
+
+template <class Fn>
+int expect_throw(Fn&& fn, const char* label) {
+    try {
+        fn();
+    } catch (const std::exception&) { return 0; }
+    std::cerr << label << " did not throw\n";
+    return 1;
+}
+
+std::size_t record_bytes(const infernix::GdnReplayRecordSpec& spec) {
+    infernix::LayoutBuilder builder;
+    (void)infernix::plan_gdn_replay_records(builder, spec);
+    return builder.finish(256);
+}
+
+} // namespace
+
+int main() {
+    int failures = 0;
+
+    const infernix::GdnReplayRecordSpec spec{
+        .layers          = 3,
+        .record_capacity = 5,
+        .width           = 4,
+        .conv_channels   = 256,
+        .qk_heads        = 2,
+        .value_heads     = 6,
+        .key_dim         = 128,
+        .value_dim       = 128,
+    };
+    infernix::LayoutBuilder builder;
+    const auto layout       = infernix::plan_gdn_replay_records(builder, spec);
+    const std::size_t bytes = builder.finish(256);
+    auto backing            = make_backing(bytes);
+    const infernix::GdnReplayRecords records({backing.get(), bytes}, layout);
+
+    failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
+    failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
+    failures += expect_shape(records.value, 128, 6, 4, 15, "value plane");
+    failures += expect_shape(records.gate, 2, 6, 4, 15, "gate plane");
+    failures += expect(records.conv.dtype == infernix::DType::BF16, "conv dtype differs");
+    failures += expect(records.key.dtype == infernix::DType::BF16, "key dtype differs");
+    failures += expect(records.value.dtype == infernix::DType::BF16, "value dtype differs");
+    failures += expect(records.gate.dtype == infernix::DType::FP32, "gate dtype differs");
+    failures += expect(reinterpret_cast<std::uintptr_t>(records.conv.data) % 256 == 0,
+                       "conv plane is not aligned");
+    failures += expect(reinterpret_cast<std::uintptr_t>(records.key.data) % 256 == 0,
+                       "key plane is not aligned");
+    failures += expect(reinterpret_cast<std::uintptr_t>(records.value.data) % 256 == 0,
+                       "value plane is not aligned");
+    failures += expect(reinterpret_cast<std::uintptr_t>(records.gate.data) % 256 == 0,
+                       "gate plane is not aligned");
+    failures += expect_size(layout.payload_bytes(),
+                            records.conv.bytes() + records.key.bytes() + records.value.bytes() +
+                                records.gate.bytes(),
+                            "record payload bytes");
+
+    const auto layer2 = records.layer(2, 3);
+    failures += expect_shape(layer2.conv, 256, 4, 3, 1, "layer conv slice");
+    failures += expect_shape(layer2.key, 128, 2, 4, 3, "layer key slice");
+    failures += expect_shape(layer2.value, 128, 6, 4, 3, "layer value slice");
+    failures += expect_shape(layer2.gate, 2, 6, 4, 3, "layer gate slice");
+    failures += expect(
+        static_cast<std::byte*>(layer2.conv.data) - static_cast<std::byte*>(records.conv.data) ==
+            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.conv.nb[2]),
+        "layer conv slice offset differs");
+    failures += expect(
+        static_cast<std::byte*>(layer2.key.data) - static_cast<std::byte*>(records.key.data) ==
+            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.key.nb[3]),
+        "layer key slice offset differs");
+    failures += expect_throw([&] { (void)records.layer(-1, 1); }, "negative layer");
+    failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
+    failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
+    failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
+
+    for (int width = 1; width <= spec.width; ++width) {
+        const auto narrow = records.narrowed(width);
+        failures += expect(narrow.spec.width == width && narrow.spec.layers == spec.layers &&
+                               narrow.spec.record_capacity == spec.record_capacity,
+                           "narrowed spec differs");
+        failures += expect_shape(narrow.conv, 256, width, 15, 1, "narrowed conv plane");
+        failures += expect_shape(narrow.key, 128, 2, width, 15, "narrowed key plane");
+        failures += expect_shape(narrow.value, 128, 6, width, 15, "narrowed value plane");
+        failures += expect_shape(narrow.gate, 2, 6, width, 15, "narrowed gate plane");
+        failures += expect(narrow.conv.data == records.conv.data &&
+                               narrow.key.data == records.key.data &&
+                               narrow.value.data == records.value.data &&
+                               narrow.gate.data == records.gate.data,
+                           "narrowed view moved a plane base");
+        const auto narrow_layer = narrow.layer(2, 3);
+        failures += expect_shape(narrow_layer.key, 128, 2, width, 3, "narrowed layer key");
+        failures += expect(static_cast<std::byte*>(narrow_layer.key.data) -
+                                   static_cast<std::byte*>(records.key.data) ==
+                               static_cast<std::ptrdiff_t>(2 * spec.record_capacity *
+                                                           narrow.key.nb[3]),
+                           "narrowed layer offset is not dense at the narrowed width");
+        failures += expect(narrow_layer.key.is_contiguous() && narrow_layer.conv.is_contiguous(),
+                           "narrowed layer rows are not dense");
+    }
+    failures += expect_throw([&] { (void)records.narrowed(0); }, "zero narrowed width");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width + 1); },
+                             "narrowed width above the storage width");
+
+    auto wide_spec  = spec;
+    wide_spec.width = 64;
+    infernix::LayoutBuilder wide_builder;
+    const auto wide_layout = infernix::plan_gdn_replay_records(wide_builder, wide_spec);
+    const auto wide_bytes  = wide_builder.finish(256);
+    auto wide_backing      = make_backing(wide_bytes);
+    const infernix::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
+    const auto row = wide.layer(2, 1);
+    for (int width = 1; width <= 64; ++width) {
+        const auto prefix = row.single_row_prefix(width);
+        failures += expect_shape(prefix.conv, 256, width, 1, 1, "prefix conv");
+        failures += expect_shape(prefix.key, 128, 2, width, 1, "prefix key");
+        failures += expect_shape(prefix.value, 128, 6, width, 1, "prefix value");
+        failures += expect_shape(prefix.gate, 2, 6, width, 1, "prefix gate");
+        failures +=
+            expect(prefix.conv.data == row.conv.data && prefix.key.data == row.key.data &&
+                       prefix.value.data == row.value.data && prefix.gate.data == row.gate.data,
+                   "prefix moved the record base");
+        failures += expect(prefix.conv.is_contiguous() && prefix.key.is_contiguous() &&
+                               prefix.value.is_contiguous() && prefix.gate.is_contiguous(),
+                           "single-row record prefix is not packed");
+    }
+    for (int width : {0, -1, 65}) {
+        failures +=
+            expect_throw([&] { (void)row.single_row_prefix(width); }, "invalid prefix width");
+    }
+    failures += expect_throw([&] { (void)wide.layer(1, 2).single_row_prefix(6); },
+                             "multi-row record prefix");
+    auto strided = row;
+    strided.key.nb[1] *= 2;
+    failures += expect_throw([&] { (void)strided.single_row_prefix(6); }, "strided record prefix");
+    auto mismatched       = row;
+    mismatched.gate.ne[2] = 32;
+    failures +=
+        expect_throw([&] { (void)mismatched.single_row_prefix(6); }, "mismatched record width");
+
+    failures += expect_size(record_bytes({.layers          = 48,
+                                          .record_capacity = 8,
+                                          .width           = 6,
+                                          .conv_channels   = 10240,
+                                          .qk_heads        = 16,
+                                          .value_heads     = 48,
+                                          .key_dim         = 128,
+                                          .value_dim       = 128}),
+                            85819392, "48-layer T6 capacity");
+    failures += expect_size(record_bytes({.layers          = 30,
+                                          .record_capacity = 8,
+                                          .width           = 6,
+                                          .conv_channels   = 8192,
+                                          .qk_heads        = 16,
+                                          .value_heads     = 32,
+                                          .key_dim         = 128,
+                                          .value_dim       = 128}),
+                            41656320, "30-layer T6 capacity");
+    failures += expect_size(record_bytes({.layers          = 30,
+                                          .record_capacity = 8,
+                                          .width           = 16,
+                                          .conv_channels   = 8192,
+                                          .qk_heads        = 16,
+                                          .value_heads     = 32,
+                                          .key_dim         = 128,
+                                          .value_dim       = 128}),
+                            111083520, "30-layer T16 capacity");
+
+    failures += expect_throw(
+        [&] {
+            infernix::LayoutBuilder invalid;
+            (void)infernix::plan_gdn_replay_records(invalid, {.layers          = 1,
+                                                            .record_capacity = 9,
+                                                            .width           = 2,
+                                                            .conv_channels   = 1,
+                                                            .qk_heads        = 1,
+                                                            .value_heads     = 1,
+                                                            .key_dim         = 1,
+                                                            .value_dim       = 1});
+        },
+        "record capacity above eight");
+
+    infernix::LayoutBuilder state_builder;
+    const auto state_layout = infernix::plan_linear_attention_state_pool(
+        state_builder, {.layers         = 3,
+                        .conv_channels  = 256,
+                        .conv_width     = 3,
+                        .value_heads    = 6,
+                        .value_head_dim = 128,
+                        .key_head_dim   = 128,
+                        .slot_count     = 7,
+                        .conv_dtype     = infernix::DType::BF16});
+    const std::size_t state_bytes = state_builder.finish(256);
+    auto state_backing            = make_backing(state_bytes);
+    infernix::LinearAttentionStatePool state({state_backing.get(), state_bytes}, state_layout);
+    const auto all = state.all_layers_view();
+    failures +=
+        expect(all.conv_layer0.data == state.layer_view(0).conv.data, "conv layer-0 base differs");
+    failures += expect(all.recurrent_layer0.data == state.layer_view(0).recurrent.data,
+                       "recurrent layer-0 base differs");
+    failures += expect_size(static_cast<std::size_t>(all.conv_layer_stride_bytes),
+                            static_cast<std::byte*>(state.layer_view(1).conv.data) -
+                                static_cast<std::byte*>(state.layer_view(0).conv.data),
+                            "conv layer stride");
+    failures += expect_size(static_cast<std::size_t>(all.recurrent_layer_stride_bytes),
+                            static_cast<std::byte*>(state.layer_view(1).recurrent.data) -
+                                static_cast<std::byte*>(state.layer_view(0).recurrent.data),
+                            "recurrent layer stride");
+    failures +=
+        expect_size(static_cast<std::size_t>(all.spec.slot_count), 7, "all-layer slot count");
+    failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
+                            "independent record capacity");
+
+    return failures == 0 ? 0 : fail("GDN replay record storage test failed");
+}

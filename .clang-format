@@ -1,0 +1,59 @@
+BasedOnStyle: LLVM
+
+# Preprocessor directive indentation
+IndentPPDirectives: AfterHash
+
+# Allow short statements on a single line
+AllowShortIfStatementsOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: true
+AllowShortFunctionsOnASingleLine: true
+AllowShortEnumsOnASingleLine: true
+
+ColumnLimit: 100
+
+# Align consecutive declarations
+AlignConsecutiveAssignments: true
+AlignConsecutiveMacros: true
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+# AlignConsecutiveDeclarations: true
+
+# Line breaks after template declarations
+AlwaysBreakTemplateDeclarations: Yes
+
+# Bin-pack arguments
+BinPackArguments: true
+BinPackParameters: true
+
+# Brace line breaks
+# BreakBeforeBraces: Allman
+
+# Remove all empty lines after access modifiers
+EmptyLineAfterAccessModifier: Never
+EmptyLineBeforeAccessModifier: Leave
+
+# Include block style
+IncludeBlocks: Regroup
+SortIncludes: Never
+
+SortUsingDeclarations: Never
+
+# Bin-pack constructor initializer lists
+PackConstructorInitializers: BinPack
+
+# Pointer and reference alignment
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Separate definition blocks
+SeparateDefinitionBlocks: Always
+
+# Indentation width
+IndentWidth: 4
+TabWidth: 4
+AccessModifierOffset: -4
+
+# Maximum number of empty lines to keep
+MaxEmptyLinesToKeep: 3

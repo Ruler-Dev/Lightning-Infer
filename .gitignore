@@ -1,0 +1,81 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+compile_commands.json
+CMakeUserPresets.json
+.cache/
+
+# CUDA / profiling artifacts
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Python tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Weight artifacts (large; produced by offline tooling)
+*.qus
+*.bin
+*.safetensors
+*.gguf
+*.ninfer
+*.ninfer.conversion.json
+*.infernix
+*.infernix.conversion.json
+/models/
+out/
+
+# Local workspace and transient runtime output
+/.local/
+/temp/
+/temp-*/
+/tmp/
+/tmp-*/
+/AGENTS.override.md
+/logs/
+*.log
+*.tmp
+/core
+/core.*
+
+# Measurement raw corpora & intermediates (large; produced by offline tooling).
+# The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
+tools/freq_corpus/fixtures/*
+!tools/freq_corpus/fixtures/ranking/
+
+# Release packages (packaging/windows/package_release.ps1)
+/dist/
+
+# Local deploy working files (never committed)
+/deploy-working/
+
+# A/B rig outputs and control build (bench/ab; the scripts and README are tracked)
+/bench/ab/ab_report.md
+/bench/ab/AB_DONE.txt
+/bench/ab/runner.log
+/bench/ab/watchdog.log
+/bench/ab/serve_*.log
+/bench/ab/arm_*.jsonl
+/bench/ab/control/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+profiles/
+.chatgpt/
+
+# Claude Code personal/local settings (may contain API tokens)
+.claude/settings.local.json

@@ -1,0 +1,404 @@
+#include "infernix_build_id.h"
+#include "options.h"
+#include "product/logging/logging.h"
+#include "product/logging/pretty_format.h"
+#include "product/logging/engine_diagnostics.h"
+#include "product/logging/startup_log.h"
+#include "product/log_colour/log_colour.h"
+#include "product/prompt_input/prompt_input.h"
+#include "product/speculative_options.h"
+
+#include "infernix/engine.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <fstream>
+#include <iterator>
+#include <iomanip>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+#include <spdlog/logger.h>
+
+namespace {
+
+std::string format_seconds(double seconds) {
+    return infernix::product::format_pretty_duration(seconds);
+}
+
+std::string format_rate(double tokens, double seconds) {
+    if (tokens <= 0.0 || seconds <= 0.0) { return "n/a"; }
+    return infernix::product::format_pretty_rate(tokens / seconds, "tok");
+}
+
+std::string format_percent(std::uint64_t numerator, std::uint64_t denominator) {
+    if (denominator == 0) { return "n/a"; }
+    return infernix::product::format_pretty_percent(static_cast<double>(numerator) /
+                                                  static_cast<double>(denominator));
+}
+
+std::string format_bytes(std::uint64_t bytes) {
+    return infernix::product::format_pretty_bytes(bytes);
+}
+
+std::string format_arena_used(const infernix::ArenaMemorySummary& arena) {
+    return format_bytes(arena.used_bytes) + " / " + format_bytes(arena.capacity_bytes);
+}
+
+std::string format_arena_peak(const infernix::ArenaMemorySummary& arena) {
+    return format_bytes(arena.peak_used_bytes) + " / " + format_bytes(arena.capacity_bytes);
+}
+
+std::string format_sampling(const infernix::ResolvedSamplingParameters& sampling) {
+    if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
+           << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
+           << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
+           << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
+    return output.str();
+}
+
+std::string format_finish(infernix::FinishReason reason) {
+    switch (reason) {
+    case infernix::FinishReason::None:
+        return "none";
+    case infernix::FinishReason::OutputLimit:
+        return "output-limit";
+    case infernix::FinishReason::ContextCapacity:
+        return "context-capacity";
+    case infernix::FinishReason::StopToken:
+        return "stop-token";
+    case infernix::FinishReason::StopString:
+        return "stop-string";
+    case infernix::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
+std::string format_kv_cache(infernix::KvCacheStorage storage) {
+    switch (storage) {
+    case infernix::KvCacheStorage::BFloat16:
+        return "bf16";
+    case infernix::KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case infernix::KvCacheStorage::Fp8E4M3Row256:
+        return "fp8-e4m3-row256";
+    case infernix::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    case infernix::KvCacheStorage::Vq2:
+        return "vq2";
+    case infernix::KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
+    }
+    return "unknown";
+}
+
+std::string format_kv_capacity_mode(infernix::KvCapacityMode mode) {
+    return mode == infernix::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
+// Stats colouring (stderr only). Each statistic gets a stable 256-colour ANSI
+// colour keyed by its name (see product/log_colour), so it keeps the same
+// colour on every line and can be tracked across the log as its value
+// changes. Colours are on by default when stderr is a terminal, so logs
+// captured to files stay plain; --log-colours on|off overrides either way.
+std::optional<bool> log_colours_flag; // set from --log-colours before any output
+
+bool stats_color_enabled() {
+    static const bool enabled = [] {
+        if (log_colours_flag.has_value()) { return *log_colours_flag; }
+        return infernix::product::log_colour::stderr_is_console();
+    }();
+    return enabled;
+}
+
+std::string colorize(std::string_view text, std::string_view key) {
+    return infernix::product::log_colour::colourize(text, key, stats_color_enabled());
+}
+
+void print_stage(std::string_view group, std::string_view detail, double seconds) {
+    const std::string elapsed = format_seconds(seconds);
+    std::cerr << std::left << std::setw(12) << group << colorize(detail, detail);
+    const std::size_t detail_width = std::max<std::size_t>(detail.size(), 26);
+    for (std::size_t i = detail.size(); i < detail_width; ++i) { std::cerr << ' '; }
+    for (std::size_t i = elapsed.size(); i < std::max<std::size_t>(elapsed.size(), 12); ++i) {
+        std::cerr << ' ';
+    }
+    std::cerr << colorize(elapsed, detail) << '\n';
+}
+
+void print_metric(std::string_view label, std::string_view value) {
+    std::cerr << std::left << std::setw(12) << "summary" << colorize(label, label);
+    const std::size_t label_width = std::max<std::size_t>(label.size(), 26);
+    for (std::size_t i = label.size(); i < label_width; ++i) { std::cerr << ' '; }
+    std::cerr << colorize(value, label) << '\n';
+}
+
+class StreamingSink final : public infernix::OutputSink {
+public:
+    void start(infernix::GenerationStart) override {}
+
+    void progress(infernix::PromptProgress) override {}
+
+    void timing(infernix::GenerationTimingObservation) override {}
+
+    void publish(infernix::OutputDelta delta) override {
+        std::ostream& output =
+            delta.channel == infernix::OutputChannel::Reasoning ? std::cerr : std::cout;
+        output << delta.text;
+        output.flush();
+        if (delta.channel == infernix::OutputChannel::Reasoning) {
+            reasoning_seen_ = reasoning_seen_ || !delta.text.empty();
+            if (!delta.text.empty()) { reasoning_ends_in_newline_ = delta.text.back() == '\n'; }
+        } else {
+            content_seen_ = content_seen_ || !delta.text.empty();
+            if (!delta.text.empty()) { content_ends_in_newline_ = delta.text.back() == '\n'; }
+        }
+    }
+
+    void finish_streams(bool successful = true) {
+        if (finished_) { return; }
+        finished_ = true;
+        if ((successful && !content_seen_) || (content_seen_ && !content_ends_in_newline_)) {
+            std::cout << '\n';
+        }
+        std::cout.flush();
+        if (reasoning_seen_ && !reasoning_ends_in_newline_) { std::cerr << '\n'; }
+    }
+
+private:
+    bool content_seen_              = false;
+    bool content_ends_in_newline_   = false;
+    bool reasoning_seen_            = false;
+    bool reasoning_ends_in_newline_ = false;
+    bool finished_                  = false;
+};
+
+void print_generation_summary(const infernix::GenerationResult& result,
+                              const infernix::ResolvedSamplingParameters& sampling,
+                              const infernix::MemorySummary& memory) {
+    print_stage("prepare", "request preparation", result.timings.prepare_seconds);
+    print_stage("generate", "vision", result.timings.vision_seconds);
+    print_stage("generate", "text prefill", result.timings.prefill_seconds);
+    print_stage("generate", "decode", result.timings.decode_seconds);
+    print_stage("generate", "total", result.timings.total_seconds);
+
+    const std::size_t generated = result.generated_token_ids.size();
+    const std::size_t decoded   = generated == 0 ? 0 : generated - 1;
+    const double model_seconds  = result.timings.vision_seconds + result.timings.prefill_seconds +
+                                 result.timings.decode_seconds;
+    print_metric("sampling", format_sampling(sampling));
+    print_metric("finish reason", format_finish(result.finish_reason));
+    print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
+    print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
+    print_metric("generated tokens", std::to_string(generated));
+    if (result.thinking.configured_budget) {
+        print_metric("thinking budget", std::to_string(*result.thinking.configured_budget));
+        print_metric("model thinking tokens",
+                     std::to_string(result.thinking.model_thinking_tokens));
+        print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
+        print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+    }
+    print_metric("model elapsed", format_seconds(model_seconds));
+    print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
+                                              result.timings.prefill_seconds));
+    print_metric("decode speed",
+                 format_rate(static_cast<double>(decoded), result.timings.decode_seconds));
+    print_metric("throughput (overall)",
+                 format_rate(static_cast<double>(generated), model_seconds));
+
+    const std::uint64_t reserved = static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
+                                   memory.runtime_reservation_bytes;
+    print_metric("device", std::to_string(memory.device));
+    print_metric("max context", std::to_string(memory.max_context));
+    print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
+    print_metric("KV capacity", std::to_string(memory.kv_capacity));
+    print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
+                                       std::to_string(memory.kv_capacity_max_page_groups));
+    print_metric("gpu weights used", format_arena_used(memory.weights));
+    print_metric("gpu sequence used", format_arena_used(memory.sequence));
+    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
+    print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
+    print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
+    print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
+    print_metric("VRAM headroom", format_bytes(memory.vram_headroom_bytes));
+    print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
+    print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
+    print_metric("planned device total", format_bytes(reserved));
+
+    const infernix::SpeculativeStats& speculative = result.speculative;
+    if (speculative.enabled) {
+        const std::string backend = infernix::product::speculative_backend_name(speculative.backend);
+        print_metric(backend + " draft window", std::to_string(speculative.draft_window));
+        print_metric(backend + " rounds", std::to_string(speculative.rounds));
+        print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
+        print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));
+        print_metric(backend + " accepted tokens", std::to_string(speculative.accepted_tokens));
+        print_metric(backend + " acceptance rate",
+                     format_percent(speculative.accepted_tokens, speculative.drafted_tokens));
+        if (speculative.rounds != 0) {
+            std::ostringstream length;
+            length << std::fixed << std::setprecision(2)
+                   << 1.0 + static_cast<double>(speculative.accepted_tokens) /
+                                static_cast<double>(speculative.rounds)
+                   << " tok/round";
+            print_metric(backend + " acceptance length", length.str());
+        }
+        if (!speculative.accepted_per_position.empty()) {
+            std::ostringstream positions;
+            for (std::size_t i = 0; i < speculative.accepted_per_position.size(); ++i) {
+                if (i != 0) { positions << ','; }
+                positions << speculative.accepted_per_position[i];
+            }
+            print_metric(backend + " accepted by pos", positions.str());
+        }
+        if (speculative.tree_rounds != 0) {
+            print_metric(backend + " tree rounds", std::to_string(speculative.tree_rounds));
+            print_metric(backend + " tree side rounds",
+                         std::to_string(speculative.tree_side_rounds));
+            print_metric(backend + " tree side drafts",
+                         std::to_string(speculative.tree_side_accepted_tokens));
+        }
+    }
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    infernix::cli::Options cli;
+    try {
+        cli = infernix::cli::parse_options(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        std::cerr << infernix::cli::usage_text(argv[0]);
+        return 1;
+    }
+    if (cli.help_requested) {
+        std::cout << infernix::cli::usage_text(argv[0]);
+        return 0;
+    }
+    log_colours_flag = cli.log_colours;
+
+    infernix::product::LoggingRuntime logging(
+        {.logger_name  = "infernix",
+         .level        = cli.log_level,
+         .presentation = infernix::product::LogPresentation::Tool});
+    const std::shared_ptr<spdlog::logger> logger = logging.logger();
+#ifdef INFERNIX_BUILD_ID
+    logger->info("build {}", INFERNIX_BUILD_ID);
+#endif
+    infernix::product::StartupLogRenderer startup_log(logging);
+
+    try {
+        infernix::PromptInput input =
+            cli.messages_path.empty()
+                ? infernix::product::prompt_from_text(cli.prompt, cli.enable_thinking)
+                : infernix::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
+                                                        cli.enable_vision);
+        input.options.reasoning_effort = cli.reasoning_effort;
+
+        infernix::RequestOptions request;
+        if (cli.json_object)
+            request.constraint = infernix::OutputConstraint::json_object();
+        else if (cli.regex)
+            request.constraint = infernix::OutputConstraint::regex(*cli.regex);
+        else if (!cli.choices.empty())
+            request.constraint = infernix::OutputConstraint::choice(cli.choices);
+        else if (!cli.grammar_path.empty() || !cli.json_schema_path.empty()) {
+            const auto& path = cli.grammar_path.empty() ? cli.json_schema_path : cli.grammar_path;
+            std::ifstream file(path, std::ios::binary);
+            if (!file) throw std::invalid_argument("cannot open constraint file: " + path.string());
+            std::string source(std::istreambuf_iterator<char>(file), {});
+            if (file.bad()) throw std::runtime_error("failed to read constraint file");
+            request.constraint = cli.grammar_path.empty()
+                                     ? infernix::OutputConstraint::json_schema(std::move(source))
+                                     : infernix::OutputConstraint::grammar(std::move(source));
+        }
+        request.execution.sampling                = cli.sampling;
+        request.execution.requested_output_tokens = cli.max_new;
+        request.execution.thinking.budget         = cli.thinking_budget;
+        request.execution.thinking.loop           = cli.reasoning_loop;
+        request.stop.token_ids                    = cli.stop_token_ids;
+        request.stop.strings                      = cli.stop_strings;
+        request.output.raw                        = cli.raw_output;
+
+        infernix::EngineOptions engine_options;
+        engine_options.artifact_path            = cli.artifact_path;
+        engine_options.chat_template_path       = cli.chat_template_path;
+        engine_options.ngram_volume_path        = cli.ngram_volume_path;
+        engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
+                                                                   : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
+        engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
+        engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
+        engine_options.device                   = cli.device;
+        engine_options.max_context              = cli.max_context;
+        engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
+        engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
+        engine_options.vram_past_budget         = cli.vram_past_budget;
+        engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
+        engine_options.prefill_8bit_pv              = cli.prefill_8bit_pv;
+        engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
+        engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
+        engine_options.speculative              = cli.speculative;
+        engine_options.enable_vision            = cli.enable_vision;
+        engine_options.vision_offload           = cli.vision_offload;
+        engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
+        engine_options.use_cuda_graph           = cli.use_cuda_graph;
+        // One CLI invocation owns exactly one request and needs neither history nor pause
+        // storage, so select those resource capacities explicitly.
+        engine_options.context_cache.enabled             = false;
+        engine_options.context_cache.device_state_slots  = 0;
+        engine_options.context_cache.host_capacity_bytes = 0;
+        engine_options.startup_observer                  = startup_log.observer();
+        engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
+
+        infernix::Engine engine(std::move(engine_options));
+        startup_log.engine_ready(engine.load_summary());
+        engine.reset_memory_peaks();
+
+        infernix::PreparedPrompt prompt = engine.prepare(std::move(input));
+
+        StreamingSink sink;
+        infernix::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            infernix::OutputConsumerMode::Streaming);
+        const infernix::ResolvedSamplingParameters sampling = generation.resolved_sampling();
+        infernix::GenerationResult result;
+        try {
+            result = generation.wait(&sink);
+            sink.finish_streams();
+        } catch (...) {
+            sink.finish_streams(false);
+            throw;
+        }
+
+        std::cerr << "phase       detail                      elapsed/progress\n";
+        if (cli.print_token_ids) {
+            std::cerr << std::left << std::setw(12) << "tokens" << std::setw(26) << "generated ids";
+            for (std::size_t i = 0; i < result.generated_token_ids.size(); ++i) {
+                if (i != 0) { std::cerr << ' '; }
+                std::cerr << result.generated_token_ids[i];
+            }
+            std::cerr << '\n';
+        }
+        print_generation_summary(result, sampling, engine.memory_summary());
+        return 0;
+    } catch (const std::exception& error) {
+        logger->error("{}", infernix::product::format_pretty_text(error.what()));
+        return 1;
+    }
+}

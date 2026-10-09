@@ -1,0 +1,502 @@
+#pragma once
+
+#include "core/arena.h"
+#include "core/layout.h"
+#include "core/paged_kv_storage.h"
+#include "core/tensor.h"
+#include "core/transfer_work.h"
+
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <type_traits>
+#include <vector>
+
+namespace infernix {
+
+inline constexpr std::int32_t kPagedKVPageSize = 64;
+
+/**
+ * Exact recent-key window planes of one layer (see kKVWindowSlots); empty for formats without a
+ * window. A window belongs to a sequence's state, so its last extent counts sequence state slots:
+ * a single-sequence view carries its own slot (extent one); a batched view carries every slot and
+ * `slots` (I32 [B]) names each row's slot.
+ *   k_codes/v_codes   I8   [256, kKVWindowSlots, Hkv, slots]  rotated INT8-G64 codes
+ *   k_scales/v_scales FP16 [4, kKVWindowSlots, Hkv, slots]    their group scales
+ *   tags              I32  [2, kKVWindowSlots, Hkv, slots]    K and V position/code hashes
+ */
+struct PagedKVWindowView {
+    Tensor k_codes;
+    Tensor v_codes;
+    Tensor k_scales;
+    Tensor v_scales;
+    Tensor tags;
+    Tensor slots;
+
+    [[nodiscard]] bool present() const noexcept { return tags.data != nullptr; }
+};
+
+/** Non-owning, single-sequence view consumed by growing-cache Ops. */
+struct PagedKVLayerView {
+    Tensor k_pages;
+    Tensor v_pages;
+    Tensor k_scale_pages;
+    Tensor v_scale_pages;
+    Tensor block_table;
+    std::int32_t head_dim     = 0;
+    std::int32_t num_kv_heads = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVWindowView window;
+};
+
+/** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
+struct PagedKVBatchLayerView {
+    Tensor k_pages;
+    Tensor v_pages;
+    Tensor k_scale_pages;
+    Tensor v_scale_pages;
+    Tensor block_tables;
+    std::int32_t head_dim     = 0;
+    std::int32_t num_kv_heads = 0;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVWindowView window;
+};
+
+/** Rebinds one checked single-sequence table row as a one-row batched view. */
+[[nodiscard]] PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache);
+
+// A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.
+struct KVPlaneGeometry {
+    DType dtype                 = DType::BF16;
+    std::int32_t leading_extent = 0;
+    std::int32_t head_extent    = 0;
+    std::size_t alignment       = 256;
+
+    friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
+};
+
+enum class PagedKVPlaneOrder : std::uint8_t {
+    PageMajor,
+    HeadMajor,
+};
+
+struct KVPageGeometry {
+    std::uint32_t page_tokens            = kPagedKVPageSize;
+    PagedKVPlaneOrder device_plane_order = PagedKVPlaneOrder::PageMajor;
+    std::vector<KVPlaneGeometry> planes;
+
+    friend bool operator==(const KVPageGeometry&, const KVPageGeometry&) = default;
+};
+
+struct DeviceKVPagePoolSpec {
+    std::uint32_t page_group_count = 0;
+    KVPageGeometry geometry;
+};
+
+struct KVExecutionTableSpec {
+    std::uint32_t logical_page_capacity = 0;
+    std::int32_t table_rows             = 0;
+};
+
+struct DeviceKVPlaneLayout {
+    KVPlaneGeometry geometry;
+    TensorRegion storage;
+};
+
+struct DeviceKVPagePoolLayout {
+    DeviceKVPagePoolSpec spec;
+    std::vector<DeviceKVPlaneLayout> planes;
+
+    [[nodiscard]] std::size_t payload_bytes() const noexcept;
+};
+
+struct KVExecutionTableLayout {
+    KVExecutionTableSpec spec;
+    TensorRegion block_tables;
+
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept;
+};
+
+[[nodiscard]] DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
+                                                              const DeviceKVPagePoolSpec& spec);
+
+[[nodiscard]] KVExecutionTableLayout plan_kv_execution_tables(LayoutBuilder& builder,
+                                                              const KVExecutionTableSpec& spec);
+
+class DeviceKVPagePool;
+class KVExecutionTablePool;
+class HostKVAllocationView;
+class HostKVAllocationConstView;
+struct HostKVPageLayout;
+
+/** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
+class DeviceKVPageHandle {
+public:
+    DeviceKVPageHandle() noexcept = default;
+
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+private:
+    friend class DeviceKVPagePool;
+    friend class DeviceKVPageLease;
+    friend class KVExecutionTablePool;
+
+    DeviceKVPageHandle(const DeviceKVPagePool* owner, std::int32_t index,
+                       std::uint32_t generation) noexcept
+        : owner_(owner), index_(index), generation_(generation) {}
+
+    const DeviceKVPagePool* owner_ = nullptr;
+    std::int32_t index_            = -1;
+    std::uint32_t generation_      = 0;
+};
+
+/** Move-only owner of one complete Device page-group replica. */
+class DeviceKVPageLease {
+public:
+    DeviceKVPageLease() noexcept = default;
+    ~DeviceKVPageLease();
+
+    DeviceKVPageLease(const DeviceKVPageLease&)            = delete;
+    DeviceKVPageLease& operator=(const DeviceKVPageLease&) = delete;
+    DeviceKVPageLease(DeviceKVPageLease&& other) noexcept;
+    DeviceKVPageLease& operator=(DeviceKVPageLease&& other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+    [[nodiscard]] DeviceKVPageHandle handle() const noexcept;
+    [[nodiscard]] bool belongs_to(const DeviceKVPagePool& pool) const noexcept;
+    bool release() noexcept;
+
+private:
+    friend class DeviceKVPagePool;
+
+    DeviceKVPageLease(DeviceKVPagePool& owner, std::int32_t index,
+                      std::uint32_t generation) noexcept
+        : owner_(&owner), index_(index), generation_(generation) {}
+
+    DeviceKVPagePool* owner_  = nullptr;
+    std::int32_t index_       = -1;
+    std::uint32_t generation_ = 0;
+};
+
+/** Move-only reservation of capacity not yet associated with physical page IDs. */
+class DeviceKVPageReservation {
+public:
+    DeviceKVPageReservation() noexcept = default;
+    ~DeviceKVPageReservation();
+
+    DeviceKVPageReservation(const DeviceKVPageReservation&)            = delete;
+    DeviceKVPageReservation& operator=(const DeviceKVPageReservation&) = delete;
+    DeviceKVPageReservation(DeviceKVPageReservation&& other) noexcept;
+    DeviceKVPageReservation& operator=(DeviceKVPageReservation&& other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+    [[nodiscard]] std::uint32_t pages() const noexcept { return pages_; }
+
+    [[nodiscard]] bool belongs_to(const DeviceKVPagePool& pool) const noexcept;
+    void clear() noexcept;
+    void release() noexcept;
+
+private:
+    friend class DeviceKVPagePool;
+
+    DeviceKVPageReservation(DeviceKVPagePool& owner, std::uint32_t pages) noexcept
+        : owner_(&owner), pages_(pages) {}
+
+    DeviceKVPagePool* owner_ = nullptr;
+    std::uint32_t pages_     = 0;
+};
+
+class DeviceKVPagePool {
+public:
+    DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout);
+
+    DeviceKVPagePool(const DeviceKVPagePool&)            = delete;
+    DeviceKVPagePool& operator=(const DeviceKVPagePool&) = delete;
+    DeviceKVPagePool(DeviceKVPagePool&&)                 = delete;
+    DeviceKVPagePool& operator=(DeviceKVPagePool&&)      = delete;
+
+    [[nodiscard]] const KVPageGeometry& geometry() const noexcept { return spec_.geometry; }
+
+    [[nodiscard]] std::uint32_t capacity_pages() const noexcept;
+    // Pages [0, backed_pages) can be handed out; the rest of the capacity has no memory behind it
+    // (an elastic pool over reserved virtual memory). The whole capacity by default.
+    [[nodiscard]] std::uint32_t backed_pages() const noexcept { return backed_pages_; }
+    // Whether every page in [pages, backed_pages) is free, so the limit may fall to `pages`.
+    [[nodiscard]] bool can_back(std::uint32_t pages) const noexcept;
+    // Raises or lowers the limit (lowering needs can_back; the caller unmaps the memory afterwards,
+    // raising maps it before). Allocation is first-fit over ascending pages, so a pool keeps its
+    // pages low and its top frees up.
+    void set_backed_pages(std::uint32_t pages);
+    [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
+    [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
+    [[nodiscard]] std::uint32_t available_pages() const noexcept;
+    [[nodiscard]] std::size_t plane_count() const noexcept;
+    [[nodiscard]] const Tensor& plane(std::size_t index) const;
+
+    [[nodiscard]] std::optional<DeviceKVPageReservation> reserve(std::uint32_t pages) noexcept;
+
+    [[nodiscard]] DeviceKVPageReservation make_empty_reservation() noexcept {
+        return DeviceKVPageReservation(*this, 0);
+    }
+
+    [[nodiscard]] bool can_resize_reservation(const DeviceKVPageReservation& reservation,
+                                              std::uint32_t new_reserved_pages) const noexcept;
+    void resize_reservation(DeviceKVPageReservation& reservation, std::uint32_t new_reserved_pages);
+
+    // Grows destination to target_page_count without host allocation or a second capacity check.
+    void materialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
+                     std::vector<DeviceKVPageLease>& destination,
+                     std::optional<DeviceKVPageHandle> preferred_predecessor = std::nullopt);
+    // Single-page forms for fixed-capacity logical stores which do not own a growable lease vector.
+    [[nodiscard]] DeviceKVPageLease materialize_one(DeviceKVPageReservation& reservation);
+    // Returns trailing leases to the reservation, keeping their capacity reserved.
+    void dematerialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
+                       std::vector<DeviceKVPageLease>& source);
+    void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
+
+    void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
+    TransferWork copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
+                           cudaStream_t stream = nullptr) const;
+
+    // One run assumes contiguous Host records and contiguous Device page IDs. Before Device
+    // allocation, sum this work over known Host runs as a nominal transfer estimate.
+    [[nodiscard]] TransferWork host_transfer_run_work(std::uint32_t pages) const;
+    [[nodiscard]] TransferWork device_copy_work(std::uint32_t pages) const;
+
+    TransferWork copy_to_host(std::span<const DeviceKVPageHandle> source,
+                              HostKVAllocationView destination,
+                              cudaStream_t stream = nullptr) const;
+    TransferWork copy_from_host(HostKVAllocationConstView source,
+                                std::span<const DeviceKVPageHandle> destination,
+                                cudaStream_t stream = nullptr) const;
+    // Record-addressed forms for caller-owned pinned host memory: page i is packed with `layout`
+    // at records[i]. Runs of consecutive physical pages whose records advance by one constant
+    // pitch are copied as one strided transfer per plane. A strided transfer must stay inside one
+    // pinned allocation and within the device's maximum copy pitch: `record_groups` (empty, or
+    // one id per record) names the allocation each record lies in, and records of different
+    // groups, or further apart than the maximum pitch, are never joined into one run.
+    void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                              std::span<std::byte* const> records,
+                              std::span<const std::uint32_t> record_groups,
+                              const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    // The same restricted to planes [plane_begin, plane_end), so a capture can copy a model
+    // layer's planes as soon as the layer's last writer has run.
+    void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                              std::span<std::byte* const> records,
+                              std::span<const std::uint32_t> record_groups,
+                              const HostKVPageLayout& layout, std::size_t plane_begin,
+                              std::size_t plane_end, cudaStream_t stream) const;
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout,
+                                cudaStream_t stream = nullptr) const;
+    // The same restricted to planes [plane_begin, plane_end), so a caller can order the planes a
+    // consumer needs first (a model's per-layer planes) ahead of the rest.
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout, std::size_t plane_begin,
+                                std::size_t plane_end, cudaStream_t stream) const;
+
+private:
+    friend class DeviceKVPageLease;
+    friend class DeviceKVPageReservation;
+    friend class KVExecutionTablePool;
+
+    [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
+    [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
+                       std::int32_t first, std::size_t count, std::byte* host_base,
+                       std::size_t host_pitch, const HostKVPageLayout& host,
+                       cudaStream_t stream) const;
+    [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
+                                                         std::span<const std::byte* const> records,
+                                                         std::span<const std::uint32_t> groups,
+                                                         std::size_t begin, std::size_t page_stride,
+                                                         std::size_t max_pitch,
+                                                         std::size_t& pitch) noexcept;
+    void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
+                                 const char* duplicate_message) const;
+    void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;
+    void release_free_page(std::int32_t index) noexcept;
+    void release_page(std::int32_t index, std::uint32_t generation) noexcept;
+    void release_reservation(std::uint32_t pages) noexcept;
+
+    void initialize_host_transfer_plan();
+    template <bool ToHost>
+    TransferWork copy_host_pages(std::span<const DeviceKVPageHandle> pages,
+                                 std::conditional_t<ToHost, std::byte*, const std::byte*> host,
+                                 cudaStream_t stream) const;
+
+    struct HostTransferPlane {
+        std::size_t host_offset    = 0;
+        std::size_t page_bytes     = 0;
+        std::size_t head_bytes     = 0;
+        std::uint32_t heads        = 0;
+        bool page_copies_supported = false;
+
+        [[nodiscard]] bool copy_by_page(std::size_t pages) const noexcept {
+            return page_copies_supported && pages < heads;
+        }
+    };
+
+    struct HostTransferGroup {
+        std::size_t first_plane  = 0;
+        std::size_t plane_count  = 1;
+        std::size_t device_pitch = 0;
+        std::size_t host_pitch   = 0;
+
+        [[nodiscard]] bool copy_by_page(std::size_t pages) const noexcept {
+            return pages < plane_count;
+        }
+    };
+
+    struct FreePageRun {
+        std::int32_t begin  = 0;
+        std::uint32_t count = 0;
+    };
+
+    DeviceKVPagePoolSpec spec_;
+    std::vector<Tensor> planes_;
+    std::vector<HostTransferPlane> host_transfer_planes_;
+    std::vector<HostTransferGroup> host_transfer_groups_;
+    // Index is min(run pages, size - 1); the last entry covers the ordinary long-run route.
+    std::vector<std::uint32_t> host_transfer_operations_;
+    std::size_t host_page_stride_         = 0;
+    std::uint64_t page_payload_bytes_     = 0;
+    std::size_t maximum_host_plane_group_ = 1;
+    std::vector<FreePageRun> free_page_runs_;
+    std::vector<std::uint32_t> page_generations_;
+    std::vector<bool> page_allocated_;
+    mutable std::vector<std::uint32_t> validation_marks_;
+    mutable std::uint32_t validation_stamp_ = 0;
+    std::uint32_t allocated_pages_          = 0;
+    std::uint32_t backed_pages_    = 0;
+    std::uint32_t reserved_pages_           = 0;
+};
+
+struct DeviceKVPageReservationRequest {
+    DeviceKVPagePool* pool = nullptr;
+    std::uint32_t pages    = 0;
+};
+
+// Reserves every distinct physical pool or leaves every pool unchanged.
+[[nodiscard]] std::vector<DeviceKVPageReservation>
+reserve_device_kv_page_bundle(std::span<const DeviceKVPageReservationRequest> requests);
+
+class KVExecutionRowHandle {
+public:
+    KVExecutionRowHandle() noexcept = default;
+
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+    [[nodiscard]] std::int32_t row_index() const noexcept { return row_; }
+
+private:
+    friend class KVExecutionTablePool;
+    friend class KVExecutionRowLease;
+
+    KVExecutionRowHandle(const KVExecutionTablePool* owner, std::int32_t row,
+                         std::uint32_t generation) noexcept
+        : owner_(owner), row_(row), generation_(generation) {}
+
+    const KVExecutionTablePool* owner_ = nullptr;
+    std::int32_t row_                  = -1;
+    std::uint32_t generation_          = 0;
+};
+
+class KVExecutionRowLease {
+public:
+    KVExecutionRowLease() noexcept = default;
+    ~KVExecutionRowLease();
+
+    KVExecutionRowLease(const KVExecutionRowLease&)            = delete;
+    KVExecutionRowLease& operator=(const KVExecutionRowLease&) = delete;
+    KVExecutionRowLease(KVExecutionRowLease&& other) noexcept;
+    KVExecutionRowLease& operator=(KVExecutionRowLease&& other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+    [[nodiscard]] KVExecutionRowHandle handle() const noexcept;
+
+    [[nodiscard]] std::int32_t row_index() const noexcept { return row_; }
+
+    [[nodiscard]] bool belongs_to(const KVExecutionTablePool& pool) const noexcept;
+    bool release() noexcept;
+
+private:
+    friend class KVExecutionTablePool;
+
+    KVExecutionRowLease(KVExecutionTablePool& owner, std::int32_t row,
+                        std::uint32_t generation) noexcept
+        : owner_(&owner), row_(row), generation_(generation) {}
+
+    KVExecutionTablePool* owner_ = nullptr;
+    std::int32_t row_            = -1;
+    std::uint32_t generation_    = 0;
+};
+
+class KVExecutionTablePool {
+public:
+    KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
+                         const DeviceKVPagePool& pages);
+    ~KVExecutionTablePool();
+
+    KVExecutionTablePool(const KVExecutionTablePool&)            = delete;
+    KVExecutionTablePool& operator=(const KVExecutionTablePool&) = delete;
+    KVExecutionTablePool(KVExecutionTablePool&&)                 = delete;
+    KVExecutionTablePool& operator=(KVExecutionTablePool&&)      = delete;
+
+    [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
+    [[nodiscard]] std::int32_t row_count() const noexcept;
+    [[nodiscard]] KVExecutionRowLease acquire(std::int32_t row);
+
+    void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                 std::span<const DeviceKVPageHandle> pages, cudaStream_t stream);
+    void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                 std::span<const DeviceKVPageLease> pages, cudaStream_t stream);
+    void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
+                          cudaStream_t stream);
+
+    [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
+
+    [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
+
+private:
+    friend class KVExecutionRowLease;
+
+    // A publication's H2D copy reads its row's pinned shadow slice when the stream reaches it,
+    // not when it is enqueued. The fence records the entries a row's queued copies still read, so
+    // a later publication - by the same owner or by the next owner of a released row - waits for
+    // them before rewriting any of those entries. Disjoint entries are written without waiting.
+    struct RowFence {
+        cudaEvent_t event   = nullptr;
+        cudaStream_t stream = nullptr;
+        std::uint32_t begin = 0;
+        std::uint32_t end   = 0;
+    };
+
+    [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
+    bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
+    [[nodiscard]] std::int32_t* writable_shadow(KVExecutionRowHandle row,
+                                                std::uint32_t logical_begin, std::size_t count,
+                                                cudaStream_t stream);
+    void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                         std::span<const std::int32_t> indices, cudaStream_t stream);
+
+    KVExecutionTableSpec spec_;
+    const DeviceKVPagePool* pages_ = nullptr;
+    Tensor block_tables_;
+    PinnedHostBuffer host_shadow_;
+    std::vector<bool> row_in_use_;
+    std::vector<std::uint32_t> row_generations_;
+    std::vector<RowFence> row_fences_;
+};
+
+} // namespace infernix

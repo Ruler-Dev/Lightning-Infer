@@ -1,0 +1,83 @@
+#include "runtime/engine/kv_capacity.h"
+
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+int check(bool condition, const char* message) {
+    if (condition) { return 0; }
+    std::cerr << message << '\n';
+    return 1;
+}
+
+template <class Attempt>
+std::string failure_message(const Attempt& attempt) {
+    try {
+        attempt();
+    } catch (const std::invalid_argument& failure) {
+        return failure.what();
+    }
+    return {};
+}
+
+} // namespace
+
+int main() {
+    int failures = 0;
+    const infernix::runtime::SequenceCapacityCurve curve{
+        .main_page_tokens                     = 64,
+        .minimum_main_page_groups             = 2,
+        .maximum_main_page_groups             = 6,
+        .minimum_device_reservation_bytes     = 1000,
+        .bytes_per_additional_main_page_group = 128,
+    };
+
+    const auto automatic =
+        infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve, 1360, 50);
+    failures +=
+        check(automatic.main_page_groups == 4 && automatic.resolved_tokens == 256 &&
+                  automatic.runtime_reservation_bytes == 1256 &&
+                  automatic.automatic_headroom_bytes == 50 && automatic.planned_slack_bytes == 104,
+              "automatic KV capacity did not select the largest fitting page count");
+
+    const auto capped =
+        infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve, 10000, 50);
+    failures += check(capped.main_page_groups == 6 && capped.resolved_tokens == 384,
+                      "automatic KV capacity exceeded or missed the target maximum");
+
+    const auto explicit_capacity = infernix::runtime::resolve_kv_capacity(
+        infernix::KvCapacityPolicy::explicit_capacity(129), curve, 1200, 50);
+    failures +=
+        check(explicit_capacity.main_page_groups == 3 && explicit_capacity.resolved_tokens == 192 &&
+                  explicit_capacity.runtime_reservation_bytes == 1128 &&
+                  explicit_capacity.automatic_headroom_bytes == 0,
+              "explicit KV capacity did not use page-aligned token semantics or kept a headroom");
+
+    const std::string insufficient_message = failure_message([&] {
+        (void)infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve,
+                                                   1049, 50);
+    });
+    failures += check(!insufficient_message.empty(),
+                      "automatic KV capacity accepted less than the minimum reservation");
+    failures += check(
+        insufficient_message ==
+            "automatic KV capacity requires 1050 bytes total (1000 bytes minimum Engine runtime "
+            "reservation + 50 bytes automatic headroom), but only 1049 bytes are available after "
+            "weights",
+        "automatic KV capacity error does not state the combined reservation + headroom total");
+
+    const std::string explicit_message = failure_message([&] {
+        (void)infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::explicit_capacity(384),
+                                                   curve, 1400, 50);
+    });
+    failures += check(
+        explicit_message ==
+            "requested Engine runtime reservation requires 1512 bytes, but only 1400 bytes are "
+            "available after weights",
+        "explicit KV capacity error does not state the after-weights allowance");
+
+    if (failures == 0) { std::cout << "ok\n"; }
+    return failures == 0 ? 0 : 1;
+}
