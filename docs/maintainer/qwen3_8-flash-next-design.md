@@ -714,6 +714,25 @@ loads all-device on a hypothetical larger card. The n-gram table is written as i
 (`*.ninfer.ngram`), so it can be placed on a different NVMe drive and a 4 KiB-aligned layout is
 guaranteed.
 
+**Layer split** (multi-GPU WP7). `LoadOptions::segment_ends` splits the dense weights into one
+device arena per segment (`SegmentMap`): each parameter's owner places it. A decoder layer's weights
+go to the segment running the layer; the final mixer, the head, the MTP drafter and the proposal
+head go to the last segment; the Vision tower goes to the first. The token embedding stays pinned
+and shared, because the first segment embeds the prompt and the head's MTP drafter its tokens.
+Each expert bank stays pinned, tagged with its layer's segment (the tag places it only with
+per-segment pinned chunks). The pinned space and the one-segment layout are unchanged.
+`materialize_model` takes one device per segment, and the `Model` keeps the `SegmentMap` with their
+ordinals. `LoadPlan` reports each segment's arena and each part's device bytes for sizing a split:
+per layer, head, MTP, and Vision. Each counts its objects with their worst alignment padding, so a
+segment's arena never exceeds the sum of its parts.
+Each segment has its own `execution::Parameters(model, layers, role)`, built on its device. It
+prepares only its layers, plus the head, MTP drafter and draft head on the last segment and the
+tower on the first. Its `layers` table stays indexed by decoder layer: other layers are empty (null
+payloads, no bank or scales). Its expert-scale buffer holds only its layers. A range across
+segments, or a role its range cannot hold, is refused. `infernix_qwen4_exp_load_segments_test`
+checks the placements, the parts' bytes and both segments' Parameters on two contexts of device 0
+(`INFERNIX_QWEN4_ARTIFACT`).
+
 ---
 
 ## 7. Ownership in Infernix
@@ -2406,6 +2425,31 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   - arbiter decisions forced to each service;
   - every CPU ISA variant the host supports.
 - **Exact import.** Recipe A's word equality (§16.3) runs on the real artifact.
+- **Layer split** (multi-GPU WP8). `execution::Forward` runs one segment of a split
+  (`ForwardSegment`: a layer range, its compact GDN and attention bases, and the `HandoffChannel`s
+  it receives the residual from and sends it to). Its state, KV planes, tails, verification records
+  and per-layer expert tables (frames, route log, landing, CPU and fetch channels, the prefill
+  stream, the CPU split policy) hold only its layers, indexed from 0; parameters, taps and the
+  prefix-cache layer waits stay indexed by decoder layer, and CPU channels keep their global layer.
+  Event-mode handoffs need the owner's `record_sent`/`wait_sent` around the call, outside capture;
+  Gate mode waits for `ForwardBatch::handoff_word` (its waits add to the optional
+  `ForwardSegment::in_wait_stats`). A `HandoffChannel` slot holds one decode or verification
+  residual, so eager prefill chunks do not use `run()`'s crossing: the owner composes each
+  segment's steps and moves the residual with `BulkHandoff::transfer`, chunk after chunk with no
+  host wait. `infernix_qwen4_exp_forward_real_test TOKENS
+  --split 1,2,3,4,24,47 [--split-device 1] [--cpu-columns]` compares two segments, in Event and in
+  Gate mode, with the unsplit Forward bit for bit: a 4,096-column prefill chunk, a decode step and a
+  W = 4 verification call (logits, every residual tap, route and landing logs, replay records), the
+  same prefill as four chunks through a `BulkHandoff` (the last chunk), and the CPU-served calls.
+  Across two GPUs it needs `INFERNIX_NUMERICS_SMS` at the smaller SM count. The chunks are bit-exact
+  across two GPUs with segment 0's next chunk overlapping segment 1's, and on one GPU when a stream
+  event keeps them apart; overlapping on one GPU they are not: layer 0's MoE output of a
+  2,048-column call differed with an identical input (K = 47, RTX PRO 4000, measured 2026-10-10),
+  the "F1 nondeterminism" below. So on `--devices A,A` the segments' work must not overlap on the
+  GPU where the split's results are to equal the unsplit run.
+  Its Gate decode step launches only the receiver's gate ahead of the sender and the receiver's
+  layers after it: on one GPU (RTX PRO 4000, WDDM) eager work queued behind a waiting gate kept the
+  sender's stream from running until the gate expired.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
@@ -2780,6 +2824,18 @@ roughly halve the miss stall.
 4. A one-CTA kernel waits for the answer and places the outputs before the combine. The wait
    lasts while the service's heartbeat word changes; a silent host fails the call through its
    error word after 1 s (§19.3.7, R9; it trapped after 2 s before).
+
+**Layer split** (multi-GPU WP9). A port holds one request at a time, so calls that may overlap
+(each device of a split, or two streams of one device) use separate ports.
+`CpuMissService(layers, shared, ports)` takes one `PortOptions` (device and caps) per port; each
+port has its own mapped request, x, y, done, status and heartbeat, and its sequence counter on its
+device; `channel(global_layer, port)` hands them out. One thread and one team serve every port,
+taking requests round-robin; layers stay global. Every poll advances every port's heartbeat, so a
+device waiting on one port while another port's request is computed is silent for at most one
+request's service time, as before. The 20 ms idle clock restarts on a request from any port, so at
+C = 1 the service never parks between one device's layers and the next's. The one-port constructor
+(`Options`, current device) is unchanged. `infernix_miss_service_ports_test` checks two streams of
+one GPU and one port per GPU against the CPU engine.
 
 The outputs are bit-identical: the layer-route test checks CPU channels of 2 and 8 jobs against
 the CPU engine, and greedy token ids are unchanged. Prefill chunks (more than 64 columns) stay on
@@ -3293,8 +3349,14 @@ prompt); frames lent to the prefill arena (§9.2); BF16 tensor-core routes for t
 QSA QKVG group runs on the scalar fallback at 13.2 TFLOP/s (measured; ~0.45 s per 8K prefill, est.;
 decided (default, 2026-10-04): a separate task with its own quality gate, after vision V0); the QSA
 QKVG split from the indexer (~1 % of decode; reconversion); plain-round commit overlap
-(`after_round` ~0.5 ms of host time with no GPU work queued); the CPU miss service's idle
-`sleep_for(50 µs)` (≥ 1 ms on Windows, est.).
+(`after_round` ~0.5 ms of host time with no GPU work queued). The CPU miss service's idle
+`sleep_for(50 µs)` (≥ 1 ms on Windows, est.) is a 50 µs high-resolution waitable timer on Windows
+since multi-GPU WP9; it waits ~0.52 ms (median, p90 0.52-0.54 ms; measured by
+`infernix_miss_service_ports_test`, Windows 11, 2026-10-09), the timer's floor here, not 50 µs.
+Between those waits the thread spins 4,096 polls, so it polls 17.7 % of the time while idle
+(measured, 2026-10-10). After 1 s without a request it waits 1 ms after every poll instead
+(~1.5 ms median, polling ~0 % of the time; measured, same test), so an idle server leaves its core
+free and the first request after a long idle spell waits at most about that long.
 
 **For the user:** an x16 link would roughly double miss bandwidth.
 
@@ -5350,8 +5412,10 @@ compete with builds for CPU (§19.3.0).
 **Outside this task.** Plain rounds without a drafter leave the GPU idle during commit (no GPU work
 before `settle_round`, 645-698 and 814-821, while `after_round` takes ~0.5 ms of host), possibly a
 larger plain item; the S0 plain timers measure it. The miss service's `sleep_for(50 µs)` after 20 ms
-idle (`miss_service.cpp:111-116`) sleeps ≥ 1 ms, up to 15.6 ms, on Windows (inferred, unmeasured):
-cheap to probe. Drafting on the device right after acceptance, as Qwen3.5 does, would remove the
+idle slept ≥ 1 ms, up to 15.6 ms, on Windows (inferred, unmeasured); multi-GPU WP9 replaced it there
+with a 50 µs high-resolution waitable timer, and `infernix_miss_service_ports_test` reports the wait
+it gives: ~0.52 ms median (measured, 2026-10-09); after 1 s idle it waits 1 ms per poll (~1.5 ms
+median, measured 2026-10-10). Drafting on the device right after acceptance, as Qwen3.5 does, would remove the
 commit-to-draft gap; a larger design. NVMe power-state exits (50-150 ms on some drives, §12.4;
 unmeasured on G:) would hit a request's first gated round, and the slow-read warning will show them.
 
@@ -5933,6 +5997,14 @@ shipped profile. It published no gain.
   a seeded cache left the fill phase at once and replaced the irrelevant seeded experts only at the
   steady-state rate. Since 2026-10-05 seeded frames do not end the fill phase (`promotions + landed <
   frames`): promotions only follow misses, so a matching workload promotes little either way.
+- **Layer split** (multi-GPU WP11). Each segment's `ExpertResidency` serves its own layers and keys
+  them locally (`(layer - first layer) * experts + expert`); the file keeps the whole model's keys, so
+  one state serves split and single-GPU runs alike. `expert_cache::split_saved_state` gives a
+  segment its layers' counts and its keys of the ranking in the global order;
+  `merge_saved_states` puts the counts back at their layers and interleaves the segments' rankings
+  in proportion to their lengths (their scores are not saved and not comparable: each cache's clock
+  ticks with its own layers), so a prefix of the merged ranking holds each segment's best keys in
+  the share that segment held. Splitting a merged state returns every segment's part exactly.
 - **Interface.** `EngineOptions::expert_state_path` (empty: off; `infernix_bench` leaves it empty).
   CLI and serve: `--expert-state FILE|off`, default `<artifact>.expert-state`.
 - **Tests.** `test_expert_cache.cpp`: seed fills the policy's capacity, skips duplicates, residents
@@ -7298,6 +7370,12 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   padding after records (the stride equals the record size), the epilogues' row guards and the
   producer's tensor-map acquires (read). Under test: the prefill staging overlap (pass p+1 staged
   on the side stream while pass p computes).
+  - A reproduction (multi-GPU wave 2 review, 2026-10-10): `infernix_qwen4_exp_forward_real_test
+    --split 47` on one GPU, with `SplitPair::run_bulk`'s one-GPU event wait removed so that the two
+    segments' prefill chunks overlap on two streams, gives
+    layer 0 a different MoE output of a 2,048-column call from an identical MoE input; serialized
+    by a stream event, or with the segments on two GPUs, the outputs are bit-exact. Work of
+    another stream on the same GPU is enough to change the MoE's bits.
 
 #### Long prompts: attribution and plan (2026-10-05)
 

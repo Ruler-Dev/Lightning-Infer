@@ -264,7 +264,12 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vram-past-budget` | Qwen3.8-Flash-Next on Windows: also size the expert cache into the VRAM the Windows per-process budget withholds (~0.6 GiB, ~240 more expert frames on an RTX 5090), measured at startup; that memory may be moved to system memory if another program needs VRAM ([details](qwen3_8-flash-next.md#vram)) | off |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
-| `--device N` | CUDA device index | `0` |
+| `--device N` | CUDA device ordinal, in PCI bus order ([device order](#device-order)) | `0` |
+| `--devices A,B` | Qwen3.8-Flash-Next layer split across two GPUs: the first layers on `A`, which also runs the engine, the remaining layers and the output head on `B`; `A,A` splits on one GPU (a test mode). One ordinal is the same as `--device N`; the two flags cannot be combined. Not available yet: startup refuses two devices ([layer split](#layer-split)) | one device |
+| `--layer-split K\|auto\|@FILE` | where the split falls: after layer `K` (at least 1 and below the layer count), chosen at startup, or read from a plan file; requires two devices | `auto` with two devices |
+| `--layer-split-report` | report the split planner's table of candidate `K` at startup; requires two devices | off |
+| `--split-handoff auto\|event\|gate` | how rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (lower latency, but that kernel spins); `auto` is `event`; requires two devices | `auto` |
+| `--handoff-timeout-ms N` | bound of a `gate` handoff's wait, `1..1500`; a wait that runs out fails the round with a recoverable error instead of reaching Windows' 2 s GPU timeout; requires two devices | `1000` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage | `bf16` |
@@ -359,6 +364,27 @@ created.
 ```bash
 INFERNIX_NUMERICS_SMS=70 ./build/apps/infernix model.infernix --prompt "Hello"
 ```
+
+## Device order
+
+`--device` and `--devices` take CUDA device ordinals in PCI bus order, the order in which
+`nvidia-smi` lists the GPUs: before its first CUDA call the engine sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` for its process, for both the CLI and HTTP server. A value already
+set in the environment is kept. CUDA's own default numbers the fastest GPU 0, so on a machine with
+two different GPUs an ordinal can name another GPU than in builds before this order was selected;
+`CUDA_DEVICE_ORDER=FASTEST_FIRST` restores that numbering. With one GPU nothing changes.
+
+## Layer split
+
+`--devices A,B` will split Qwen3.8-Flash-Next's layers across two GPUs: the first layers, with
+their KV cache and state, on `A`, which also runs the engine; the remaining layers, the output
+head, sampling and the MTP drafter on `B`. Startup checks the split's options and then refuses two
+devices, because the split execution is not available yet. Once it is, a split also refuses, until
+each is supported, `--vision`, the prefix cache (`infernix-serve --no-prefix-reuse` disables it),
+the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier), which needs every expert in
+Host RAM, and `--layer-split auto` (the default with two devices) or `@FILE`, which need the split
+planner: pass `--layer-split K`, with `K` below the model's layer count. `--devices A` with one
+ordinal runs exactly as `--device A`.
 
 ## Context and memory
 

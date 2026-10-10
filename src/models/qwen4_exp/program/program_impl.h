@@ -582,7 +582,11 @@ public:
           volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0) {
         const Config& config = parameters_.model.config();
         // The whole model on `device` (SegmentMap::single): one segment embeds, runs every layer and
-        // holds the head.
+        // holds the head. A segment's Parameters (Parameters(model, range, role)) leave the other
+        // layers without weights or banks, which this constructor's per-layer tables would read.
+        if (parameters_.layer_range().begin != 0 || parameters_.layer_range().end != c_.num_hidden_layers) {
+            throw std::invalid_argument("Qwen4Exp: a one-segment Program needs the Parameters of every layer");
+        }
         const SegmentMap map = SegmentMap::single(c_, config.mtp, device.device);
         ple_segment_         = map.ple().index;
         DeviceSegment& seg   = *segments_.emplace_back(std::make_unique<DeviceSegment>());
@@ -718,11 +722,14 @@ public:
         seg.work          = std::make_unique<WorkspaceArena>(seg.work_capacity);
         allocated += seg.work_capacity;
 
+        // The segment's own layers, in local order (layer - range.begin): the others have no bank.
+        const LayerRange owned = seg.parameters->layer_range();
         std::vector<const std::uint8_t*> banks;
         std::uint64_t record_stride = 0;
-        for (const auto& layer : seg.parameters->layers) {
-            banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
-            record_stride = layer.moe.bank->planes.record_stride;
+        for (std::uint32_t l = owned.begin; l < owned.end; ++l) {
+            const auto& bank = *seg.parameters->layers[l].moe.bank;
+            banks.push_back(reinterpret_cast<const std::uint8_t*>(bank.planes.records));
+            record_stride = bank.planes.record_stride;
         }
         if (record_stride != seg.plan.record_stride) {
             throw std::logic_error("Qwen4Exp: the expert banks' record stride differs from their format's");
@@ -799,9 +806,10 @@ public:
                     return tier->record(tier->key(layer, expert));
                 };
             } else {
-                std::vector<const std::uint8_t*> banks;
-                for (const auto& layer : seg.parameters->layers) {
-                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+                std::vector<const std::uint8_t*> banks; // local order, as the Forward's layers
+                for (std::uint32_t l = owned.begin; l < owned.end; ++l) {
+                    banks.push_back(
+                        reinterpret_cast<const std::uint8_t*>(seg.parameters->layers[l].moe.bank->planes.records));
                 }
                 record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
@@ -829,11 +837,13 @@ public:
             // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
             const bool assist        = assist_jobs > 0 && decode_columns < kAssistMaxColumns;
+            // Every layer's bank (the service's layers are global), from the model: a segment's
+            // Parameters hold only its own.
             std::vector<ops::offloaded_moe::CpuMissService::Layer> service_layers;
-            for (const auto& layer : parameters_.layers) {
-                service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
-                                          .record_stride = layer.moe.bank->planes.record_stride,
-                                          .scales        = layer.moe.bank->scales.data()});
+            for (const auto& bank : parameters_.model.expert_banks()) {
+                service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(bank.planes.records),
+                                          .record_stride = bank.planes.record_stride,
+                                          .scales        = bank.scales.data()});
             }
             cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
                 std::move(service_layers),
@@ -3955,7 +3965,7 @@ private:
             }
         }
         const bool fixed   = rate > 0.0;
-        const void* source = seg.parameters->layers.front().moe.bank->planes.records;
+        const void* source = seg.parameters->layers[seg.parameters->layer_range().begin].moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
         if (rate <= 0.0 && source != nullptr && seg.staging.p != nullptr && seg.plan.staging > 0) {
             // Windows can depress host-to-device DMA to a quarter or less for a few seconds after a

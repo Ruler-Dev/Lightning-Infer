@@ -63,7 +63,15 @@ struct ServeOptions {
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
-    int device                             = 0;
+    int device                             = 0; // --device N, or the first --devices entry
+    // The layer split's flags (EngineOptions fields of the same names).
+    std::vector<int> devices;
+    std::optional<std::uint32_t> layer_split;
+    bool layer_split_auto = false;
+    std::filesystem::path layer_split_plan;
+    bool layer_split_report                = false;
+    SplitHandoff split_handoff             = SplitHandoff::Auto;
+    std::uint32_t handoff_timeout_ms       = kDefaultHandoffTimeoutMs;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;

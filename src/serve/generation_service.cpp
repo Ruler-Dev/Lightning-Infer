@@ -314,6 +314,13 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
                                                                                             ".expert-state");
     engine_options.thinking_budget_message  = options_.thinking_budget_message;
     engine_options.device                   = options_.device;
+    engine_options.devices                  = options_.devices;
+    engine_options.layer_split              = options_.layer_split;
+    engine_options.layer_split_auto         = options_.layer_split_auto;
+    engine_options.layer_split_plan         = options_.layer_split_plan;
+    engine_options.layer_split_report       = options_.layer_split_report;
+    engine_options.split_handoff            = options_.split_handoff;
+    engine_options.handoff_timeout_ms       = options_.handoff_timeout_ms;
     engine_options.max_context              = options_.max_context;
     engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
     engine_options.kv_capacity              = options_.kv_capacity;

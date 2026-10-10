@@ -105,6 +105,27 @@ enum class ProposalHead : std::uint8_t {
 // Where the Vision tower's weights live between encodes (--vision-offload).
 enum class VisionOffload : std::uint8_t { Auto, On, Off };
 
+// How a layer split's decode and verify rounds pass the residual stream from one device to the
+// next (--split-handoff). Event: a copy through pinned memory behind a cross-device event wait, no
+// spinning kernel. Gate: a word published with the copy that a bounded kernel on the next device
+// polls, lower latency but a kernel that spins on that GPU. Auto selects Event.
+enum class SplitHandoff : std::uint8_t { Auto, Event, Gate };
+
+[[nodiscard]] constexpr const char* split_handoff_name(SplitHandoff handoff) noexcept {
+    switch (handoff) {
+    case SplitHandoff::Auto: return "auto";
+    case SplitHandoff::Event: return "event";
+    case SplitHandoff::Gate: return "gate";
+    }
+    return "auto";
+}
+
+// A Gate handoff's wait for the previous device: past it the round fails with a recoverable error
+// instead of the waiting kernel running into Windows' 2 s GPU timeout, so the bound leaves that
+// timeout a margin.
+inline constexpr std::uint32_t kDefaultHandoffTimeoutMs = 1000;
+inline constexpr std::uint32_t kMaximumHandoffTimeoutMs = 1500;
+
 enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
@@ -328,7 +349,26 @@ struct EngineOptions {
     // model's built-in end-of-thinking control suffix.
     std::string thinking_budget_message;
     EnginePurpose purpose              = EnginePurpose::Generation;
+    // CUDA device ordinals are in PCI bus order, as nvidia-smi lists the GPUs: the Engine sets
+    // CUDA_DEVICE_ORDER=PCI_BUS_ID before the process's first CUDA call unless it is already set.
+    // `device` is the primary device, the one the Engine's worker runs on.
     int device                         = 0;
+    // Qwen3.8-Flash-Next's layer split (--devices a,b): the devices of its two segments in layer
+    // order, beginning with `device`. Empty runs on `device` alone, as does the one entry `device`.
+    // A repeated ordinal gives that GPU two contexts (the split's same-device test mode).
+    std::vector<int> devices;
+    // Where the layers split (--layer-split K|auto|@plan.json), at most one of the three: K puts
+    // layers [0,K) on devices[0] and [K,L) with the output head on devices[1] (1 <= K < L); auto
+    // chooses K at startup and is what two devices without either other form resolve to; a plan
+    // file names K.
+    std::optional<std::uint32_t> layer_split;
+    bool layer_split_auto = false;
+    std::filesystem::path layer_split_plan;
+    // Report the split planner's table of candidate K at startup (--layer-split-report).
+    bool layer_split_report = false;
+    SplitHandoff split_handoff = SplitHandoff::Auto;
+    // A Gate handoff's bound, [1,kMaximumHandoffTimeoutMs] ms.
+    std::uint32_t handoff_timeout_ms = kDefaultHandoffTimeoutMs;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.

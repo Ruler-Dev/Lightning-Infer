@@ -109,6 +109,8 @@ public:
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
+                // The primary device; a layer split's Program selects each further segment's
+                // device around that segment's calls itself.
                 device_.bind_to_current_thread();
                 startup.set_value();
             } catch (...) {

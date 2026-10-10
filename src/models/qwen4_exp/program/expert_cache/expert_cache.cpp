@@ -203,6 +203,92 @@ void LfruPolicy::set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>
     capacity_ = capacity;
 }
 
+// ---------------------------------------------------------------------------- saved state
+
+SavedState split_saved_state(const SavedState& global, std::uint32_t layer_begin, std::uint32_t layer_end,
+                             std::uint32_t experts) {
+    if (experts == 0 || layer_begin >= layer_end) {
+        throw std::invalid_argument("expert state split: an empty layer range or no experts");
+    }
+    const std::uint64_t first = static_cast<std::uint64_t>(layer_begin) * experts;
+    const std::uint64_t last  = static_cast<std::uint64_t>(layer_end) * experts;
+    if (last > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("expert state split: too many keys");
+    }
+    if (!global.counts.empty() && (global.counts.size() % experts != 0 || global.counts.size() < last)) {
+        throw std::invalid_argument("expert state split: the layer range is outside the state's layers");
+    }
+    SavedState out;
+    if (!global.counts.empty()) {
+        out.counts.assign(global.counts.begin() + static_cast<std::ptrdiff_t>(first),
+                          global.counts.begin() + static_cast<std::ptrdiff_t>(last));
+    }
+    for (const std::uint32_t key : global.ranked) {
+        if (key >= first && key < last) { out.ranked.push_back(static_cast<std::uint32_t>(key - first)); }
+    }
+    return out;
+}
+
+SavedState merge_saved_states(std::span<const SavedState> parts, std::span<const LayerRange> ranges,
+                              std::uint32_t layers, std::uint32_t experts) {
+    if (parts.size() != ranges.size()) { throw std::invalid_argument("expert state merge: one layer range per part"); }
+    const std::uint64_t keys = static_cast<std::uint64_t>(layers) * experts;
+    if (experts == 0 || keys > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("expert state merge: no experts or too many keys");
+    }
+    std::vector<std::uint8_t> owned(layers, 0);
+    bool counted = false;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const LayerRange range = ranges[i];
+        if (range.begin >= range.end || range.end > layers) {
+            throw std::invalid_argument("expert state merge: a layer range is empty or past the last layer");
+        }
+        for (std::uint32_t layer = range.begin; layer < range.end; ++layer) {
+            if (owned[layer] != 0) { throw std::invalid_argument("expert state merge: layer ranges overlap"); }
+            owned[layer] = 1;
+        }
+        if (!parts[i].counts.empty() && parts[i].counts.size() != static_cast<std::size_t>(range.size()) * experts) {
+            throw std::invalid_argument("expert state merge: a part's key count differs from its layers'");
+        }
+        counted = counted || !parts[i].counts.empty();
+    }
+    SavedState out;
+    if (counted) {
+        out.counts.assign(static_cast<std::size_t>(keys), 0);
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            const auto at = static_cast<std::ptrdiff_t>(static_cast<std::size_t>(ranges[i].begin) * experts);
+            std::copy(parts[i].counts.begin(), parts[i].counts.end(), out.counts.begin() + at);
+        }
+    }
+    // Each part's keys in range, as global keys, in its own order.
+    std::vector<std::vector<std::uint32_t>> lists(parts.size());
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const std::uint32_t base  = ranges[i].begin * experts;
+        const std::uint32_t local = ranges[i].size() * experts;
+        for (const std::uint32_t key : parts[i].ranked) {
+            if (key < local) { lists[i].push_back(base + key); }
+        }
+        total += lists[i].size();
+    }
+    // Next is the part whose next key sits earliest in its own ranking: the least (n + 1/2) / size
+    // over the parts, compared exactly as (2n + 1) * other size; ties go to the earlier part.
+    out.ranked.reserve(total);
+    std::vector<std::size_t> next(parts.size(), 0);
+    while (out.ranked.size() < total) {
+        std::size_t best = parts.size();
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (next[i] == lists[i].size()) { continue; }
+            if (best == parts.size() || (2 * static_cast<std::uint64_t>(next[i]) + 1) * lists[best].size() <
+                                            (2 * static_cast<std::uint64_t>(next[best]) + 1) * lists[i].size()) {
+                best = i;
+            }
+        }
+        out.ranked.push_back(lists[best][next[best]++]);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------- frames
 
 FramePool::FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight, std::uint32_t max_frames)

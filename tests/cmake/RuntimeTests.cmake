@@ -50,6 +50,6 @@ add_test(NAME infernix_json_schema_oracle_test
 
 infernix_add_test(infernix_engine_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_options.cpp"
-  LIBRARIES infernix_engine infernix_core)
+  LIBRARIES infernix_engine infernix_core infernix::json)
 
 set_tests_properties(infernix_engine_options_test PROPERTIES SKIP_RETURN_CODE 77)

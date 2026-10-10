@@ -3,10 +3,12 @@
 #include "models/qwen4_exp/program/host_expert_tier.h"
 
 #include "core/copy_batch.h"
+#include "core/device_guard.h"
 
 #include <algorithm>
 #include <limits>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 
 namespace infernix::models::qwen4_exp {
@@ -25,29 +27,46 @@ std::uint32_t slack_frames(std::uint32_t) { return 0; }
 } // namespace
 
 std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept {
-    const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
+    return table_bytes(config, max_columns, config.num_hidden_layers);
+}
+
+std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns,
+                                           std::uint32_t layers) noexcept {
+    const std::uint64_t keys = static_cast<std::uint64_t>(layers) * config.moe.experts;
     const std::uint64_t route =
-        static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
-    const std::uint64_t landing = 2ULL * config.num_hidden_layers * kLandingSlots; // table + landed log
+        static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * layers;
+    const std::uint64_t landing = 2ULL * layers * kLandingSlots; // table + landed log
     return (keys + route + landing) * sizeof(std::int32_t);
 }
 
 std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
-    return config.num_hidden_layers * config.moe.experts - 1;
+    return max_frames(config, config.num_hidden_layers);
+}
+
+std::uint32_t ExpertResidency::max_frames(const TextConfig& config, std::uint32_t layers) noexcept {
+    const std::uint32_t keys = layers * config.moe.experts;
+    return keys > 0 ? keys - 1 : 0;
 }
 
 ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::int32_t max_columns, int device)
-    : c_(config), banks_(std::move(banks)), stride_(record_stride) {
+    : c_(config), banks_(std::move(banks)), stride_(record_stride), device_(device) {
+    // Every allocation, stream and event below belongs to `device`, and cudaMemGetInfo reads it,
+    // whichever device the caller has current.
+    const DeviceGuard on_device(device);
     experts_ = config.moe.experts;
-    layers_  = config.num_hidden_layers;
+    layers_  = static_cast<std::uint32_t>(banks_.size());
     top_k_   = config.moe.top_k;
-    if (banks_.size() != layers_) { throw std::invalid_argument("expert residency: one bank per layer"); }
+    if (banks_.empty() || banks_.size() > config.num_hidden_layers) {
+        throw std::invalid_argument("expert residency: one bank per layer it serves, at least one");
+    }
     if (stride_ == 0) { throw std::invalid_argument("expert residency: empty records"); }
     const std::size_t keys = static_cast<std::size_t>(layers_) * experts_;
-    limit_                 = max_frames(config);
+    limit_                 = max_frames(config, layers_);
     if (VmmArena::supported(device)) {
-        // Address space for the whole card: growth never needs a new range.
+        // Address space for the whole card: growth never needs a new range. The card is `device`
+        // (the guard above), not whichever device was current: a layer split's residencies each
+        // reserve their own device's memory.
         std::size_t free_bytes = 0, total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
         arena_ = std::make_unique<VmmArena>(device, total_bytes, kChunkBytes);
@@ -78,6 +97,12 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
 }
 
 ExpertResidency::~ExpertResidency() {
+    // On `device`, whichever device the caller has current. A guard that cannot select it leaves
+    // the calls below to report their own failures.
+    std::optional<DeviceGuard> on_device;
+    try {
+        on_device.emplace(device_);
+    } catch (const std::exception&) {}
     if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
     if (d2h_stream_ != nullptr) {
         (void)cudaStreamSynchronize(d2h_stream_);
@@ -88,6 +113,14 @@ ExpertResidency::~ExpertResidency() {
     for (auto event : spare_events_) { (void)cudaEventDestroy(event); }
     if (table_ready_ != nullptr) { (void)cudaEventDestroy(table_ready_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
+    // The device memory is released here, under the guard, rather than by the members' destructors.
+    arena_.reset();
+    frame_memory_   = DeviceBuffer{};
+    table_device_   = DeviceBuffer{};
+    route_device_   = DeviceBuffer{};
+    landing_device_ = DeviceBuffer{};
+    landed_device_  = DeviceBuffer{};
+    records_device_ = DeviceBuffer{};
 }
 
 const std::uint8_t* ExpertResidency::frame_base() const noexcept {
@@ -193,6 +226,10 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
 
 void ExpertResidency::attach_tier(HostExpertTier* tier) {
     if (tier_ != nullptr || tier == nullptr || round_ != 0) { throw std::logic_error("expert residency: tier attached twice or late"); }
+    if (tier->keys() != layers_ * experts_) {
+        throw std::logic_error("expert residency: the SSD tier keys the whole model, not this residency's layers");
+    }
+    const DeviceGuard on_device(device_); // the record table and the D2H stream
     tier_ = tier;
     const std::size_t keys = static_cast<std::size_t>(layers_) * experts_;
     records_device_        = DeviceBuffer(keys * sizeof(const std::uint8_t*));

@@ -6,6 +6,7 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_store.h"
+#include "models/qwen4_exp/segment_map.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -66,19 +67,30 @@ public:
         return overlay_vision_;
     }
 
+    // The device segments of the load (LoadOptions::segment_ends; SegmentMap::single without a
+    // split), with the ordinals materialize_model was given. Segment s's dense weights live in one
+    // arena on segments()[s].device.
+    [[nodiscard]] const SegmentMap& segments() const noexcept { return segments_; }
+
+    [[nodiscard]] DeviceSpan segment_arena(std::uint32_t segment) const {
+        return backing_.device_arena(segment);
+    }
+
 private:
-    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
+    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, std::span<DeviceContext* const>,
                                                     const StartupObserver*);
-    Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-          std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-          std::optional<ExpertStore> expert_store);
+    Model(Config config, LoadOptions options, SegmentMap segments, TextWeights weights,
+          std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
+          FrontendResources resources, InstanceInfo info,
+          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision,
+          artifact::MaterializedArtifact backing, std::optional<ExpertStore> expert_store);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
     std::optional<ExpertStore> expert_store_; // the streamed banks' multipliers back banks_
     Config config_;
     LoadOptions options_;
+    SegmentMap segments_;
     TextWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBank> banks_;

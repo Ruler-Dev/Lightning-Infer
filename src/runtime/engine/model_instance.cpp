@@ -4,6 +4,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen4_exp/program/split_capabilities.h"
 
 #include <algorithm>
 #include <system_error>
@@ -18,6 +19,70 @@
 namespace infernix::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+// The device set and the layer-split options. A split runs only what split_capabilities.h has
+// enabled; everything else is refused here, before any device context exists.
+void validate_devices(const EngineOptions& options, models::Architecture architecture) {
+    const std::vector<int>& devices = options.devices;
+    const auto negative             = [](int ordinal) { return ordinal < 0; };
+    if (negative(options.device) || std::ranges::any_of(devices, negative)) {
+        throw std::invalid_argument("Engine CUDA device ordinals must be nonnegative");
+    }
+    if (!devices.empty() && devices.front() != options.device) {
+        throw std::invalid_argument("Engine devices must begin with device, the primary device");
+    }
+    if (devices.size() > 2) {
+        throw std::invalid_argument("a layer split spans at most two devices (--devices a,b)");
+    }
+    const int split_forms = static_cast<int>(options.layer_split.has_value()) +
+                            static_cast<int>(options.layer_split_auto) +
+                            static_cast<int>(!options.layer_split_plan.empty());
+    if (split_forms > 1) {
+        throw std::invalid_argument(
+            "select one layer split: K, auto or a plan file (--layer-split K|auto|@plan.json)");
+    }
+    if (options.layer_split == 0U) {
+        throw std::invalid_argument(
+            "--layer-split K must leave at least one layer on the first device (K >= 1)");
+    }
+    switch (options.split_handoff) {
+    case SplitHandoff::Auto:
+    case SplitHandoff::Event:
+    case SplitHandoff::Gate: break;
+    default: throw std::invalid_argument("Engine split_handoff is invalid");
+    }
+    if (options.handoff_timeout_ms == 0 || options.handoff_timeout_ms > kMaximumHandoffTimeoutMs) {
+        throw std::invalid_argument("--handoff-timeout-ms must be in [1," +
+                                    std::to_string(kMaximumHandoffTimeoutMs) + "]");
+    }
+    if (devices.size() < 2) {
+        // Accepting them would configure a split that never runs.
+        if (split_forms != 0 || options.layer_split_report ||
+            options.split_handoff != SplitHandoff::Auto ||
+            options.handoff_timeout_ms != kDefaultHandoffTimeoutMs) {
+            throw std::invalid_argument(
+                "--layer-split, --layer-split-report, --split-handoff and --handoff-timeout-ms "
+                "configure a layer split, which needs two devices (--devices a,b)");
+        }
+        return;
+    }
+    if (architecture != models::Architecture::Qwen4Exp) {
+        throw std::invalid_argument("a layer split across devices (--devices a,b) needs a readable "
+                                    "Qwen3.8-Flash-Next artifact");
+    }
+    if (!models::qwen4_exp::kSplitExecution) {
+        throw std::invalid_argument("a layer split across devices (--devices a,b) is not available "
+                                    "yet; run on one device (--device N)");
+    }
+    if (options.enable_vision && !models::qwen4_exp::kSplitVision) {
+        throw std::invalid_argument("a layer split across devices does not support --vision");
+    }
+    if (options.context_cache.enabled && !models::qwen4_exp::kSplitPrefixCache) {
+        throw std::invalid_argument("a layer split across devices does not support the prefix "
+                                    "cache yet: disable it (infernix-serve --no-prefix-reuse)");
+    }
+}
+
 } // namespace
 
 void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
@@ -85,6 +150,7 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
+    validate_devices(options, architecture);
 }
 
 namespace {
@@ -252,6 +318,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
+    }
+    // Two devices without K or a plan file choose the split at startup.
+    if (options.devices.size() > 1 && !options.layer_split && options.layer_split_plan.empty()) {
+        options.layer_split_auto = true;
     }
     return options;
 }

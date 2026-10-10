@@ -81,15 +81,66 @@ ops::QsaGeometry qsa_geometry(const TextConfig& c) {
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
-                 ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context)
+                 ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context,
+                 ForwardSegment segment)
     : parameters_(parameters), config_(parameters.model.config().text), device_(device), work_(work),
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context),
+      segment_(segment),
       rope_(ops::prepare_rope(dim(config_.rope.rotary_dim), config_.rope.theta,
                               {config_.rope.yarn_factor, config_.max_position_embeddings})) {
-    if (state_.gdn == nullptr || state_.gdn->layer_count() != config_.gdn_layers ||
-        state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
-        experts_.frames.size() != config_.num_hidden_layers) {
-        throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
+    const std::uint32_t L = config_.num_hidden_layers;
+    LayerRange& range     = segment_.layers;
+    if (range.begin == 0 && range.end == 0) { range.end = L; }
+    if (range.begin >= range.end || range.end > L || config_.layer_types.size() != L ||
+        config_.compact_layer_indices.size() != L) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: the segment's layer range is empty or past the last layer");
+    }
+    if (segment_.embed != (range.begin == 0) || segment_.finish != (range.end == L)) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: exactly the segment of layer 0 embeds and the last finishes");
+    }
+    // Its Parameters prepared the range's layers; one that ends at the last layer also prepared the
+    // head (Parameters ties its role to its range).
+    if (range.begin < parameters_.layer_range().begin || range.end > parameters_.layer_range().end) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: the segment's layers lie outside its Parameters' layer range");
+    }
+    if ((!segment_.embed &&
+         (segment_.in == nullptr || segment_.in->receiver() != device_.device)) ||
+        (!segment_.finish &&
+         (segment_.out == nullptr || segment_.out->sender() != device_.device))) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: a segment needs a handoff channel at each inner boundary, "
+            "on its own device");
+    }
+    // The range's layers of each kind are contiguous slices of the compact indices, starting at the
+    // segment's bases (compact indices count each kind in layer order).
+    for (std::uint32_t l = range.begin; l < range.end; ++l) {
+        const bool is_gdn        = config_.layer_types[l] == MixerKind::Gdn;
+        std::uint32_t& count     = is_gdn ? gdn_count_ : attention_count_;
+        const std::uint32_t base = is_gdn ? segment_.gdn_base : segment_.attention_base;
+        if (config_.compact_layer_indices[l] != base + count) {
+            throw std::invalid_argument(
+                "Qwen4Exp forward: the segment's compact bases do not match its layers");
+        }
+        ++count;
+    }
+    const bool gdn_ok = gdn_count_ == 0
+                            ? state_.gdn == nullptr || state_.gdn->layer_count() == 0
+                            : state_.gdn != nullptr && state_.gdn->layer_count() == gdn_count_;
+    const auto sized  = [&](std::size_t n) { return n == 0 || n == range.size(); };
+    if (!gdn_ok || state_.qsa_tails.size() != attention_count_ ||
+        kv_.layers.size() != attention_count_ || experts_.frames.size() != range.size() ||
+        !sized(experts_.cpu.size()) || !sized(experts_.host_tables.size()) ||
+        !sized(experts_.fetch.size())) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: state, KV or expert residency is incomplete");
+    }
+    if (!segment_.finish &&
+        (kv_.mtp || state_.mtp_tails.data != nullptr || state_.mtp_ones.data != nullptr)) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: only the finishing segment holds the MTP drafter's state");
     }
     if (experts_.split != nullptr) {
         const auto E   = static_cast<std::size_t>(config_.moe.experts);
@@ -133,9 +184,21 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 
 void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
     const std::int32_t T = batch.ids.ne[0];
-    if (batch.verify != nullptr && (batch.width < 2 || batch.verify->gdn.spec.width != batch.width ||
-                                    batch.verify->gdn.spec.record_capacity < batch.batch)) {
-        throw std::invalid_argument("Qwen4Exp forward: verification records do not match the call");
+    if (logits != nullptr && !segment_.finish) {
+        throw std::invalid_argument("Qwen4Exp forward: only the finishing segment produces logits");
+    }
+    if (batch.verify != nullptr) {
+        // A segment's records hold its own layers, from 0; one without GDN layers needs none.
+        const GdnReplayRecordSpec& records = batch.verify->gdn.spec;
+        if (batch.width < 2 ||
+            (gdn_count_ > 0 &&
+             (records.width != batch.width || records.record_capacity < batch.batch ||
+              records.layers != static_cast<std::int32_t>(gdn_count_))) ||
+            (attention_count_ > 0 &&
+             batch.verify->qsa_keys.ne[3] != static_cast<std::int32_t>(attention_count_))) {
+            throw std::invalid_argument(
+                "Qwen4Exp forward: verification records do not match the call");
+        }
     }
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
         (logits != nullptr && (logits->dtype != DType::FP32 || logits->ne[1] != batch.logit_columns.ne[0] ||
@@ -162,15 +225,56 @@ void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
     }
 }
 
+void Forward::run(const ForwardBatch& batch, Tensor* logits, const ForwardTap* tap) {
+    begin_call(batch, logits);
+    Tensor residual = alloc_residual(batch);
+    if (segment_.embed) {
+        embed(batch, residual);
+    } else {
+        receive(batch, residual);
+    }
+    for (std::uint32_t l = segment_.layers.begin; l < segment_.layers.end; ++l) {
+        layer(l, batch, residual, tap);
+    }
+    if (segment_.finish) {
+        finish(batch, residual, logits);
+    } else {
+        send(batch, residual);
+    }
+}
+
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
-    begin_call(batch, &logits);
-    Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.ids.ne[0]});
-    embed(batch, residual);
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) { layer(l, batch, residual, tap); }
-    finish(batch, residual, &logits);
+    run(batch, &logits, tap);
+}
+
+Tensor Forward::alloc_residual(const ForwardBatch& batch) {
+    return work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.ids.ne[0]});
+}
+
+void Forward::receive(const ForwardBatch& batch, Tensor& residual) {
+    if (segment_.in == nullptr) {
+        throw std::logic_error("Qwen4Exp forward: the segment receives no residual");
+    }
+    if (batch.handoff == HandoffMode::Gate && batch.handoff_word == nullptr) {
+        throw std::invalid_argument("Qwen4Exp forward: a gated handoff needs the call's word");
+    }
+    segment_.in->receive(residual.data, residual.bytes(), batch.handoff, batch.handoff_word,
+                         segment_.in_bound, segment_.in_wait_stats, device_.stream);
+}
+
+void Forward::send(const ForwardBatch& batch, const Tensor& residual) {
+    if (segment_.out == nullptr) {
+        throw std::logic_error("Qwen4Exp forward: the segment sends no residual");
+    }
+    if (batch.handoff == HandoffMode::Gate && batch.handoff_word == nullptr) {
+        throw std::invalid_argument("Qwen4Exp forward: a gated handoff needs the call's word");
+    }
+    segment_.out->send(residual.data, residual.bytes(), batch.handoff, batch.handoff_word,
+                       device_.stream);
 }
 
 void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
+    if (!segment_.embed) { throw std::logic_error("Qwen4Exp forward: the segment does not embed"); }
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
@@ -183,6 +287,10 @@ void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
 }
 
 void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap) {
+    if (!segment_.layers.contains(layer)) {
+        throw std::out_of_range("Qwen4Exp forward: layer " + std::to_string(layer) +
+                                " is outside the segment's range");
+    }
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0];
     const auto& block    = parameters_.layers[layer];
@@ -192,17 +300,19 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         if (block.ple) { ple(*block.ple, residual, batch); }
         Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor xa     = mix(block.attn_hc, residual, &inject);
+        // The segment's state, KV planes, tails and records hold its layers of each kind from 0.
         const std::uint32_t compact = config_.compact_layer_indices[layer];
         Tensor y;
         if (config_.layer_types[layer] == MixerKind::Gdn) {
-            y = gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
+            y = gdn(std::get<GdnParameters>(block.mixer), xa, compact - segment_.gdn_base, batch);
         } else {
+            const std::uint32_t local = compact - segment_.attention_base;
             // A verification call records the raw index keys for the tail commit.
             const AttentionCall call{
-                .layer        = kv_.layers.at(compact),
-                .tails        = state_.qsa_tails.at(compact),
+                .layer        = kv_.layers.at(local),
+                .tails        = state_.qsa_tails.at(local),
                 .key_records  = batch.verify != nullptr
-                                    ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
+                                    ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(local), 1)
                                           .view({dim(config_.qsa.index_head_dim), T})
                                     : Tensor{},
                 .update_tails     = batch.verify == nullptr,
@@ -244,6 +354,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
 }
 
 void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
+    if (!segment_.finish) { throw std::logic_error("Qwen4Exp forward: the segment does not finish the call"); }
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
     if (batch.residual_out.data != nullptr) {
@@ -518,6 +629,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
+    // The segment's per-layer expert tables, route log, landing and stream hold its layers from 0.
+    const std::uint32_t local = layer - segment_.layers.begin;
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
     const Tensor* rows[] = {&p.router, &p.shared_score};
     ops::projection_fp32(x, rows, logits, s);
@@ -529,7 +642,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
             throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
         }
-        route_log = experts_.route_log + layer * experts_.route_stride; // written by moe_dispatch
+        route_log = experts_.route_log + local * experts_.route_stride; // written by moe_dispatch
     }
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
@@ -540,17 +653,17 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
     ops::moe_dispatch(routing, E, dispatch, route_log, s);
     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
-                                .frames       = experts_.frames.at(layer),
+                                .frames       = experts_.frames.at(local),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.records),
                                 .record_stride = p.bank->planes.record_stride,
                                 .scales        = p.device_scales,
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
-                                .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};
+                                .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(local)};
     if (!experts_.host_tables.empty()) {
         source.host_records = nullptr; // the banks hold no records in tier mode
-        source.host_table   = experts_.host_tables.at(layer);
-        if (!experts_.fetch.empty()) { source.fetch = experts_.fetch.at(layer); }
+        source.host_table   = experts_.host_tables.at(local);
+        if (!experts_.fetch.empty()) { source.fetch = experts_.fetch.at(local); }
     }
     source.error = experts_.error;
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
@@ -564,14 +677,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         source.fork_events[0] = experts_.overlap_events[0];
         source.fork_events[1] = experts_.overlap_events[1];
         if (experts_.landing != nullptr) {
-            source.landing       = experts_.landing + static_cast<std::size_t>(layer) * experts_.landing_slots;
-            source.landed        = experts_.landed + static_cast<std::size_t>(layer) * experts_.landing_slots;
+            source.landing       = experts_.landing + static_cast<std::size_t>(local) * experts_.landing_slots;
+            source.landed        = experts_.landed + static_cast<std::size_t>(local) * experts_.landing_slots;
             source.landing_slots = experts_.landing_slots;
         }
     }
     // While the host computes this call's misses, the CPU wait warms the next layer's first weights
     // into L2: its attention-mixer down and up projections and the start of its input projection.
-    if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
+    // The segment's last layer has no next layer on this device.
+    if (source.cpu.max_jobs > 0 && layer + 1 < segment_.layers.end) {
         const auto& next = parameters_.layers[layer + 1];
         const Weight& input = config_.layer_types[layer + 1] == MixerKind::Gdn
                                   ? std::get<GdnParameters>(next.mixer).projection.weight
@@ -607,9 +721,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         for (std::int32_t e = 0; e < E; ++e) { split_columns_[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
         std::fill(split_cpu_.begin(), split_cpu_.end(), std::uint8_t{0});
         const std::uint32_t cpu = batch->split && experts_.split != nullptr && source.cpu.max_jobs > 0
-                                      ? experts_.split->choose(layer, split_columns_, split_cpu_)
+                                      ? experts_.split->choose(local, split_columns_, split_cpu_)
                                       : 0U;
-        split_streamed_experts_ += streaming->plan_layer(layer, split_columns_, split_cpu_);
+        split_streamed_experts_ += streaming->plan_layer(local, split_columns_, split_cpu_);
         split_cpu_experts_ += cpu;
         if (cpu > 0) {
             source.cpu.max_columns  = ops::offloaded_moe::kMaxCpuCallColumns;
@@ -621,8 +735,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     if (streaming != nullptr) {
-        streaming->before_experts(layer, s);
-        source.prefetched    = streaming->slots(layer);
+        streaming->before_experts(local, s);
+        source.prefetched    = streaming->slots(local);
         source.prefetch_base = streaming->base();
     }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
@@ -633,7 +747,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T));
     // The shared expert runs while the host computes the CPU-served misses.
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
-    if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
+    if (streaming != nullptr && batch->release_stream) { streaming->after_experts(local, s); }
 
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor product = work_.alloc(DType::BF16, {I, T});

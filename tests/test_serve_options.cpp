@@ -945,6 +945,54 @@ int main() {
     const auto state_file = parse({"infernix-serve", "model.ninfer", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "serve --expert-state FILE must name the file");
+
+    // --devices and the layer-split flags (the parsing is shared with the CLI, which tests it in
+    // full): the primary device, the conflict with --device, and every flag reaching its field.
+    const auto unsplit = parse({"infernix-serve", "model.ninfer"});
+    failures += check(unsplit.devices.empty() && unsplit.device == 0 && !unsplit.layer_split &&
+                          !unsplit.layer_split_auto && unsplit.layer_split_plan.empty() &&
+                          !unsplit.layer_split_report &&
+                          unsplit.split_handoff == infernix::SplitHandoff::Auto &&
+                          unsplit.handoff_timeout_ms == infernix::kDefaultHandoffTimeoutMs,
+                      "serve layer-split flags must default off");
+    const auto split =
+        parse({"infernix-serve", "model.ninfer", "--devices", "1,0", "--layer-split", "24",
+               "--layer-split-report", "--split-handoff", "gate", "--handoff-timeout-ms", "250",
+               "--no-prefix-reuse"});
+    failures += check(split.devices == std::vector<int>{1, 0} && split.device == 1 &&
+                          split.layer_split == 24U && !split.layer_split_auto &&
+                          split.layer_split_report &&
+                          split.split_handoff == infernix::SplitHandoff::Gate &&
+                          split.handoff_timeout_ms == 250,
+                      "serve layer-split flags were not preserved");
+    const auto planned = parse(
+        {"infernix-serve", "model.ninfer", "--devices", "0,0", "--layer-split", "@plan.json"});
+    failures += check(planned.devices == std::vector<int>{0, 0} && planned.device == 0 &&
+                          !planned.layer_split &&
+                          planned.layer_split_plan == std::filesystem::path("plan.json"),
+                      "serve --layer-split @FILE was not preserved");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+             {"--device", "1", "--devices", "1,0"},
+             {"--devices", "1,0", "--device", "1"},
+             {"--devices", "0,1,2"},
+             {"--devices", "x"},
+             {"--layer-split", "0"},
+             {"--split-handoff", "spin"},
+             {"--handoff-timeout-ms", "0"}}) {
+        std::vector<std::string> args{"infernix-serve", "model.ninfer"};
+        args.insert(args.end(), arguments.begin(), arguments.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid serve layer-split flag was accepted");
+    }
+    const std::string split_help = serve_usage_text("infernix-serve");
+    for (const char* flag : {"--devices A,B", "--layer-split K|auto|@FILE", "--layer-split-report",
+                             "--split-handoff", "--handoff-timeout-ms", "PCI bus order"}) {
+        failures += check(split_help.find(flag) != std::string::npos,
+                          "serve help omits a layer-split flag");
+    }
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -5,6 +5,8 @@
 // reuse. Pure host logic with no CUDA dependency; the transfer agent drives it and turns its
 // decisions into copy-stream commands.
 
+#include "models/qwen4_exp/segment_map.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -122,6 +124,28 @@ struct SavedState {
     std::vector<std::uint32_t> counts;
     std::vector<std::uint32_t> ranked;
 };
+
+// A layer split runs one expert cache per segment, keyed by its own layers (key = (layer -
+// layer_begin) * experts + expert), while the saved file keeps the whole model's keys, so a state
+// written by a split run warm-starts a single-GPU run and the reverse.
+//
+// The part of `global` for layers [layer_begin, layer_end): their counts, and the ranked keys among
+// them in the global order, as local keys. Empty counts stay empty. Throws std::invalid_argument on
+// an empty range, no experts, or counts that are not whole layers up to layer_end.
+[[nodiscard]] SavedState split_saved_state(const SavedState& global, std::uint32_t layer_begin,
+                                           std::uint32_t layer_end, std::uint32_t experts);
+// The whole model's state from one part per disjoint layer range: each part's counts at its layers
+// (zero for layers no part covers; empty only when every part's are), and the parts' rankings
+// interleaved in proportion to their lengths, each in its own order. Parts' scores are not
+// comparable (each cache's LFRU clock ticks with its own layers' calls) and are not saved, so a key
+// ranked at fraction f of its part's ranking lands near fraction f of the merged one: a cache that
+// loads a prefix of it takes each part's best keys in the share that part held. Part keys past
+// their range are dropped. split_saved_state(merge_saved_states(parts, ranges), r.begin, r.end)
+// returns the part of range r exactly (keys in range), so a split run's state survives a save and
+// a load unchanged. Throws std::invalid_argument on a range outside [0, layers) or overlapping
+// another, or a part whose counts differ from its range's key count.
+[[nodiscard]] SavedState merge_saved_states(std::span<const SavedState> parts, std::span<const LayerRange> ranges,
+                                            std::uint32_t layers, std::uint32_t experts);
 
 // ---------------------------------------------------------------------------- frames
 

@@ -2,6 +2,7 @@
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/split_options.h"
 
 #include <algorithm>
 #include <array>
@@ -389,6 +390,10 @@ std::string usage_text(std::string_view program) {
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+        << "  --devices <a,b>             Qwen3.8-Flash-Next layer split across two devices, as\n"
+           "                             infernix's (not available yet; replaces --device)\n"
+        << "  --layer-split <K|auto|@FILE>  --layer-split-report  --split-handoff <auto|event|gate>\n"
+           "  --handoff-timeout-ms <n>    the split's options, as infernix's\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -402,6 +407,7 @@ std::string usage_text(std::string_view program) {
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
     bool saw_artifact = false;
+    bool device_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto value = [&](std::string_view flag) -> std::string {
@@ -539,6 +545,21 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--draft-tree-paths"), "draft-tree-paths");
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
+            device_given   = true;
+        } else if (arg == "--devices") {
+            options.devices = product::parse_devices(value("--devices"));
+        } else if (arg == "--layer-split") {
+            product::LayerSplit split = product::parse_layer_split(value("--layer-split"));
+            options.layer_split       = split.layer;
+            options.layer_split_auto  = split.automatic;
+            options.layer_split_plan  = split.plan.string();
+        } else if (arg == "--layer-split-report") {
+            options.layer_split_report = true;
+        } else if (arg == "--split-handoff") {
+            options.split_handoff = product::parse_split_handoff(value("--split-handoff"));
+        } else if (arg == "--handoff-timeout-ms") {
+            options.handoff_timeout_ms =
+                product::parse_handoff_timeout_ms(value("--handoff-timeout-ms"));
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--profile-measured") {
@@ -561,6 +582,13 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
+    if (!options.devices.empty()) {
+        if (device_given) {
+            throw std::invalid_argument(
+                "--devices names the primary device first; it cannot be combined with --device");
+        }
+        options.device = options.devices.front();
+    }
     if (options.concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--concurrency must be in [1,8]");
     }

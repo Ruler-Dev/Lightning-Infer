@@ -6,10 +6,15 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/registry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::models::qwen4_exp {
 namespace {
@@ -30,22 +35,41 @@ ops::LinearPolicy linear_policy(artifact::ActivationPolicy policy) {
     throw ArtifactError("unknown activation policy");
 }
 
+// The binder's and the segment map's tag of an allocation every segment reads.
+static_assert(artifact::kSharedSegment == kSharedSegment);
+
 struct PendingWeight {
     artifact::ParameterReference reference;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
-// Logical demands of the selected model; each parameter is declared exactly once.
+// Who reads a parameter, which decides its device segment (SegmentMap): a decoder layer's
+// parameters go to the segment running the layer; the head (final mixer and output head) and the
+// MTP drafter with its proposal head to the last segment (the spec's kGlobalLast); the Vision tower
+// to the first (kGlobalFirst), which embeds the prompt. The token embedding is pinned and read by
+// both ends (kShared): the first segment embeds the prompt with it, the last the MTP drafter's
+// tokens. The kind also files the parameter's device bytes for the split planner.
+struct Owner {
+    enum class Kind : std::uint8_t { Layer, Head, Mtp, Vision, Shared };
+    Kind kind           = Kind::Shared;
+    std::uint32_t layer = 0; // Kind::Layer
+
+    static Owner of_layer(std::uint32_t layer) { return {Kind::Layer, layer}; }
+};
+
+// Logical demands of the selected model; each parameter is declared exactly once, by its owner.
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
+    Bindings(artifact::Binder& binder, const SegmentMap& segments)
+        : binder_(binder), segments_(segments) {}
 
-    WeightId parameter(std::string name, Shape shape, std::string_view input = {},
+    WeightId parameter(Owner owner, std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
-                       Residency residency                = Residency::Device) {
+                       Residency residency               = Residency::Device) {
         if (ids_.contains(name)) { throw ArtifactError(name + ": duplicate parameter declaration"); }
         PendingWeight pending;
-        pending.reference = binder_.parameter(name, std::move(shape), residency, exact_format);
+        pending.reference =
+            binder_.parameter(name, std::move(shape), residency, exact_format, segment(owner));
         if (!input.empty()) {
             const auto& use = binder_.use(name, input);
             if (!use.activation_policy) {
@@ -59,21 +83,58 @@ public:
         const WeightId id{weights.size()};
         ids_.emplace(std::move(name), id);
         weights.push_back(std::move(pending));
+        owners.push_back(owner);
         return id;
     }
 
-    WeightId direct(std::string name, Shape shape, QType format = QType::BF16, Residency residency = Residency::Device) {
-        return parameter(std::move(name), std::move(shape), {}, format, residency);
-    }
-
     std::vector<PendingWeight> weights;
+    std::vector<Owner> owners; // [weight]
 
 private:
+    // The binder's tag: the arena of a Device parameter, the reading segment of a HostPinned one.
+    std::uint8_t segment(Owner owner) const {
+        switch (owner.kind) {
+        case Owner::Kind::Layer:
+            return static_cast<std::uint8_t>(segments_.segment_of(owner.layer));
+        case Owner::Kind::Head:
+        case Owner::Kind::Mtp:
+            return static_cast<std::uint8_t>(segments_.last().index);
+        case Owner::Kind::Vision:
+            return static_cast<std::uint8_t>(segments_.first().index);
+        case Owner::Kind::Shared:
+            return kSharedSegment;
+        }
+        throw std::logic_error("unknown parameter owner");
+    }
+
     artifact::Binder& binder_;
+    const SegmentMap& segments_;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
 
-HyperConnectionWeights bind_hc(Bindings& b, const TextConfig& c, const std::string& prefix,
+// The declarations of one owner.
+class Owned {
+public:
+    Owned(Bindings& bindings, Owner owner) : bindings_(bindings), owner_(owner) {}
+
+    WeightId parameter(std::string name, Shape shape, std::string_view input = {},
+                       std::optional<QType> exact_format = {},
+                       Residency residency               = Residency::Device) const {
+        return bindings_.parameter(owner_, std::move(name), std::move(shape), input, exact_format,
+                                   residency);
+    }
+
+    WeightId direct(std::string name, Shape shape, QType format = QType::BF16,
+                    Residency residency = Residency::Device) const {
+        return parameter(std::move(name), std::move(shape), {}, format, residency);
+    }
+
+private:
+    Bindings& bindings_;
+    Owner owner_;
+};
+
+HyperConnectionWeights bind_hc(const Owned& b, const TextConfig& c, const std::string& prefix,
                                bool combine) {
     const std::uint64_t width = c.residual_width(), rank = c.hc.rank;
     HyperConnectionWeights out;
@@ -86,7 +147,7 @@ HyperConnectionWeights bind_hc(Bindings& b, const TextConfig& c, const std::stri
     return out;
 }
 
-AttentionWeights bind_attention(Bindings& b, const TextConfig& c, const std::string& prefix) {
+AttentionWeights bind_attention(const Owned& b, const TextConfig& c, const std::string& prefix) {
     const std::uint64_t h = c.hidden_size, q = c.attention.query_width(),
                         k = c.attention.key_width();
     const std::uint64_t iq = std::uint64_t(c.qsa.index_heads) * c.qsa.index_head_dim;
@@ -106,7 +167,7 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& c, const std::str
     return out;
 }
 
-GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix) {
+GdnWeights bind_gdn(const Owned& b, const TextConfig& c, const std::string& prefix) {
     const std::uint64_t h = c.hidden_size, kw = c.gdn.key_width(), vw = c.gdn.value_width(),
                         nv = c.gdn.value_heads;
     const std::string input = prefix + "mixer_input", p = prefix + "gdn/";
@@ -125,7 +186,8 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix, Residency experts) {
+MoeWeights bind_moe(const Owned& b, const TextConfig& c, const std::string& prefix,
+                    Residency experts) {
     const std::uint64_t h = c.hidden_size, e = c.moe.experts, s = c.moe.shared_intermediate;
     const std::string input = prefix + "ffn_input", p = prefix + "moe/";
     MoeWeights out;
@@ -140,7 +202,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     return out;
 }
 
-PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix) {
+PleWeights bind_ple(const Owned& b, const TextConfig& c, const std::string& prefix) {
     const std::uint64_t h = c.hidden_size, width = c.residual_width(), dim = c.ple.embed_dim;
     const std::string p = prefix + "ple/", input = prefix + "ple/embeddings";
     PleWeights out;
@@ -154,14 +216,19 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
+// The expert banks stay pinned (or streamed): their tag is the layer's segment, which places them
+// only with per-segment pinned chunks.
+TextWeights bind_text(Bindings& bindings, const TextConfig& c, Residency experts) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
-    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::BF16,
-                                      Residency::HostPinned);
-    out.output_head = b.parameter("text/output_head", {v, h}, "text/final_hidden");
-    out.final_mixer = bind_hc(b, c, "text/final_mixer/", false);
+    out.token_embedding =
+        Owned(bindings, {Owner::Kind::Shared})
+            .parameter("text/token_embedding", {v, h}, {}, QType::BF16, Residency::HostPinned);
+    const Owned head(bindings, {Owner::Kind::Head});
+    out.output_head = head.parameter("text/output_head", {v, h}, "text/final_hidden");
+    out.final_mixer = bind_hc(head, c, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < c.num_hidden_layers; ++i) {
+        const Owned b(bindings, Owner::of_layer(i));
         const std::string prefix = "text/layers/" + std::to_string(i) + "/";
         BlockWeights block;
         if (i == c.ple.layer) { block.ple = bind_ple(b, c, prefix); }
@@ -178,7 +245,7 @@ TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
     return out;
 }
 
-MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
+MtpWeights bind_mtp(const Owned& b, const TextConfig& c) {
     const std::uint64_t h = c.hidden_size, width = c.residual_width(), e = c.moe.experts,
                         ir = c.moe.intermediate, s = c.moe.shared_intermediate;
     MtpWeights out;
@@ -208,8 +275,8 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
 
 // Qwen3.5's tower binding (qwen3_5/load/vision.cpp) with the same parameter names; the merger's
 // output width is the text hidden size.
-VisionWeights bind_vision(Bindings& b, const qwen3_5::VisionConfig& config, const TextConfig& target,
-                          Residency residency) {
+VisionWeights bind_vision(const Owned& b, const qwen3_5::VisionConfig& config,
+                          const TextConfig& target, Residency residency) {
     const std::uint64_t h = config.hidden_size, intermediate = config.intermediate_size;
     const auto use = [&](std::string name, Shape shape, std::string_view input) {
         return b.parameter(std::move(name), std::move(shape), input, {}, residency);
@@ -316,15 +383,63 @@ std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlan
     return out;
 }
 
+// The device bytes of each owner (LoadPlan::layer_device_bytes and the others): each device object
+// once, under the first parameter that binds it (packed parents serve several parameters of one
+// owner), at its bytes plus the most padding its alignment can put before it in an arena. A
+// segment's arena is therefore never larger than the sum over the parts it holds, whatever the
+// split, and smaller by at most that padding.
+struct OwnerDeviceBytes {
+    std::vector<std::uint64_t> layers; // [layer]
+    std::uint64_t head = 0, mtp = 0, vision = 0;
+};
+
+OwnerDeviceBytes owner_device_bytes(const artifact::MaterializationPlan& plan,
+                                    const std::vector<PendingWeight>& pending,
+                                    const std::vector<Owner>& owners, std::uint32_t layers) {
+    std::vector<std::uint64_t> footprint(plan.object_count, 0);
+    for (const auto& placement : plan.device_objects) {
+        footprint.at(placement.object.index) =
+            placement.bytes + std::max<std::uint64_t>(placement.alignment, 1) - 1;
+    }
+    OwnerDeviceBytes out;
+    out.layers.assign(layers, 0);
+    for (std::size_t w = 0; w < pending.size(); ++w) {
+        if (pending[w].reference.residency != Residency::Device) { continue; }
+        std::uint64_t bytes = 0;
+        for (const auto& part : pending[w].reference.binding.parts) {
+            bytes += std::exchange(footprint.at(part.object.index), 0);
+        }
+        switch (owners[w].kind) {
+        case Owner::Kind::Layer:
+            out.layers.at(owners[w].layer) += bytes;
+            break;
+        case Owner::Kind::Head:
+            out.head += bytes;
+            break;
+        case Owner::Kind::Mtp:
+            out.mtp += bytes;
+            break;
+        case Owner::Kind::Vision:
+            out.vision += bytes;
+            break;
+        case Owner::Kind::Shared: // never device-resident: the binder refuses a shared device tag
+            break;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 struct LoadPlan::Impl {
     Config config;
     LoadOptions options;
+    std::vector<std::uint32_t> segment_ends; // {L} without a split
     TextWeights weights;
     std::vector<PendingWeight> pending;
     std::vector<artifact::HostValues> input_scales; // [layer]
     artifact::MaterializationPlan materialization;
+    OwnerDeviceBytes device_bytes;
     FrontendResources resources;
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
@@ -353,7 +468,36 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
     return bytes;
 }
 
-std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes; }
+std::uint64_t LoadPlan::device_bytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& segment : impl_->materialization.device_segments) {
+        bytes += segment.capacity_bytes;
+    }
+    return bytes;
+}
+
+std::uint32_t LoadPlan::segment_count() const {
+    return static_cast<std::uint32_t>(impl_->segment_ends.size());
+}
+
+std::uint64_t LoadPlan::device_bytes(std::uint32_t segment) const {
+    const auto& segments = impl_->materialization.device_segments;
+    if (segment >= segments.size()) {
+        throw std::out_of_range("load plan: device segment " + std::to_string(segment) + " of " +
+                                std::to_string(segments.size()));
+    }
+    return segments[segment].capacity_bytes;
+}
+
+std::vector<std::uint64_t> LoadPlan::layer_device_bytes() const {
+    return impl_->device_bytes.layers;
+}
+
+std::uint64_t LoadPlan::head_device_bytes() const { return impl_->device_bytes.head; }
+
+std::uint64_t LoadPlan::mtp_device_bytes() const { return impl_->device_bytes.mtp; }
+
+std::uint64_t LoadPlan::vision_device_bytes() const { return impl_->device_bytes.vision; }
 
 std::uint32_t LoadPlan::public_token_count() const {
     return static_cast<std::uint32_t>(impl_->resources.public_token_count);
@@ -391,23 +535,33 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    const std::uint32_t layer_count = out->config.text.num_hidden_layers;
+    out->segment_ends = options.segment_ends.empty() ? std::vector<std::uint32_t>{layer_count}
+                                                     : options.segment_ends;
+    // The binding needs the segments' layers and roles, not their devices.
+    const std::vector<int> unplaced(out->segment_ends.size(), 0);
+    const SegmentMap segments =
+        SegmentMap::contiguous(out->config.text, out->config.mtp, unplaced, out->segment_ends);
     artifact::Binder binder(reader);
+    binder.set_segment_count(static_cast<std::uint8_t>(segments.size()));
     out->resources = bind_resources(binder, out->config);
-    Bindings bindings(binder);
+    Bindings bindings(binder, segments);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
-        out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
-                                          options.overlay_vision() ? Residency::HostPinned : Residency::Device);
+        out->weights.vision = bind_vision(
+            Owned(bindings, {Owner::Kind::Vision}), *out->config.vision, out->config.text,
+            options.overlay_vision() ? Residency::HostPinned : Residency::Device);
     }
     if (out->config.mtp) {
-        out->weights.mtp = bind_mtp(bindings, out->config.text);
+        const Owned mtp(bindings, {Owner::Kind::Mtp});
+        out->weights.mtp = bind_mtp(mtp, out->config.text);
         if (out->config.proposal_rows != 0) {
             const std::uint64_t rows = out->config.proposal_rows;
             ProposalWeights proposal;
-            proposal.head      = bindings.parameter("proposal/head", {rows, out->config.text.hidden_size},
-                                                    "mtp/final_hidden");
-            proposal.token_ids = bindings.direct("proposal/token_ids", {rows}, QType::INT32);
+            proposal.head = mtp.parameter("proposal/head", {rows, out->config.text.hidden_size},
+                                          "mtp/final_hidden");
+            proposal.token_ids = mtp.direct("proposal/token_ids", {rows}, QType::INT32);
             const auto ids = binder.values(bindings.weights.at(proposal.token_ids.index).reference.binding,
                                            QType::INT32)
                                  .integers();
@@ -428,6 +582,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
+    out->device_bytes =
+        owner_device_bytes(out->materialization, out->pending, bindings.owners, layer_count);
     if (out->weights.vision && options.overlay_vision()) {
         out->vision_overlay = vision_overlay_layout(*out->weights.vision, out->pending, out->materialization);
     }
@@ -439,22 +595,41 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     return LoadPlan(std::move(out));
 }
 
-Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
-             std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-             std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-             std::optional<ExpertStore> expert_store)
-    : backing_(std::move(backing)), expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
+Model::Model(Config config, LoadOptions options, SegmentMap segments, TextWeights weights,
+             std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
+             FrontendResources resources, InstanceInfo info,
+             std::optional<qwen3_5::VisionOverlayAssets> overlay_vision,
+             artifact::MaterializedArtifact backing, std::optional<ExpertStore> expert_store)
+    : backing_(std::move(backing)), expert_store_(std::move(expert_store)),
+      config_(std::move(config)), options_(options), segments_(std::move(segments)),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
-      resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
+      resources_(std::move(resources)), info_(std::move(info)),
+      overlay_vision_(std::move(overlay_vision)) {}
 
 Model::~Model() = default;
 
-std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, std::span<DeviceContext* const> devices,
                                          const StartupObserver* observer) {
     if (!plan.impl_) { throw ArtifactError("load plan was already consumed"); }
+    // Checked before the plan is consumed.
+    if (devices.size() != plan.impl_->segment_ends.size()) {
+        throw std::invalid_argument(
+            "the load plan has " + std::to_string(plan.impl_->segment_ends.size()) +
+            " device segments, but " + std::to_string(devices.size()) + " devices were given");
+    }
+    std::vector<int> ordinals;
+    for (const DeviceContext* device : devices) {
+        if (device == nullptr) {
+            throw std::invalid_argument("a device segment has no device context");
+        }
+        ordinals.push_back(device->device);
+    }
+    SegmentMap segments = SegmentMap::contiguous(plan.impl_->config.text, plan.impl_->config.mtp,
+                                                 ordinals, plan.impl_->segment_ends);
     auto data    = std::move(plan.impl_);
     const artifact::Reader& reader = *data->materialization.source;
-    auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer);
+    auto backing =
+        artifact::materialize(reader, std::move(data->materialization), devices, observer);
     std::vector<BoundWeight> bound;
     bound.reserve(data->pending.size());
     for (auto& item : data->pending) {
@@ -518,11 +693,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                                .ladder_bytes = 0,
                                                .layout       = std::move(*data->vision_overlay)};
     }
-    return std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
-                                            std::move(data->weights), std::move(bound),
-                                            std::move(banks), std::move(data->resources),
-                                            std::move(data->info), std::move(overlay), std::move(backing),
-                                            std::move(store)));
+    return std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(segments), std::move(data->weights),
+        std::move(bound), std::move(banks), std::move(data->resources), std::move(data->info),
+        std::move(overlay), std::move(backing), std::move(store)));
+}
+
+std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+                                         const StartupObserver* observer) {
+    DeviceContext* const devices[] = {&device};
+    return materialize_model(std::move(plan), std::span<DeviceContext* const>(devices), observer);
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

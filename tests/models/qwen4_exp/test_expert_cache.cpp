@@ -1,8 +1,9 @@
 // Host expert cache of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md §9):
 // LFRU decisions equal tools/expert_cache_replay step for step, residency words round-trip,
-// frames are never reused while a round that may read them is in flight, and a resized pool (design
+// frames are never reused while a round that may read them is in flight, a resized pool (design
 // §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
-// top and never names a frame above it.
+// top and never names a frame above it, and a layer split's saved state splits into per-segment
+// parts and merges back (multi-GPU WP11).
 
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
@@ -15,6 +16,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,7 @@
 #endif
 
 using namespace infernix::models::qwen4_exp::expert_cache;
+using infernix::models::qwen4_exp::LayerRange;
 
 namespace {
 
@@ -534,6 +537,116 @@ void test_state_file() {
     check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
 }
 
+// A layer split's saved state (multi-GPU WP11): split_saved_state keeps a range's counts and its
+// ranked keys, in the global order, as local keys; merge_saved_states puts the counts back at their
+// layers and interleaves the rankings in proportion to their lengths, each in its own order. A
+// split after a merge returns every part exactly, a merged state round-trips through split and
+// merge, and one range over the whole model changes nothing.
+void test_saved_state_split() {
+    constexpr std::uint32_t kLayers = 48, kExperts = 8, kKeys = kLayers * kExperts;
+    SavedState global;
+    global.counts.resize(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { global.counts[k] = (k * 7U) % 13U; }
+    std::vector<std::uint32_t> keys(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { keys[k] = k; }
+    std::mt19937 rng(11);
+    std::shuffle(keys.begin(), keys.end(), rng);
+    global.ranked.assign(keys.begin(), keys.begin() + 150);
+
+    const LayerRange ranges[] = {{0, 24}, {24, kLayers}};
+    const auto split_all      = [&](const SavedState& state) {
+        std::vector<SavedState> out;
+        for (const LayerRange& range : ranges) {
+            out.push_back(split_saved_state(state, range.begin, range.end, kExperts));
+        }
+        return out;
+    };
+    const std::vector<SavedState> parts = split_all(global);
+    bool sliced                         = true;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const std::uint32_t base = ranges[i].begin * kExperts, local = ranges[i].size() * kExperts;
+        sliced = sliced && parts[i].counts.size() == local &&
+                 std::equal(parts[i].counts.begin(), parts[i].counts.end(), global.counts.begin() + base);
+        std::vector<std::uint32_t> expected;
+        for (const std::uint32_t key : global.ranked) {
+            if (key >= base && key < base + local) { expected.push_back(key - base); }
+        }
+        sliced = sliced && parts[i].ranked == expected;
+    }
+    check(sliced, "a split keeps its layers' counts and ranked keys, in the global order, as local keys");
+    check(parts[0].ranked.size() + parts[1].ranked.size() == global.ranked.size(),
+          "every ranked key lands in one part");
+
+    const SavedState merged = merge_saved_states(parts, ranges, kLayers, kExperts);
+    check(merged.counts == global.counts, "the merged counts equal the global counts");
+    std::vector<std::uint32_t> merged_keys = merged.ranked, global_keys = global.ranked;
+    std::sort(merged_keys.begin(), merged_keys.end());
+    std::sort(global_keys.begin(), global_keys.end());
+    check(merged_keys == global_keys, "the merged ranking holds the global ranking's keys");
+    const std::vector<SavedState> again = split_all(merged);
+    bool exact                          = true;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        exact = exact && again[i].counts == parts[i].counts && again[i].ranked == parts[i].ranked;
+    }
+    check(exact, "a split after a merge returns every part exactly");
+    const SavedState remerged = merge_saved_states(again, ranges, kLayers, kExperts);
+    check(remerged.counts == merged.counts && remerged.ranked == merged.ranked,
+          "a merged state round-trips through split and merge");
+    const SavedState whole        = split_saved_state(global, 0, kLayers, kExperts);
+    const LayerRange everything[] = {{0, kLayers}};
+    const SavedState rewhole =
+        merge_saved_states(std::span<const SavedState>(&whole, 1), everything, kLayers, kExperts);
+    check(whole.counts == global.counts && whole.ranked == global.ranked && rewhole.counts == global.counts &&
+              rewhole.ranked == global.ranked,
+          "a whole-model split and merge change nothing");
+
+    // Fractions (n + 1/2) / size: 1/4, 3/4 for the first part, 1/12 ... 11/12 for the second; the
+    // equal fractions 1/4 and 3/4 go to the first part.
+    SavedState first, second;
+    first.ranked                  = {5, 1};
+    second.ranked                 = {0, 1, 2, 3, 4, 5};
+    const SavedState two_parts[]  = {first, second};
+    const LayerRange two_layers[] = {{0, 1}, {1, 2}};
+    const SavedState mixed        = merge_saved_states(two_parts, two_layers, 2, kExperts);
+    const std::vector<std::uint32_t> interleaved = {8, 5, 9, 10, 11, 1, 12, 13};
+    check(mixed.ranked == interleaved, "rankings interleave in proportion to their lengths, ties to the earlier part");
+    check(mixed.counts.empty(), "parts without counts merge to no counts");
+
+    SavedState counted;
+    counted.counts.assign(kExperts, 3);
+    counted.ranked            = {2, 200}; // 200 is past the part's one layer
+    const LayerRange middle[] = {{1, 2}};
+    const SavedState partial  = merge_saved_states(std::span<const SavedState>(&counted, 1), middle, 3, kExperts);
+    bool zeros                = partial.counts.size() == 3 * kExperts;
+    for (std::uint32_t k = 0; zeros && k < 3 * kExperts; ++k) {
+        zeros = partial.counts[k] == (k / kExperts == 1 ? 3U : 0U);
+    }
+    check(zeros, "layers no part covers merge with zero counts");
+    check(partial.ranked == std::vector<std::uint32_t>{kExperts + 2}, "a part's keys past its range are dropped");
+
+    const auto refused = [](const auto& call) {
+        try {
+            call();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    const SavedState none[2]        = {};
+    const LayerRange overlapping[]  = {{0, 2}, {1, 3}};
+    const LayerRange past_the_end[] = {{0, 2}, {2, 4}};
+    const LayerRange shifted[]      = {{0, 23}, {23, kLayers}};
+    check(refused([&] { (void)merge_saved_states(none, overlapping, 3, kExperts); }),
+          "overlapping ranges are refused");
+    check(refused([&] { (void)merge_saved_states(none, past_the_end, 3, kExperts); }),
+          "a range past the last layer is refused");
+    check(refused([&] { (void)merge_saved_states(none, everything, kLayers, kExperts); }),
+          "a merge needs one range per part");
+    check(refused([&] { (void)merge_saved_states(parts, shifted, kLayers, kExperts); }),
+          "a part whose counts differ from its range's keys is refused");
+    check(refused([&] { (void)split_saved_state(global, 24, kLayers + 1, kExperts); }),
+          "a split past the state's layers is refused");
+    check(refused([&] { (void)split_saved_state(global, 5, 5, kExperts); }), "an empty split is refused");
+}
+
 // Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
 // room; adopt makes a landed key READY and resident in its frame, drops its queued load (no second
 // copy), refuses a key loading elsewhere, and release returns unused frames.
@@ -628,6 +741,7 @@ int main() {
     test_seed();
     test_landing();
     test_state_file();
+    test_saved_state_split();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "product/split_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace infernix::serve {
 namespace {
@@ -196,7 +198,24 @@ std::string serve_usage_text(const char* argv0) {
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
-           "  --device N                 CUDA device ordinal (default 0)\n"
+           "  --device N                 CUDA device ordinal in PCI bus order, as\n"
+           "                             nvidia-smi lists the GPUs (default 0)\n"
+           "  --devices A,B              Qwen3.8-Flash-Next layer split: the first layers on\n"
+           "                             GPU A, which runs the engine, the rest and the\n"
+           "                             output head on GPU B; A,A splits on one GPU (a test\n"
+           "                             mode). Not available yet: startup refuses two\n"
+           "                             devices\n"
+           "  --layer-split K|auto|@FILE split after layer K, choose K at startup (default\n"
+           "                             with two devices), or read it from a plan file\n"
+           "  --layer-split-report       report the split table of candidate K at startup\n"
+           "  --split-handoff auto|event|gate\n"
+           "                             how rounds pass the hidden state between the GPUs:\n"
+           "                             event (copy and event wait) or gate (lower latency,\n"
+           "                             a spinning kernel); auto = event (default)\n"
+           "  --handoff-timeout-ms N     gate handoff bound, 1-" +
+           std::to_string(kMaximumHandoffTimeoutMs) + " (default " +
+           std::to_string(kDefaultHandoffTimeoutMs) +
+           ")\n"
            "  --ram-headroom-mib N       physical Host RAM in MiB that pinned weights and\n"
            "                             caches leave free for the system (default " +
            std::to_string(kDefaultRamHeadroomBytes >> 20) +
@@ -411,6 +430,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool request_log_keep_explicit = false;
     bool host_context_explicit   = false;
     bool original_cache_selected = false;
+    bool device_given            = false;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
     const char* original_cache_flag = nullptr;
     const char* hybrid_option_flag  = nullptr;
@@ -620,6 +640,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+            device_given   = true;
+        } else if (arg == "--devices") {
+            options.devices = product::parse_devices(require_value("--devices"));
+        } else if (arg == "--layer-split") {
+            product::LayerSplit split = product::parse_layer_split(require_value("--layer-split"));
+            options.layer_split       = split.layer;
+            options.layer_split_auto  = split.automatic;
+            options.layer_split_plan  = std::move(split.plan);
+        } else if (arg == "--layer-split-report") {
+            options.layer_split_report = true;
+        } else if (arg == "--split-handoff") {
+            options.split_handoff = product::parse_split_handoff(require_value("--split-handoff"));
+        } else if (arg == "--handoff-timeout-ms") {
+            options.handoff_timeout_ms =
+                product::parse_handoff_timeout_ms(require_value("--handoff-timeout-ms"));
         } else if (arg == "--ram-headroom-mib") {
             const std::uint64_t mib = parse_u64(require_value("--ram-headroom-mib"), "ram-headroom-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
@@ -816,6 +851,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                     "with --use-original-prefix-caching");
     }
     options.context_cache.enabled = options.allow_prefix_reuse;
+    if (!options.devices.empty()) {
+        if (device_given) {
+            throw std::invalid_argument(
+                "--devices names the primary device first; it cannot be combined with --device");
+        }
+        options.device = options.devices.front();
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }

@@ -3,11 +3,16 @@
 // Native execution parameters of a loaded Qwen4Exp model: one Weight per fused projection (the
 // converter packs every projection group that shares an input into one parent), BF16 vectors for
 // norms and convolutions, and each MoE layer's expert source.
+//
+// Layer split: each segment has its own Parameters over its layer range, built on its device (the
+// expert scales are its only allocation); the head segment's also hold the head, the MTP drafter
+// and the draft head, the first segment's the Vision tower. Tables stay indexed by decoder layer.
 
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
+#include "models/qwen4_exp/segment_map.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/weight_input.h"
 
@@ -83,12 +88,46 @@ struct BlockParameters {
     std::optional<PleParameters> ple;
 };
 
+// The model's single components a segment's Parameters prepare besides its layers. embed: the
+// segment embeds the prompt, so it starts at layer 0; head: the final mixer, the output head, the
+// MTP drafter and the draft head, so it ends at the last layer; vision: the Vision tower (the
+// load places it with the first segment). The token embedding is bound whatever the role (pinned,
+// read in place): the head segment's MTP drafter embeds its tokens with it too.
+struct SegmentRole {
+    bool embed  = true;
+    bool head   = true;
+    bool vision = true;
+};
+
+// The role of a segment of the map: the first embeds and holds the tower, the last the head.
+[[nodiscard]] constexpr SegmentRole segment_role(const SegmentSpec& segment) noexcept {
+    return {.embed = segment.embed, .head = segment.head, .vision = segment.embed};
+}
+
 class Parameters {
 public:
+    // The whole model: Parameters(model, {0, L}, {}).
     explicit Parameters(const Model& model);
+    // Decoder layers `layers` and the components of `role`. The range lies inside one of the
+    // model's device segments (Model::segments()), so its weights share one device; its expert
+    // scales are allocated on the current device, so it is constructed under that segment's
+    // DeviceGuard. Throws std::invalid_argument for an empty range, one past the last layer or
+    // across segments, and a role that disagrees with its range: embed exactly when it starts at
+    // layer 0, head exactly when it ends at the last layer, vision only with embed.
+    Parameters(const Model& model, LayerRange layers, SegmentRole role);
     ~Parameters();
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
+
+    [[nodiscard]] LayerRange layer_range() const noexcept { return range_; }
+
+    [[nodiscard]] SegmentRole role() const noexcept { return role_; }
+
+    // The device current at construction, which holds the expert scales.
+    [[nodiscard]] int device() const noexcept { return device_; }
+
+    // The device copy of the range's ExpertScales, [layer - begin][E].
+    [[nodiscard]] DeviceSpan expert_scales() const noexcept { return {scales_.p, scales_.bytes}; }
 
     const Model& model;
     Weight token_embedding; // BF16 rows in pinned host memory, read zero-copy
@@ -96,13 +135,18 @@ public:
     // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits); output_head is then empty.
     std::optional<LinearParameters> output_head_q8;
     HyperConnectionParameters final_mixer;
+    // Indexed by decoder layer (size L). A layer outside the range is default: null payloads, no
+    // bank, scales or PLE, and the mixer alternative of its kind.
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp;
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
 
 private:
-    // Device copy of every layer's ExpertScales, [layers][E].
+    LayerRange range_;
+    SegmentRole role_;
+    int device_ = 0;
+    // Device copy of the range's ExpertScales, [layers in range][E].
     DeviceBuffer scales_;
 };
 

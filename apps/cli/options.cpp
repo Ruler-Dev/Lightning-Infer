@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/speculative_options.h"
+#include "product/split_options.h"
 
 #include <cerrno>
 #include <cmath>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace infernix::cli {
 namespace {
@@ -85,7 +87,9 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N | --devices A,B] [--layer-split K|auto|@FILE]\n"
+           "       [--layer-split-report] [--split-handoff auto|event|gate]\n"
+           "       [--handoff-timeout-ms N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -114,7 +118,24 @@ std::string usage_text(const char* argv0) {
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
            "  --max-new N              cap on generated tokens\n"
-           "  --device N               CUDA device ordinal (default 0)\n"
+           "  --device N               CUDA device ordinal in PCI bus order, as nvidia-smi\n"
+           "                           lists the GPUs (default 0)\n"
+           "  --devices A,B            Qwen3.8-Flash-Next layer split: the first layers on\n"
+           "                           GPU A, which runs the engine, the rest and the output\n"
+           "                           head on GPU B; A,A splits on one GPU (a test mode).\n"
+           "                           Not available yet: startup refuses two devices\n"
+           "  --layer-split K|auto|@FILE\n"
+           "                           split after layer K, choose K at startup (default\n"
+           "                           with two devices), or read it from a plan file\n"
+           "  --layer-split-report     report the split table of candidate K at startup\n"
+           "  --split-handoff auto|event|gate\n"
+           "                           how rounds pass the hidden state between the GPUs:\n"
+           "                           event (copy and event wait) or gate (lower latency,\n"
+           "                           a spinning kernel); auto = event (default)\n"
+           "  --handoff-timeout-ms N   gate handoff bound, 1-" +
+           std::to_string(kMaximumHandoffTimeoutMs) + " (default " +
+           std::to_string(kDefaultHandoffTimeoutMs) +
+           ")\n"
            "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
            "                           caches leave free for the system (default " +
            std::to_string(kDefaultRamHeadroomBytes >> 20) +
@@ -228,6 +249,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument("a model path (.infernix or .ninfer) is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_given         = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -283,6 +305,20 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+            device_given   = true;
+        } else if (arg == "--devices") {
+            options.devices = product::parse_devices(value(arg));
+        } else if (arg == "--layer-split") {
+            product::LayerSplit split = product::parse_layer_split(value(arg));
+            options.layer_split       = split.layer;
+            options.layer_split_auto  = split.automatic;
+            options.layer_split_plan  = std::move(split.plan);
+        } else if (arg == "--layer-split-report") {
+            options.layer_split_report = true;
+        } else if (arg == "--split-handoff") {
+            options.split_handoff = product::parse_split_handoff(value(arg));
+        } else if (arg == "--handoff-timeout-ms") {
+            options.handoff_timeout_ms = product::parse_handoff_timeout_ms(value(arg));
         } else if (arg == "--ram-headroom-mib") {
             const std::uint64_t mib = parse_u64(value(arg), "ram-headroom-mib");
             if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
@@ -429,6 +465,13 @@ Options parse_options(int argc, char** argv) {
                                     "--json-schema-file, --regex or --choice");
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!options.devices.empty()) {
+        if (device_given) {
+            throw std::invalid_argument(
+                "--devices names the primary device first; it cannot be combined with --device");
+        }
+        options.device = options.devices.front();
     }
 
     const bool has_prompt   = !options.prompt.empty();

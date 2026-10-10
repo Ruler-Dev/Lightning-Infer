@@ -2,6 +2,7 @@
 
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/device_guard.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "core/vram_budget.h"
@@ -10,8 +11,10 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/route_trace.h"
+#include "models/qwen4_exp/program/split_capabilities.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/registry.h"
+#include "runtime/engine/device_set.h"
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
@@ -82,6 +85,20 @@ void validate(const EngineOptions& options) {
     }
 }
 
+// One Parameters per device segment of the model, each built under its segment's device (where its
+// expert scales go).
+std::vector<std::unique_ptr<const models::qwen4_exp::execution::Parameters>>
+segment_parameters(const models::qwen4_exp::Model& model) {
+    namespace execution = models::qwen4_exp::execution;
+    std::vector<std::unique_ptr<const execution::Parameters>> out;
+    for (const models::qwen4_exp::SegmentSpec& segment : model.segments().segments()) {
+        const DeviceGuard guard(segment.device);
+        out.push_back(std::make_unique<const execution::Parameters>(
+            model, segment.layers, execution::segment_role(segment)));
+    }
+    return out;
+}
+
 } // namespace
 
 bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) {
@@ -90,7 +107,7 @@ bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) {
 }
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+    : model(std::move(source)), parameters(segment_parameters(*model)),
       frontend(models::qwen3_5::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
                                                .architecture            = models::Architecture::Qwen4Exp,
@@ -105,8 +122,27 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
 
-ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
+const models::qwen4_exp::execution::Parameters& Qwen4ExpInstance::primary() const {
+    return *parameters.front();
+}
+
+ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
+                                        std::span<DeviceContext* const> devices) {
     validate(options);
+    bool matches = devices.size() == std::max<std::size_t>(options.devices.size(), 1);
+    for (std::size_t i = 0; matches && i < devices.size(); ++i) {
+        const int ordinal = options.devices.empty() ? options.device : options.devices[i];
+        matches           = devices[i] != nullptr && devices[i]->device == ordinal;
+    }
+    if (!matches) {
+        throw std::logic_error(
+            "construct_qwen4_exp needs one device context per device of its options, in order");
+    }
+    // validate_engine_options refuses a second device before its context exists.
+    if (devices.size() > 1 && !models::qwen4_exp::kSplitExecution) {
+        throw std::logic_error("a Qwen3.8-Flash-Next layer split cannot be constructed yet");
+    }
+    DeviceContext& device = *devices.front();
     const auto start = std::chrono::steady_clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
@@ -114,7 +150,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
+    auto load = models::load_options(options, models::Architecture::Qwen4Exp);
+    auto plan = models::qwen4_exp::plan_load(reader, load);
+    // A layer split's device segments, once the artifact gives the layer count.
+    load.segment_ends = layer_split_ends(options, plan.config().text.num_hidden_layers);
+    if (!load.segment_ends.empty()) { plan = models::qwen4_exp::plan_load(reader, load); }
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
@@ -140,8 +180,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    if (tier && devices.size() > 1 && !models::qwen4_exp::kSplitExpertTier) {
+        throw std::invalid_argument(
+            "a layer split across devices needs every expert in Host RAM (it has no SSD expert "
+            "tier yet), and the RAM ledger leaves " +
+            std::to_string(mib(ledger.expert_ram)) + " of the " +
+            std::to_string(mib(ledger.full_need)) +
+            " MiB they need: free Host RAM, lower --ram-headroom-mib or raise --expert-ram-mib");
+    }
     if (tier) {
-        auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
+        auto streamed           = load;
         streamed.stream_experts = true;
         plan                    = models::qwen4_exp::plan_load(reader, streamed);
     }
@@ -224,7 +272,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // must leave room for the expert cache.
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
-    const std::uint64_t dense = plan.device_bytes();
+    // The primary's own arena (device segment 0): this check and the spill guard below are the
+    // primary's. A split's further devices need their own (plan.device_bytes() sums every arena).
+    const std::uint64_t dense = plan.device_bytes(0);
     auto vram                 = open_vram_budget_source(device.device, options.vram_past_budget);
     const VramSnapshot before = vram->query();
     models::qwen4_exp::VramDemand vram_demand;
@@ -252,7 +302,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The dense arena must land in device memory (WDDM can place it in system memory silently).
     SpillGuard guard(*vram);
     guard.begin();
-    auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
+    auto model =
+        models::qwen4_exp::materialize_model(std::move(plan), devices, &options.startup_observer);
     device.synchronize();
     if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
@@ -266,8 +317,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     frontend.complete();
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program =
-        std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
+    instance->program = std::make_unique<models::qwen4_exp::Program>(instance->primary(), device,
+                                                                     std::move(program_options));
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_record_stride;

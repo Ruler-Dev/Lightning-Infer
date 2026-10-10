@@ -3,7 +3,9 @@
 #include "models/registry.h"
 #include "infernix/types.h"
 
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace infernix::models {
 
@@ -20,6 +22,10 @@ struct LoadOptions {
     // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
     // expert tier (design §19.3.7) instead of being pinned in host memory.
     bool stream_experts = false;
+    // Qwen4Exp layer split: device segment s holds the dense weights of decoder layers
+    // [segment_ends[s-1], segment_ends[s]) (from 0) in its own arena, on the s-th device given to
+    // materialize_model. The ends ascend to the layer count; empty = one segment.
+    std::vector<std::uint32_t> segment_ends;
 
     bool operator==(const LoadOptions&) const = default;
 

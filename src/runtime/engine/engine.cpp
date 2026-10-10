@@ -7,6 +7,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/device_set.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
@@ -18,21 +19,16 @@
 #include <cstdio>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace infernix {
 namespace {
-
-DeviceContext initialize_device(const EngineOptions& options) {
-    StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
-    phase.complete();
-    return device;
-}
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -221,10 +217,10 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(runtime::initialize_devices(options, extra_devices)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (architecture == models::Architecture::Qwen4Exp) {
-            auto constructed  = runtime::construct_qwen4_exp(options, device);
+            auto constructed  = runtime::construct_qwen4_exp(options, device_set());
             options           = std::move(constructed.options);
             qwen4             = std::move(constructed.instance);
             load              = std::move(constructed.load);
@@ -285,7 +281,21 @@ public:
         try {
             device.synchronize();
         } catch (...) {}
+        for (const std::unique_ptr<DeviceContext>& extra : extra_devices) {
+            try {
+                extra->synchronize();
+            } catch (...) {}
+        }
         if (persists) { report_prefix_cache_save(); }
+    }
+
+    // Every device in EngineOptions::devices order, the primary first.
+    [[nodiscard]] std::vector<DeviceContext*> device_set() {
+        std::vector<DeviceContext*> set{&device};
+        for (const std::unique_ptr<DeviceContext>& extra : extra_devices) {
+            set.push_back(extra.get());
+        }
+        return set;
     }
 
     void stop() noexcept {
@@ -353,6 +363,11 @@ public:
 
     models::Architecture architecture = models::Architecture::Qwen3_5; // set by normalize
     EngineOptions options;
+    // The devices after the primary (a layer split's), in EngineOptions::devices order; empty on
+    // one device. Declared before the primary so that initialize_devices can fill it while it
+    // creates every context in order.
+    std::vector<std::unique_ptr<DeviceContext>> extra_devices;
+    // The primary device: the worker's, the Qwen3.5 model's and the first split segment's.
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
@@ -364,6 +379,8 @@ public:
 };
 
 Engine::Engine(EngineOptions options) {
+    // Before the first CUDA call: device ordinals in PCI bus order.
+    runtime::select_pci_bus_device_order();
     // Before any host thread starts: a throttled process runs every one of them slower.
     exempt_process_from_power_throttling();
     StartupObserver startup_observer = options.startup_observer;

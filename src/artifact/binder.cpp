@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 
 namespace infernix::artifact {
 
@@ -33,16 +34,19 @@ Binder::Binder(const Reader& reader)
     : reader_(reader), demands_(reader.directory().objects.size()) {}
 
 ParameterReference Binder::parameter(std::string_view name, Shape shape, Residency residency,
-                                     std::optional<QType> exact_format) {
+                                     std::optional<QType> exact_format,
+                                     std::optional<std::uint8_t> segment) {
     const auto found = reader_.directory().bindings.find(name);
     if (found == reader_.directory().bindings.end()) {
         throw ArtifactError("missing logical parameter " + std::string(name));
     }
-    return binding(std::string(name), found->second, std::move(shape), residency, exact_format);
+    return binding(std::string(name), found->second, std::move(shape), residency, exact_format,
+                   segment);
 }
 
 ParameterReference Binder::binding(std::string name, const Binding& binding, Shape shape,
-                                   Residency residency, std::optional<QType> exact_format) {
+                                   Residency residency, std::optional<QType> exact_format,
+                                   std::optional<std::uint8_t> segment) {
     if (weight_element_count(shape) != binding.elements ||
         (binding.whole_object &&
          reader_.directory().tensor(binding.parts.at(0).object).shape != shape)) {
@@ -55,9 +59,9 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
                                 ": representation does not match its mathematical value type");
         }
         if (residency == Residency::Device) {
-            require_device(part.object);
+            require_device(part.object, 256, segment.value_or(0));
         } else if (residency == Residency::HostPinned) {
-            require_pinned(part.object);
+            require_pinned(part.object, 256, segment.value_or(kSharedSegment));
         } else if (residency == Residency::Streamed) {
             require_streamed(part.object);
         } else if (residency == Residency::Host) {
@@ -79,13 +83,31 @@ bool Binder::contains(std::string_view parameter) const {
     return reader_.directory().bindings.contains(parameter);
 }
 
-void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
+void Binder::set_segment_count(std::uint8_t count) {
+    if (count == 0 || count >= kSharedSegment) {
+        throw ArtifactError("device segment count must be 1 to " +
+                            std::to_string(kSharedSegment - 1));
+    }
+    segment_count_ = count;
+}
+
+void Binder::require_device(ObjectHandle object, std::uint64_t alignment, std::uint8_t segment) {
     const auto& geometry = reader_.geometry(object);
     if (!alignment || (alignment & (alignment - 1))) {
         throw ArtifactError("device alignment must be a power of two");
     }
-    auto& demand     = demands_.at(object.index);
+    if (segment == kSharedSegment) {
+        throw ArtifactError(object_id(reader_.directory().object(object)) +
+                            ": a device object belongs to one device segment");
+    }
+    auto& demand = demands_.at(object.index);
+    if (demand.device && demand.segment != segment) {
+        throw ArtifactError(object_id(reader_.directory().object(object)) +
+                            ": demanded on device segments " + std::to_string(demand.segment) +
+                            " and " + std::to_string(segment));
+    }
     demand.device    = true;
+    demand.segment   = segment;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
 }
 
@@ -97,15 +119,21 @@ void Binder::mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank
     demand.evict_rank = std::max(demand.evict_rank, evict_rank);
 }
 
-void Binder::require_pinned(ObjectHandle object, std::uint64_t alignment) {
+void Binder::require_pinned(ObjectHandle object, std::uint64_t alignment, std::uint8_t segment) {
     reader_.validate_object(object);
     const auto& geometry = reader_.geometry(object);
     if (!alignment || (alignment & (alignment - 1))) {
         throw ArtifactError("pinned alignment must be a power of two");
     }
-    auto& demand     = demands_.at(object.index);
-    demand.pinned    = true;
-    demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+    auto& demand = demands_.at(object.index);
+    if (demand.pinned && demand.pinned_segment != segment) {
+        throw ArtifactError(object_id(reader_.directory().object(object)) +
+                            ": pinned for segments " + std::to_string(demand.pinned_segment) +
+                            " and " + std::to_string(segment));
+    }
+    demand.pinned         = true;
+    demand.pinned_segment = segment;
+    demand.alignment      = std::max({demand.alignment, alignment, geometry.alignment});
 }
 
 void Binder::require_streamed(ObjectHandle object) {
@@ -191,15 +219,29 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     plan.object_count      = demands_.size();
     plan.prior_read_bytes  = read_bytes_;
     plan.owned_value_bytes = owned_value_bytes_;
+    // The end of each segment's arena so far.
+    std::vector<std::uint64_t> capacity(segment_count_, std::uint64_t{0});
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
+        if (demand.device && demand.segment >= segment_count_) {
+            throw ArtifactError(object_id(reader_.directory().object(ObjectHandle{i})) +
+                                ": device segment " + std::to_string(demand.segment) +
+                                " of a plan with " + std::to_string(segment_count_));
+        }
+        if (demand.pinned && demand.pinned_segment != kSharedSegment &&
+            demand.pinned_segment >= segment_count_) {
+            throw ArtifactError(object_id(reader_.directory().object(ObjectHandle{i})) +
+                                ": pinned for segment " + std::to_string(demand.pinned_segment) +
+                                " of a plan with " + std::to_string(segment_count_));
+        }
         if (demand.device && demand.evict_rank == 0) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);
-            const auto offset =
-                align_up(plan.device_capacity_bytes, demand.alignment, "device offset");
-            plan.device_objects.push_back({handle, offset, geometry.bytes, demand.alignment});
-            plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
+            auto& end            = capacity[demand.segment];
+            const auto offset    = align_up(end, demand.alignment, "device offset");
+            plan.device_objects.push_back(
+                {handle, offset, geometry.bytes, demand.alignment, demand.segment});
+            end = checked_add(offset, geometry.bytes, "device capacity");
         }
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
@@ -227,16 +269,20 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
                     offset -= kPayloadAlignment;
                 }
             }
-            plan.pinned_objects.push_back({handle, offset, geometry.bytes});
+            plan.pinned_objects.push_back({handle, offset, geometry.bytes, demand.pinned_segment});
             plan.pinned_capacity_bytes = checked_add(offset, geometry.bytes, "pinned capacity");
         }
     }
     // Ranked device objects pack after the unranked prefix in ascending rank, so higher
     // ranks sit closer to the arena end and are evicted first. Each is aligned to the
-    // evictable chunk so the evictable suffix is chunk-aligned.
+    // evictable chunk so the evictable suffix is chunk-aligned. The EvictableWeightPool remaps
+    // one arena, so a plan with a tail has one segment (and every ranked object is in it).
     std::vector<std::size_t> ranked;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         if (demands_[i].device && demands_[i].evict_rank != 0) { ranked.push_back(i); }
+    }
+    if (!ranked.empty() && segment_count_ != 1) {
+        throw ArtifactError("the evictable weight tail requires a single device segment");
     }
     std::sort(ranked.begin(), ranked.end(), [this](std::size_t a, std::size_t b) {
         if (demands_[a].evict_rank != demands_[b].evict_rank) {
@@ -251,17 +297,17 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         const ObjectHandle handle{i};
         const auto& geometry = reader_.geometry(handle);
         const auto alignment = std::max(demand.alignment, evictable_alignment);
-        const auto offset = align_up(plan.device_capacity_bytes, alignment, "device offset");
+        const auto offset    = align_up(capacity[0], alignment, "device offset");
         if (first_ranked) {
             tail_begin   = offset;
             first_ranked = false;
         }
-        plan.device_objects.push_back({handle, offset, geometry.bytes, alignment});
-        plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
+        plan.device_objects.push_back({handle, offset, geometry.bytes, alignment, 0});
+        capacity[0] = checked_add(offset, geometry.bytes, "device capacity");
     }
-    if (!first_ranked) {
-        plan.evictable_tail_bytes = plan.device_capacity_bytes - tail_begin;
-    }
+    if (!first_ranked) { plan.evictable_tail_bytes = capacity[0] - tail_begin; }
+    for (const auto bytes : capacity) { plan.device_segments.push_back({bytes}); }
+    plan.device_capacity_bytes = capacity[0];
     return plan;
 }
 

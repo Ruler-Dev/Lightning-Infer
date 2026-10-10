@@ -78,6 +78,14 @@ struct BenchOptions {
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     int device            = 0;
+    // The layer-split flags of infernix (product/split_options.h), copied into EngineOptions.
+    std::vector<int> devices;
+    std::optional<std::uint32_t> layer_split;
+    bool layer_split_auto = false;
+    std::string layer_split_plan;
+    bool layer_split_report = false;
+    SplitHandoff split_handoff = SplitHandoff::Auto;
+    std::uint32_t handoff_timeout_ms = kDefaultHandoffTimeoutMs;
     bool use_cuda_graph   = true;
     bool profile_measured = false;
     OutputFormat output   = OutputFormat::Table;

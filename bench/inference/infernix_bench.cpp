@@ -183,10 +183,17 @@ int main(int argc, char** argv) {
             tests, options.max_context, options.speculative, options.use_cuda_graph);
 
         infernix::EngineOptions engine_options;
-        engine_options.artifact_path   = options.artifact_path;
-        engine_options.device          = options.device;
-        engine_options.max_context     = max_context;
-        engine_options.max_concurrency = options.concurrency;
+        engine_options.artifact_path      = options.artifact_path;
+        engine_options.device             = options.device;
+        engine_options.devices            = options.devices;
+        engine_options.layer_split        = options.layer_split;
+        engine_options.layer_split_auto   = options.layer_split_auto;
+        engine_options.layer_split_plan   = options.layer_split_plan;
+        engine_options.layer_split_report = options.layer_split_report;
+        engine_options.split_handoff      = options.split_handoff;
+        engine_options.handoff_timeout_ms = options.handoff_timeout_ms;
+        engine_options.max_context        = max_context;
+        engine_options.max_concurrency    = options.concurrency;
         const std::uint64_t kv_capacity =
             ((static_cast<std::uint64_t>(max_context) + 63U) / 64U) * 64U * options.concurrency;
         if (kv_capacity > std::numeric_limits<std::uint32_t>::max()) {

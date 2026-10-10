@@ -1,11 +1,15 @@
 // Engine option combinations the Engine rejects before it reads any artifact.
 #include "infernix/engine.h"
+#include "models/qwen4_exp/program/split_capabilities.h"
+#include "models/registry.h"
+#include "runtime/engine/model_instance.h"
 
 #include <cuda_runtime.h>
 
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -30,6 +34,137 @@ std::string construction_error(infernix::EngineOptions options, bool& invalid_ar
     }
     invalid_argument = false;
     return {};
+}
+
+// What validate_engine_options refuses for this architecture (empty: accepted).
+std::string validation_error(const infernix::EngineOptions& options,
+                             infernix::models::Architecture architecture) {
+    try {
+        infernix::runtime::validate_engine_options(options, architecture);
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    return {};
+}
+
+bool contains(const std::string& text, const char* part) {
+    return text.find(part) != std::string::npos;
+}
+
+// The device set and the layer-split options. Every refusal comes before any device context
+// exists; a Qwen4Exp split is refused while split_capabilities.h has not enabled it.
+int check_device_options() {
+    using infernix::models::Architecture;
+    namespace split = infernix::models::qwen4_exp;
+    int failures       = 0;
+    const auto refusal = [](infernix::EngineOptions options) {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(std::move(options), invalid_argument);
+        return invalid_argument ? what : std::string("(accepted) ") + what;
+    };
+    {
+        // One --devices entry is the device alone: validation passes and the artifact fails.
+        infernix::EngineOptions single;
+        single.devices         = {0};
+        const std::string what = refusal(single);
+        failures += check(!contains(what, "device") && !contains(what, "split"),
+                          "devices {device} was refused");
+    }
+    infernix::EngineOptions options;
+    options.devices = {1};
+    failures += check(contains(refusal(options), "begin with device"),
+                      "devices not beginning with the primary device were accepted");
+    options         = infernix::EngineOptions{};
+    options.device  = -1;
+    options.devices = {-1, 0};
+    failures +=
+        check(contains(refusal(options), "nonnegative"), "a negative device ordinal was accepted");
+    options.device  = 0;
+    options.devices = {0, 0, 0};
+    failures +=
+        check(contains(refusal(options), "at most two devices"), "three devices were accepted");
+    options.devices = {0, 0};
+    failures += check(contains(refusal(options), "needs a readable Qwen3.8-Flash-Next artifact"),
+                      "a Qwen3.5 layer split was accepted");
+    // The split's own options need two devices.
+    for (int option = 0; option < 6; ++option) {
+        infernix::EngineOptions one;
+        switch (option) {
+        case 0: one.layer_split = 24U; break;
+        case 1: one.layer_split_auto = true; break;
+        case 2: one.layer_split_plan = "plan.json"; break;
+        case 3: one.layer_split_report = true; break;
+        case 4: one.split_handoff = infernix::SplitHandoff::Event; break;
+        default: one.handoff_timeout_ms = 500; break;
+        }
+        failures += check(contains(refusal(one), "needs two devices"),
+                          "a layer-split option was accepted on one device");
+        one.devices = {0};
+        failures += check(contains(refusal(one), "needs two devices"),
+                          "a layer-split option was accepted with one --devices entry");
+    }
+    infernix::EngineOptions two;
+    two.devices          = {0, 0};
+    two.layer_split      = 24U;
+    two.layer_split_auto = true;
+    failures += check(contains(refusal(two), "select one layer split"),
+                      "two layer-split forms were accepted together");
+    two.layer_split_auto = false;
+    two.layer_split      = 0U;
+    failures += check(contains(refusal(two), "K >= 1"), "--layer-split 0 was accepted");
+    two.layer_split = 24U;
+    for (const std::uint32_t milliseconds : {0U, infernix::kMaximumHandoffTimeoutMs + 1U}) {
+        two.handoff_timeout_ms = milliseconds;
+        failures += check(contains(refusal(two), "--handoff-timeout-ms must be in"),
+                          "an out-of-range handoff timeout was accepted");
+    }
+
+    // Qwen4Exp, without its artifact: the split's capabilities.
+    infernix::EngineOptions qwen4;
+    qwen4.artifact_path         = "absent-artifact.infernix";
+    qwen4.devices               = {1, 0};
+    qwen4.device                = 1;
+    qwen4.context_cache.enabled = false;
+    if (!split::kSplitExecution) {
+        const std::string refused = validation_error(qwen4, Architecture::Qwen4Exp);
+        failures += check(contains(refused, "not available yet"),
+                          "a Qwen4Exp layer split was accepted before its execution exists");
+    } else {
+        failures += check(validation_error(qwen4, Architecture::Qwen4Exp).empty(),
+                          "a Qwen4Exp layer split was refused");
+        if (!split::kSplitVision) {
+            infernix::EngineOptions vision = qwen4;
+            vision.enable_vision           = true;
+            failures +=
+                check(contains(validation_error(vision, Architecture::Qwen4Exp), "--vision"),
+                      "a layer split accepted vision before it supports it");
+        }
+        if (!split::kSplitPrefixCache) {
+            infernix::EngineOptions cached = qwen4;
+            cached.context_cache.enabled   = true;
+            cached.context_cache.mode      = infernix::ContextCacheMode::Hybrid;
+            failures +=
+                check(contains(validation_error(cached, Architecture::Qwen4Exp), "prefix cache"),
+                      "a layer split accepted the prefix cache before it supports it");
+        }
+    }
+    // Two devices without K or a plan file resolve to auto; one device never does.
+    const auto normalized = [](infernix::EngineOptions engine_options) {
+        return infernix::runtime::normalize_engine_options(std::move(engine_options),
+                                                           Architecture::Qwen4Exp);
+    };
+    failures += check(normalized(qwen4).layer_split_auto,
+                      "two devices without a layer split did not select auto");
+    infernix::EngineOptions explicit_k = qwen4;
+    explicit_k.layer_split             = 24U;
+    infernix::EngineOptions planned    = qwen4;
+    planned.layer_split_plan           = "plan.json";
+    infernix::EngineOptions alone      = qwen4;
+    alone.devices                      = {};
+    failures += check(!normalized(explicit_k).layer_split_auto &&
+                          normalized(explicit_k).layer_split == 24U &&
+                          !normalized(planned).layer_split_auto &&
+                          !normalized(alone).layer_split_auto,
+                      "an explicit layer split or one device resolved to auto");
+    return failures;
 }
 
 } // namespace
@@ -143,6 +278,7 @@ int main() {
     failures += check(split_invalid && split_text.find("prefill_split_workspace_mib") !=
                                            std::string::npos,
                       "a prompt split workspace above 16384 MiB was accepted");
+    failures += check_device_options();
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;
 }

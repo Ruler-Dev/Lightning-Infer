@@ -4,14 +4,22 @@
 // the PLE injection, 48 hyper-connection blocks of GDN or QSA plus the offloaded MoE, the final
 // mixer and the LM head. One call runs `batch` sequences of `width` consecutive positions: a
 // prefill chunk is one sequence of many positions, a decode round several sequences of one.
+//
+// A Forward runs one segment of a layer split (models/qwen4_exp/segment_map.h, ForwardSegment): a
+// contiguous range of decoder layers, embedding the call before the first or receiving the residual
+// from the previous segment, and finishing it after the last or sending the residual on. The
+// default segment is the whole model. State, KV, tails, verification records and the per-layer
+// expert tables it is given hold only its own layers, in their order.
 
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/handoff.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/segment_map.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
@@ -28,26 +36,57 @@ namespace infernix::models::qwen4_exp::execution {
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
-// Program-owned recurrent state of every slot.
+// Program-owned recurrent state of every slot, for the segment's layers.
 struct ForwardState {
-    LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
+    LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block (null: the segment has none)
     Tensor ple_conv;                         // BF16 [S*H, span, slots]
     std::vector<Tensor> qsa_tails;           // per attention block: BF16 [Di, R - 1, slots]
     Tensor mtp_tails;                        // the MTP block's tails (empty without MTP)
     Tensor mtp_ones;                         // FP32 [S, columns] of 1: broadcasts the embedding
 };
 
-// Program-owned paged KV of the attention blocks.
+// Program-owned paged KV of the segment's attention blocks.
 struct ForwardKV {
     std::vector<ops::QsaKVLayer> layers; // per attention block
     std::optional<ops::QsaKVLayer> mtp;  // the MTP block's layer, through the same tables
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
+// A Forward's share of a layer split. Its decoder layers [layers.begin, layers.end) index the
+// model's Parameters and the call's layer waits globally; its state, KV planes and tails locally
+// (compact - gdn_base, compact - attention_base), and its per-layer expert tables, route log and
+// landing by layer - layers.begin. A segment that does not embed receives the residual through
+// `in` (on this device's stream); one that does not finish sends it through `out`. The MTP
+// drafter, its KV and tails belong to the finishing segment only.
+//
+// Event-mode handoffs need host steps around the call, outside any stream capture: the sender's
+// owner records `out->record_sent` after the call is enqueued, and the receiver's owner issues
+// `in->wait_sent` before it (HandoffChannel). Gate-mode handoffs need none: the receiver's
+// stream waits for the call's word (ForwardBatch::handoff_word), bounded by `in_bound`.
+//
+// run() always crosses through `in` and `out`, whose one slot holds a decode or verification
+// call's residual. Eager prefill chunks cross through the owner's BulkHandoff instead: the owner
+// composes each segment's share from the steps (begin_call, alloc_residual, embed or layer,
+// finish) and moves the sender's residual into the receiver's with BulkHandoff::transfer in
+// between; chunks may then follow one another without a host wait (both residuals stay at
+// alloc_residual's fixed address, and the copies are ordered on each device's stream).
+struct ForwardSegment {
+    LayerRange layers{}; // {0, 0}: the whole model
+    std::uint32_t gdn_base = 0, attention_base = 0;
+    bool embed = true, finish = true; // exactly when the range starts at 0, ends at the last layer
+    HandoffChannel* in     = nullptr; // required when !embed; received on this device
+    HandoffChannel* out    = nullptr; // required when !finish; sent from this device
+    PinnedGateBound in_bound{};       // Gate mode: the receiving gate's bound and error word
+    // Gate mode, optional: device U64 [2] to which each receiving wait that found the word
+    // unpublished adds its nanoseconds and 1 (HandoffChannel::receive's wait_stats).
+    std::uint64_t* in_wait_stats = nullptr;
+};
+
 // The CPU's share of a gated prefill call's experts (design §19.3.12): from the call's columns per
 // expert in one layer, marks in `cpu` the experts the CPU serves, which must be non-resident and
 // have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant),
 // and returns their number. Owned by the Program, which knows the link and the CPU's rates.
+// `layer` is the segment's local index (layer - ForwardSegment::layers.begin), as its tables'.
 class CpuSplitPolicy {
 public:
     virtual ~CpuSplitPolicy() = default;
@@ -56,13 +95,14 @@ public:
 };
 
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
-// bank otherwise.
+// bank otherwise. Per-layer entries are the segment's layers in order: local layer i is decoder
+// layer ForwardSegment::layers.begin + i.
 struct ForwardExperts {
     const std::uint8_t* frame_base = nullptr;
     std::uint64_t frame_stride     = 0;
     std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
-    // Optional route log for the expert cache: layer l's routed ids (I32 [k, T]) are copied to
-    // route_log + l * route_stride.
+    // Optional route log for the expert cache: local layer i's routed ids (I32 [k, T]) are copied
+    // to route_log + i * route_stride.
     std::int32_t* route_log  = nullptr;
     std::size_t route_stride = 0;
     // Device slots the MoE stages non-resident records into before computing them (shared by
@@ -70,6 +110,7 @@ struct ForwardExperts {
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     // Per layer: the channel to the host expert engine for CPU-served misses (empty disables).
+    // A channel names its decoder layer globally (the CPU service holds every layer).
     std::vector<ops::MoeCpuChannel> cpu;
     // SSD tier (design §19.3.7; empty in full mode): per layer, the device table of host record
     // pointers (null: SSD-only; replaces the pinned bank) and the fetch channel its SSD-only
@@ -83,13 +124,13 @@ struct ForwardExperts {
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
     // Landing frames of decode and verification calls (design §19.3.5 S4; see
-    // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
-    // landing_slots. Null disables.
+    // ops::MoeExpertSource::landing): local layer i uses landing + i * landing_slots and landed +
+    // i * landing_slots. Null disables.
     const std::int32_t* landing = nullptr;
     std::int32_t* landed        = nullptr;
     std::int32_t landing_slots  = 0;
     // Prefill chunks read the experts this stream copied ahead while it is active (design §19.3.8
-    // F2; owned by the Program, which starts it per chunk).
+    // F2; owned by the Program, which starts it per chunk). Its layers are the segment's, local.
     ExpertStream* stream = nullptr;
     // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
     const CpuSplitPolicy* split = nullptr;
@@ -100,9 +141,9 @@ struct ForwardExperts {
 // an accepted prefix needs instead; K/V and pooled keys are written as usual, since positions past
 // the accepted prefix are rewritten before any later query reads them.
 struct ForwardVerify {
-    GdnReplayRecords gdn; // narrowed to the call's width; physical record row b = sequence b
+    GdnReplayRecords gdn; // the segment's GDN layers at the call's width; record row b = sequence b
     Tensor ple_inputs;    // BF16 [S*H, W, B]: the PLE convolution inputs
-    Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
+    Tensor qsa_keys;      // BF16 [Di, W, B, the segment's attention layers]: the raw index keys
 };
 
 // Visual embeddings of a call's image columns (design §19.3.2): they replace those columns' token
@@ -163,8 +204,9 @@ struct ForwardBatch {
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
     // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each
-    // empty or one event per decoder layer, then one for the MTP block. Layer l waits for entry l
-    // before it reads or writes its state or KV planes; the MTP block waits for the last entry.
+    // empty or one event per decoder layer of the whole model, then one for the MTP block. Layer l
+    // waits for entry l before it reads or writes its state or KV planes; the MTP block waits for
+    // the last entry.
     std::array<std::span<const cudaEvent_t>, 2> layer_waits{};
     const VisionInput* vision = nullptr;   // when set: image columns of a prefill call
     // Prefill expert streaming (ExpertStream): the call's MoE reads the active stream's ring, and
@@ -175,6 +217,12 @@ struct ForwardBatch {
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;
+    // A layer split's crossing into or out of this segment (ForwardSegment::in, out): the mode,
+    // and for HandoffMode::Gate the call's word in this device's memory (the segment's io,
+    // IoLayout::handoff), which the sender publishes after the residual and the receiver waits
+    // for. Every segment of a call stages the same word; words strictly increase from call to call.
+    const std::uint32_t* handoff_word = nullptr;
+    HandoffMode handoff               = HandoffMode::Event;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -204,7 +252,8 @@ struct MtpCall {
     const VisionInput* vision = nullptr;
 };
 
-// Optional observation of every block, for reference comparison.
+// Optional observation of every block, for reference comparison. The vectors are indexed by
+// decoder layer; a segment writes its own layers' entries only.
 struct ForwardTap {
     std::vector<Tensor>* residuals = nullptr; // receives BF16 [S*H, T] copies, one per block
     std::vector<Tensor>* routes    = nullptr; // receives I32 [top k, T] routed expert ids, one per block
@@ -221,26 +270,47 @@ struct ForwardTap {
 
 class Forward {
 public:
+    // Throws std::invalid_argument when the state, KV, tails or expert tables do not hold exactly
+    // the segment's layers, or when the segment is inconsistent with the model's layers.
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
-            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context);
+            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context,
+            ForwardSegment segment = {});
     ~Forward();
     Forward(const Forward&)            = delete;
     Forward& operator=(const Forward&) = delete;
 
-    // FP32 logits [V, n] of batch.logit_columns.
+    // The segment's share of a call: begin_call, alloc_residual, embed (or receive), the range's
+    // layers, then finish (or send). Only a finishing segment may produce logits: FP32 [V, n] of
+    // batch.logit_columns when `logits` is set.
+    void run(const ForwardBatch& batch, Tensor* logits, const ForwardTap* tap = nullptr);
+    // The same with logits (a finishing segment; the whole model by default).
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
     // The steps run() composes, for a layer walk over a prefill span (design §19.3.8 F4): the
     // same chunks executed layer-major instead of chunk-major. Each step of a chunk starts with
     // begin_call (it resets the workspace); `residual` (BF16 [S*H, T]) lives outside the
     // workspace. embed writes the chunk's expanded embedding into it; layer runs one decoder
-    // layer; finish runs the chunk's MTP cells and, when logits is set, the final mixer and the
-    // LM head. Outputs are run()'s bit for bit: every step's kernels, inputs and order within the
-    // chunk are the same.
+    // layer of the segment's range; finish runs the chunk's MTP cells and, when logits is set, the
+    // final mixer and the LM head. Outputs are run()'s bit for bit: every step's kernels, inputs
+    // and order within the chunk are the same. begin_call throws when logits are passed to a
+    // segment that does not finish; embed and finish throw on a segment that does not own them.
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+
+    // The call's residual (BF16 [S*H, T]) in the workspace: run()'s first allocation after
+    // begin_call, so its address is the same in every call (capturable).
+    Tensor alloc_residual(const ForwardBatch& batch);
+    // The layer split's crossings, in the batch's handoff mode on this device's stream (both
+    // capturable): receive fills `residual` from ForwardSegment::in, send hands it to
+    // ForwardSegment::out. Event mode leaves the cross-device ordering to the owner
+    // (ForwardSegment); Gate mode waits for, and publishes, batch.handoff_word.
+    void receive(const ForwardBatch& batch, Tensor& residual);
+    void send(const ForwardBatch& batch, const Tensor& residual);
+
+    // The segment with its range resolved ({0, L} for the whole model).
+    [[nodiscard]] const ForwardSegment& segment() const noexcept { return segment_; }
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
@@ -287,6 +357,8 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::int32_t max_context_;
+    ForwardSegment segment_;
+    std::uint32_t gdn_count_ = 0, attention_count_ = 0; // the segment's layers of each kind
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the

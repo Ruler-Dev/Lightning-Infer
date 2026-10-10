@@ -88,7 +88,9 @@ infernix_bench --weights <artifact.ninfer>
           [--prefill-8bit-pv | --no-prefill-8bit-pv] [--use-original-nvfp4-prefill-kernel]
           [--prefill-split-workspace-mib <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
-          [--device <id>] [--no-cuda-graph] [--profile-measured]
+          [--device <id> | --devices <a,b>] [--layer-split <K|auto|@FILE>] [--layer-split-report]
+          [--split-handoff <auto|event|gate>] [--handoff-timeout-ms <n>]
+          [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
 
@@ -110,6 +112,11 @@ Example:
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, DFlash/DFlash2
 K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
+
+`--devices`, `--layer-split`, `--layer-split-report`, `--split-handoff` and `--handoff-timeout-ms`
+configure a Qwen3.8-Flash-Next layer split exactly as `infernix`'s flags do
+([layer split](../docs/cli.md#layer-split)); `--devices` replaces `--device`. Like `infernix`,
+the benchmark refuses two devices until the split execution is available.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

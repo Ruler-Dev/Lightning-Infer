@@ -29,6 +29,15 @@
 // frames chunk by chunk, or releases the top chunks after evicting the lowest-score experts and
 // moving the survivors below the new top, so kernels and captured graphs keep their addresses.
 // Without VMM the frames are one allocation of the first size.
+//
+// Layer split. A residency serves the layers whose banks it is given: the whole model on one GPU, or
+// one segment's contiguous layers. Its keys ((local layer) * experts + expert), frame tables, route
+// log, landing table and saved state then use local layer indices (the global layer minus the
+// segment's first); expert_cache::split_saved_state and merge_saved_states convert the saved state.
+// Its memory, streams and events belong to the `device` it is constructed for; every call besides
+// construction, destruction and attach_tier runs with that device current (the segment's
+// DeviceGuard), since the streams it is handed belong to it. The SSD tier serves the whole model
+// only.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -67,26 +76,41 @@ public:
     static constexpr std::uint32_t kLandingSlots = 16;
 
     using SavedState = expert_cache::SavedState;
+    // Keyed by the residency's layers (local keys); merge_saved_states makes a whole-model state.
     [[nodiscard]] SavedState saved_state() const;
     // Before the first round: seeds the counts (each capped at `count_cap`, so a stale expert
     // yields to new uses) and loads at most `max_keys` of the ranked keys, best first, into free
-    // frames, waiting for the copies. Returns the number loaded.
+    // frames, waiting for the copies. Returns the number loaded. `state` has the residency's key
+    // count (a layer subset takes split_saved_state's part) or no counts; std::invalid_argument
+    // otherwise.
     std::uint32_t warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
                              cudaStream_t compute);
 
-    // banks[l]: layer l's pinned host records (record_stride bytes apart; null entries with a tier).
-    // max_columns: the most columns one round routes. The cache starts with no frames: resize()
-    // backs them.
+    // banks[l]: the pinned host records of the residency's local layer l (record_stride bytes apart;
+    // null entries with a tier), one bank per layer it serves, at least one: layers() ==
+    // banks.size(). max_columns: the most columns one round routes. Everything is allocated on
+    // `device`, whichever device is current; the frames' VMM address space is `device`'s whole
+    // memory. The cache starts with no frames: resize() backs them.
     ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
                     std::int32_t max_columns, int device);
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
 
-    // Device bytes besides the frames: the frame tables and the route log.
+    // Device bytes besides the frames: the frame tables and the route log, of `layers` layers (the
+    // whole model without it).
     [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
-    // Frames the cache uses at most: every routed expert but one.
+    [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns,
+                                                   std::uint32_t layers) noexcept;
+    // Frames the cache uses at most: every routed expert of its layers but one.
     [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config) noexcept;
+    [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config, std::uint32_t layers) noexcept;
+
+    // The layers it serves (its banks); tables, route log and landing table are indexed 0..layers()-1.
+    [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
+    [[nodiscard]] int device() const noexcept { return device_; }
+    // The frames' VMM address space (whole chunks of `device`'s total memory); 0 without VMM.
+    [[nodiscard]] std::uint64_t reserved_bytes() const noexcept { return arena_ ? arena_->reserved_bytes() : 0; }
     // Bytes the frames are mapped in (whole chunks); a grow or shrink moves in these steps.
     static constexpr std::size_t kChunkBytes = 64ULL << 20;
 
@@ -123,7 +147,8 @@ public:
     void give_back(FrameLease& lease, cudaStream_t compute);
 
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
-    // Before the first round and before warm_start.
+    // Before the first round and before warm_start. The tier keys the whole model, so a residency
+    // over a layer subset refuses it (std::logic_error).
     void attach_tier(HostExpertTier* tier);
     [[nodiscard]] bool tiered() const noexcept { return tier_ != nullptr; }
     // Layer l's host record pointers (device [E]; null entries: SSD-only), or null without a tier.
@@ -200,6 +225,7 @@ private:
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
     std::uint64_t stride_ = 0;
+    int device_           = 0;
     std::uint32_t frames_ = 0;
     std::uint32_t limit_  = 0;
     std::uint32_t experts_ = 0, layers_ = 0, top_k_ = 0;

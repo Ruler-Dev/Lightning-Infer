@@ -1,8 +1,11 @@
 #include "models/qwen4_exp/execution/parameters.h"
 
+#include "core/device_guard.h"
+#include "core/per_device.h"
 #include "core/weight_view.h"
 
 #include <array>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -133,31 +136,80 @@ private:
     const Model& model_;
 };
 
+// The range and role of a segment's Parameters (Parameters(model, layers, role)).
+void validate_segment(const Model& model, LayerRange range, SegmentRole role) {
+    const std::uint32_t layers = model.config().text.num_hidden_layers;
+    const std::string what     = "Qwen4Exp parameters of layers [" + std::to_string(range.begin) +
+                             ", " + std::to_string(range.end) + ")";
+    if (range.begin >= range.end || range.end > layers) {
+        throw std::invalid_argument(what + ": not a range of the model's " +
+                                    std::to_string(layers) + " layers");
+    }
+    // A segment's weights share one device: its range lies inside one arena of the load.
+    const SegmentMap& segments = model.segments();
+    if (segments.segment_of(range.begin) != segments.segment_of(range.end - 1)) {
+        throw std::invalid_argument(what +
+                                    ": the layers span more than one device segment of the load");
+    }
+    if (role.embed != (range.begin == 0)) {
+        throw std::invalid_argument(what +
+                                    ": the embedding segment is the one starting at layer 0");
+    }
+    if (role.head != (range.end == layers)) {
+        throw std::invalid_argument(what +
+                                    ": the head segment is the one ending at the last layer");
+    }
+    if (role.vision && !role.embed) {
+        throw std::invalid_argument(what + ": the Vision tower belongs to the embedding segment");
+    }
+}
+
+// A layer outside the segment: no operands, and the mixer alternative of its kind, so a reader that
+// takes the variant by the layer's kind never throws.
+BlockParameters absent_layer(MixerKind kind) {
+    BlockParameters out;
+    if (kind == MixerKind::Gdn) { out.mixer = GdnParameters{}; }
+    return out;
+}
+
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
+Parameters::Parameters(const Model& source)
+    : Parameters(source, {0, source.config().text.num_hidden_layers}, {}) {}
+
+Parameters::Parameters(const Model& source, LayerRange range, SegmentRole role)
+    : model(source), range_(range), role_(role), device_(current_device()) {
+    validate_segment(source, range, role);
     const Prepare prepare(source);
     const auto& w = source.weights();
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return native_weight(embedding.view); });
-    const auto& head = source.weight(w.output_head);
-    if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
-        output_head_q8 = prepare.linear({w.output_head});
-    } else {
-        output_head = prepare.tensor(w.output_head);
+    if (role.head) {
+        const auto& head = source.weight(w.output_head);
+        if (!head.view.parts.empty() &&
+            head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
+            output_head_q8 = prepare.linear({w.output_head});
+        } else {
+            output_head = prepare.tensor(w.output_head);
+        }
+        final_mixer = prepare.hc(w.final_mixer);
     }
-    final_mixer     = prepare.hc(w.final_mixer);
 
     const auto banks = source.expert_banks();
     if (banks.size() != w.layers.size()) { throw std::logic_error("Qwen4Exp: one expert bank per layer"); }
     const std::size_t per_layer = sizeof(ops::offloaded_moe::ExpertScales) * c.moe.experts;
-    scales_ = DeviceBuffer(per_layer * banks.size());
-    for (std::size_t i = 0; i < banks.size(); ++i) {
-        scales_.copy_from_host(banks[i].scales.data(), per_layer, per_layer * i);
+    scales_ = DeviceBuffer(per_layer * range.size());
+    for (std::uint32_t i = range.begin; i < range.end; ++i) {
+        scales_.copy_from_host(banks[i].scales.data(), per_layer, per_layer * (i - range.begin));
     }
 
-    for (std::size_t i = 0; i < w.layers.size(); ++i) {
+    layers.reserve(w.layers.size());
+    for (std::uint32_t i = 0; i < w.layers.size(); ++i) {
+        if (!range.contains(i)) {
+            layers.push_back(absent_layer(c.layer_types[i]));
+            continue;
+        }
         const auto& layer = w.layers[i];
         BlockParameters out;
         out.attn_hc = prepare.hc(layer.attn_hc);
@@ -180,7 +232,7 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.moe.shared_down    = prepare.linear({layer.moe.shared_down});
         out.moe.bank           = &banks[i];
         out.moe.device_scales  = reinterpret_cast<const ops::offloaded_moe::ExpertScales*>(
-            static_cast<const std::byte*>(scales_.p) + per_layer * i);
+            static_cast<const std::byte*>(scales_.p) + per_layer * (i - range.begin));
         if (layer.ple) {
             const auto& p = *layer.ple;
             out.ple       = PleParameters{prepare.linear({p.key_projection, p.value_projection}),
@@ -192,7 +244,7 @@ Parameters::Parameters(const Model& source) : model(source) {
         }
         layers.push_back(std::move(out));
     }
-    if (w.mtp) {
+    if (role.head && w.mtp) {
         const auto& m = *w.mtp;
         MtpParameters out;
         out.embedding_norm       = prepare.tensor(m.embedding_norm);
@@ -211,11 +263,11 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.experts_down         = prepare.linear(m.expert_down).weight;
         mtp = std::move(out);
     }
-    if (w.proposal) {
+    if (role.head && w.proposal) {
         draft_head.rows      = prepare.linear({w.proposal->head});
         draft_head.token_ids = prepare.tensor(w.proposal->token_ids);
     }
-    if (w.vision) {
+    if (role.vision && w.vision) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
         if (vision->merger_fc2.weight.n != static_cast<std::int32_t>(model.config().text.hidden_size)) {
             throw std::invalid_argument("Qwen4Exp vision: the merger's output width differs from the text hidden size");
@@ -223,6 +275,16 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
 }
 
-Parameters::~Parameters() = default;
+Parameters::~Parameters() {
+    // The expert scales are freed with their device current: a layer split tears its segments
+    // down from one thread.
+    if (scales_.p == nullptr) { return; }
+    try {
+        const DeviceGuard guard(device_);
+        scales_ = DeviceBuffer();
+    } catch (const std::exception&) {
+        // The device cannot be selected: the member's destructor frees them as before.
+    }
+}
 
 } // namespace infernix::models::qwen4_exp::execution

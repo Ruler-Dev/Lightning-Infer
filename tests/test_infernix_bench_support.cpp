@@ -148,7 +148,41 @@ int test_cli_contract() {
     failures += expect(parsed.speculative.proposal_head == infernix::ProposalHead::Optimized,
                        "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
+    failures += expect(parsed.devices.empty() && !parsed.layer_split &&
+                           parsed.split_handoff == infernix::SplitHandoff::Auto &&
+                           parsed.handoff_timeout_ms == infernix::kDefaultHandoffTimeoutMs,
+                       "no layer split by default");
     failures += expect(parsed.profile_measured, "profile-measured flag");
+    {
+        const auto split = parse_for_test({"infernix_bench", "--weights", "model.ninfer",
+                                           "--devices", "1,0", "--layer-split", "24",
+                                           "--layer-split-report", "--split-handoff", "gate",
+                                           "--handoff-timeout-ms", "800"});
+        failures += expect(split.devices == std::vector<int>({1, 0}) && split.device == 1 &&
+                               split.layer_split == std::optional<std::uint32_t>(24) &&
+                               !split.layer_split_auto && split.layer_split_report &&
+                               split.split_handoff == infernix::SplitHandoff::Gate &&
+                               split.handoff_timeout_ms == 800,
+                           "layer-split flags");
+        const auto automatic = parse_for_test(
+            {"infernix_bench", "--weights", "model.ninfer", "--layer-split", "auto"});
+        failures += expect(automatic.layer_split_auto && !automatic.layer_split,
+                           "--layer-split auto");
+        failures += expect_throws<std::invalid_argument>(
+            [] {
+                (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--device",
+                                      "1", "--devices", "1,0"});
+            },
+            "--device with --devices");
+        failures += expect_throws<std::invalid_argument>(
+            [] {
+                (void)parse_for_test(
+                    {"infernix_bench", "--weights", "model.ninfer", "--devices", "0,1,0"});
+            },
+            "three devices");
+        failures += expect(qb::usage_text("infernix_bench").find("--devices") != std::string::npos,
+                           "benchmark help includes --devices");
+    }
     failures +=
         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
                "output settings");

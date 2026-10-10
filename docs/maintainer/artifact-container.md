@@ -641,6 +641,20 @@ element interval by Binding, keeping its numeric type.
 The reader's JSON and symbol index are for cold loading; at runtime the resolved references and direct
 calls are used.
 
+A layer split across devices backs the device objects with one arena per device segment.
+The architecture binder declares the segment count and tags each device demand with its segment; an
+object belongs to one segment, and a second demand with another tag is an error.
+The plan packs each segment's objects in object order into that segment's arena, at offsets relative
+to it, and the materializer allocates every arena on its segment's device before the pinned chunks and
+uploads each object on its device's transfer stream; every device parent points into its segment's
+arena.
+With one segment the plan, the arena and the upload are the single-device ones.
+The evictable weight tail needs one segment.
+Pinned objects keep one plan space of portable chunks that every device reads, unless the plan asks for
+per-segment chunks: each then holds the objects of one reading segment and is mapped memory of that
+segment's device, while objects tagged as shared stay portable. A pinned demand without a tag is
+shared.
+
 ### 11.3 Semantic and support checks
 
 | Situation | Owner |

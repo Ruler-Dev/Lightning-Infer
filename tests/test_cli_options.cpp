@@ -1,9 +1,11 @@
 #include "options.h"
 
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -26,6 +28,84 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+// --devices and the layer-split flags: their syntax and the primary device. How they combine is the
+// Engine's check (test_engine_options).
+int run_split_tests() {
+    using Arguments = std::vector<std::string>;
+    using infernix::SplitHandoff;
+    const auto with = [](Arguments extra) {
+        Arguments arguments{"infernix-cli", "model.ninfer", "--prompt", "x"};
+        arguments.insert(arguments.end(), extra.begin(), extra.end());
+        return parse(std::move(arguments));
+    };
+    int failures       = 0;
+    const auto initial = with({});
+    failures += check(initial.devices.empty() && initial.device == 0 && !initial.layer_split &&
+                          !initial.layer_split_auto && initial.layer_split_plan.empty() &&
+                          !initial.layer_split_report &&
+                          initial.split_handoff == SplitHandoff::Auto &&
+                          initial.handoff_timeout_ms == infernix::kDefaultHandoffTimeoutMs,
+                      "the layer-split flags must default off");
+    const auto reversed = with({"--devices", "1,0"});
+    failures += check(reversed.devices == std::vector<int>{1, 0} && reversed.device == 1,
+                      "--devices 1,0 must keep its order and make device 1 the primary");
+    const auto single = with({"--devices", "2"});
+    failures += check(single.devices == std::vector<int>{2} && single.device == 2,
+                      "--devices with one ordinal must select that device");
+    failures += check(with({"--devices", "0,0"}).devices == std::vector<int>{0, 0},
+                      "--devices 0,0 (same-device split) must be accepted");
+    for (const char* text : {"", ",", "0,", ",1", "-1", "0,-1", "0,1,2", "a", "1;0", "1 ,0", "+1",
+                             "99999999999"}) {
+        failures += check(rejects([&] { (void)with({"--devices", text}); }),
+                          "an invalid --devices list was accepted");
+    }
+    failures += check(rejects([&] { (void)with({"--device", "0", "--devices", "0,1"}); }) &&
+                          rejects([&] { (void)with({"--devices", "0", "--device", "0"}); }),
+                      "--device and --devices were accepted together");
+    const auto k = with({"--devices", "0,1", "--layer-split", "24"});
+    failures += check(k.layer_split == 24U && !k.layer_split_auto && k.layer_split_plan.empty(),
+                      "--layer-split K was not preserved");
+    const auto automatic = with({"--layer-split", "24", "--layer-split", "auto"});
+    failures += check(!automatic.layer_split && automatic.layer_split_auto &&
+                          automatic.layer_split_plan.empty(),
+                      "a later --layer-split auto must replace K");
+    const auto plan = with({"--layer-split", "auto", "--layer-split", "@runs/plan.json"});
+    failures += check(!plan.layer_split && !plan.layer_split_auto &&
+                          plan.layer_split_plan == std::filesystem::path("runs/plan.json"),
+                      "--layer-split @FILE must name the plan file alone");
+    for (const char* text : {"0", "-1", "", "@", "x", "24x", "auto24", "4294967296"}) {
+        failures += check(rejects([&] { (void)with({"--layer-split", text}); }),
+                          "an invalid --layer-split was accepted");
+    }
+    failures += check(with({"--layer-split-report"}).layer_split_report,
+                      "--layer-split-report was not parsed");
+    failures += check(
+        with({"--split-handoff", "event"}).split_handoff == SplitHandoff::Event &&
+            with({"--split-handoff", "gate"}).split_handoff == SplitHandoff::Gate &&
+            with({"--split-handoff", "gate", "--split-handoff", "auto"}).split_handoff ==
+                SplitHandoff::Auto,
+        "--split-handoff was not parsed");
+    failures += check(rejects([&] { (void)with({"--split-handoff", "spin"}); }),
+                      "an invalid --split-handoff was accepted");
+    const std::string maximum = std::to_string(infernix::kMaximumHandoffTimeoutMs);
+    failures += check(with({"--handoff-timeout-ms", "1"}).handoff_timeout_ms == 1 &&
+                          with({"--handoff-timeout-ms", maximum}).handoff_timeout_ms ==
+                              infernix::kMaximumHandoffTimeoutMs,
+                      "--handoff-timeout-ms was not parsed");
+    for (const std::string text : {std::string("0"), std::string(""), std::string("-5"),
+                                   std::to_string(infernix::kMaximumHandoffTimeoutMs + 1)}) {
+        failures += check(rejects([&] { (void)with({"--handoff-timeout-ms", text}); }),
+                          "an out-of-range --handoff-timeout-ms was accepted");
+    }
+    const std::string help = infernix::cli::usage_text("infernix-cli");
+    for (const char* flag : {"--devices A,B", "--layer-split K|auto|@FILE", "--layer-split-report",
+                             "--split-handoff", "--handoff-timeout-ms", "PCI bus order"}) {
+        failures +=
+            check(help.find(flag) != std::string::npos, "CLI help omits a layer-split flag");
+    }
+    return failures;
 }
 
 } // namespace
@@ -307,6 +387,7 @@ int run_tests() {
     const auto state_file = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "CLI --expert-state FILE must name the file");
+    failures += check(run_split_tests() == 0, "CLI layer-split flags failed");
     return failures == 0 ? 0 : 1;
 }
 
