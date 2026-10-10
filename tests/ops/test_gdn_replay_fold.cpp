@@ -889,6 +889,11 @@ int main(int argc, char** argv) {
     failures += run_case({48, 48, 10240}, 8, 2, {8, 3}, 1871U, false, 16);
     failures += run_case({48, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1873U, true, 16);
     failures += run_case({30, 32, 8192}, 8, 2, {5, 8}, 1875U, false, 16);
+    // A layer split's segments fold their own GDN layers (Qwen3.8-Flash-Next at K = 1, 24, 47).
+    failures += run_case({1, 48, 10240}, 5, 2, {5, 2}, 1881U, true);
+    failures += run_case({18, 48, 10240}, 5, 1, {3}, 1883U, true);
+    failures += run_case({35, 48, 10240}, 4, 2, {0, 4}, 1885U);
+    failures += run_case({7, 32, 8192}, 6, 2, {6, 1}, 1887U);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

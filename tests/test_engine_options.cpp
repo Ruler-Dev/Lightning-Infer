@@ -137,6 +137,14 @@ int check_device_options() {
                 check(contains(validation_error(vision, Architecture::Qwen4Exp), "--vision"),
                       "a layer split accepted vision before it supports it");
         }
+        // The gate handoff needs two GPUs; on one the event handoff runs.
+        infernix::EngineOptions gated = qwen4;
+        gated.split_handoff           = infernix::SplitHandoff::Gate;
+        failures += check(validation_error(gated, Architecture::Qwen4Exp).empty(),
+                          "a gated layer split across two GPUs was refused");
+        gated.devices = {1, 1};
+        failures += check(contains(validation_error(gated, Architecture::Qwen4Exp), "two different GPUs"),
+                          "a gated layer split on one GPU was accepted");
         if (!split::kSplitPrefixCache) {
             infernix::EngineOptions cached = qwen4;
             cached.context_cache.enabled   = true;

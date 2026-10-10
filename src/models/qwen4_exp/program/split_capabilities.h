@@ -10,9 +10,10 @@
 namespace infernix::models::qwen4_exp {
 
 // Construction over two segments and the eager calls (prefill, forced tokens, the first token).
-inline constexpr bool kSplitExecution = false;
-// Decode, MTP draft and verify rounds across the segments.
-inline constexpr bool kSplitDecode = false;
+inline constexpr bool kSplitExecution = true;
+// Decode, MTP draft and verify rounds across the segments (one graph family per segment, the
+// residual through each boundary's HandoffChannel in the event or the gate mode).
+inline constexpr bool kSplitDecode = true;
 // The hybrid prefix cache across the segments: restores, captures and its persistent file.
 inline constexpr bool kSplitPrefixCache = false;
 // Vision input.

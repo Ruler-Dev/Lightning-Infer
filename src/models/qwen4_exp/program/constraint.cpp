@@ -147,6 +147,7 @@ void ProgramImpl::commit_constraint_draws(Lane& lane, std::size_t accepted) {
 PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     const std::size_t n = lane.readout.size();
     if (n == 0 || n > kMaximumReadoutTokens) { throw std::invalid_argument("prompt readout names an invalid token count"); }
+    const DeviceGuard on(head().device->device);
     const cudaStream_t s = head().device->stream;
     // The sampler read these logits rounded to BF16 (and masked them for a constrained request):
     // round the unmasked FP32 column again.

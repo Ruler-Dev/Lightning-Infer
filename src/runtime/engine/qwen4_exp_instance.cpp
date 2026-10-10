@@ -13,6 +13,7 @@
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/qwen4_exp/program/split_capabilities.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
+#include "models/qwen4_exp/segment_map.h"
 #include "models/registry.h"
 #include "runtime/engine/device_set.h"
 #include "runtime/engine/model_instance.h"
@@ -20,9 +21,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <iterator>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::runtime {
 namespace {
@@ -54,6 +59,36 @@ std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::Pr
                   mib(dense), kv, mib(plan.workspace), mib(plan.staging), mib(plan.state + plan.io),
                   mib(plan.residency));
     return text;
+}
+
+// A device's part of the engine: the dense arenas of its segments, the Program's fixed allocations
+// on it (its segments' plans summed: two segments of the same-device test mode share a device), its
+// VRAM source with its readings, and the frames its segments' expert caches got.
+struct DeviceShare {
+    DeviceContext* context = nullptr;
+    std::uint64_t dense    = 0;
+    std::uint32_t layers   = 0;
+    models::qwen4_exp::ProgramDevicePlan plan;
+    std::unique_ptr<VramBudgetSource> vram;
+    VramSnapshot before;
+    std::optional<SpillGuard> guard;
+    std::uint64_t after_weights = 0, after_startup = 0;
+    std::uint32_t frames = 0;
+    std::optional<models::qwen4_exp::VramSizing> sizing; // its first segment's
+};
+
+void add_plan(models::qwen4_exp::ProgramDevicePlan& sum, const models::qwen4_exp::ProgramDevicePlan& part) {
+    sum.kv_pages = part.kv_pages; // every segment indexes the same pages
+    sum.kv += part.kv;
+    sum.kv_max += part.kv_max;
+    sum.workspace += part.workspace;
+    sum.staging += part.staging;
+    sum.state += part.state;
+    sum.io += part.io;
+    sum.residency += part.residency;
+    sum.expert_record_stride = part.expert_record_stride;
+    sum.max_frames += part.max_frames;
+    sum.graph_bound += part.graph_bound;
 }
 
 void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
@@ -267,63 +302,119 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
             static_cast<std::uint64_t>(static_cast<double>(ledger.expert_ram) / (1.0 + demand.lock_overhead));
     }
 
-    // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
-    // Program's fixed allocations, the reserve for graph executables and the display headroom
-    // must leave room for the expert cache.
-    const auto device_plan =
-        models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
-    // The primary's own arena (device segment 0): this check and the spill guard below are the
-    // primary's. A split's further devices need their own (plan.device_bytes() sums every arena).
-    const std::uint64_t dense = plan.device_bytes(0);
-    auto vram                 = open_vram_budget_source(device.device, options.vram_past_budget);
-    const VramSnapshot before = vram->query();
-    models::qwen4_exp::VramDemand vram_demand;
-    vram_demand.headroom    = options.vram_headroom_bytes;
-    vram_demand.graphs      = device_plan.graph_bound;
-    vram_demand.fixed       = dense + device_plan.fixed_bytes();
-    vram_demand.frame_bytes = device_plan.expert_record_stride;
-    vram_demand.max_frames  = device_plan.max_frames;
-    const auto check        = models::qwen4_exp::size_expert_frames(before, vram_demand);
-    if (check.frame_bytes < 0) {
-        throw std::runtime_error(
-            "Qwen3.8-Flash-Next does not fit in device memory: " + std::to_string(mib(before.device_free)) +
-            " MiB free; " + device_contributors(dense, device_plan) + "; reserve " + std::to_string(mib(check.reserve)) +
-            "; headroom " + std::to_string(mib(check.headroom)) + " (" + check.describe() +
-            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
-            "--vram-headroom-mib, or free VRAM");
+    // A layer split's handoffs (decode and verification rounds): Auto is the event handoff until the
+    // gate's soak passes, so the gate stays opt-in.
+    program_options.handoff            = options.split_handoff == SplitHandoff::Gate ? SplitHandoff::Gate
+                                                                                    : SplitHandoff::Event;
+    program_options.handoff_timeout_ms = options.handoff_timeout_ms;
+    program_options.logits_hash        = models::qwen4_exp::testing::logits_hash();
+
+    // The model's device segments (one without a split) and, per device, its segments' dense arenas
+    // and the Program's fixed allocations on it (two segments of the same-device test mode share
+    // one device).
+    const models::qwen4_exp::Config& config = plan.config();
+    std::vector<int> ordinals;
+    for (const DeviceContext* context : devices) { ordinals.push_back(context->device); }
+    const models::qwen4_exp::SegmentMap segments =
+        load.segment_ends.empty()
+            ? models::qwen4_exp::SegmentMap::single(config.text, config.mtp, device.device)
+            : models::qwen4_exp::SegmentMap::contiguous(config.text, config.mtp, ordinals, load.segment_ends);
+    std::vector<DeviceShare> shares;
+    for (const models::qwen4_exp::SegmentSpec& segment : segments.segments()) {
+        auto share = std::find_if(shares.begin(), shares.end(),
+                                  [&](const DeviceShare& s) { return s.context->device == segment.device; });
+        if (share == shares.end()) {
+            shares.push_back(DeviceShare{.context = devices[segment.index]});
+            share = std::prev(shares.end());
+        }
+        const auto segment_plan = models::qwen4_exp::Program::plan_segment(
+            program_options, config, static_cast<std::int32_t>(plan.public_token_count()), segment);
+        share->dense += plan.device_bytes(segment.index);
+        share->layers += segment.layers.size();
+        add_plan(share->plan, segment_plan);
     }
-    if (check.frames < kFewFrames) {
-        report(options, DiagnosticLevel::Warning,
-               "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
-                   std::to_string(kFewFrames) + " or more recommended); lower --max-context or --max-concurrency, "
-                   "or free VRAM");
+    const bool split = segments.size() > 1;
+    // The VRAM check (design §19.3.7) of each device, before the weights are read: the dense weights,
+    // the Program's fixed allocations, the reserve for graph executables and the display headroom
+    // must leave room for the expert cache.
+    for (DeviceShare& share : shares) {
+        share.vram   = open_vram_budget_source(share.context->device, options.vram_past_budget);
+        share.before = share.vram->query();
+        models::qwen4_exp::VramDemand vram_demand;
+        vram_demand.headroom    = options.vram_headroom_bytes;
+        vram_demand.graphs      = share.plan.graph_bound;
+        vram_demand.fixed       = share.dense + share.plan.fixed_bytes();
+        vram_demand.frame_bytes = share.plan.expert_record_stride;
+        vram_demand.max_frames  = share.plan.max_frames;
+        const auto check        = models::qwen4_exp::size_expert_frames(share.before, vram_demand);
+        const std::string where = split ? " of GPU " + std::to_string(share.context->device) : std::string();
+        if (check.frame_bytes < 0) {
+            throw std::runtime_error(
+                "Qwen3.8-Flash-Next does not fit in device memory" + where + ": " +
+                std::to_string(mib(share.before.device_free)) + " MiB free; " +
+                device_contributors(share.dense, share.plan) + "; reserve " + std::to_string(mib(check.reserve)) +
+                "; headroom " + std::to_string(mib(check.headroom)) + " (" + check.describe() +
+                "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
+                "--vram-headroom-mib, " + (split ? "move the layer split, " : "") + "or free VRAM");
+        }
+        // A device's frames serve its layers: the recommended count shrinks with them.
+        const std::uint32_t few =
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(kFewFrames) * share.layers / config.text.num_hidden_layers);
+        if (check.frames < few) {
+            report(options, DiagnosticLevel::Warning,
+                   "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM" + where +
+                       " (" + std::to_string(few) + " or more recommended); lower --max-context or "
+                       "--max-concurrency, " + (split ? "move the layer split, " : "") + "or free VRAM");
+        }
     }
 
-    // The dense arena must land in device memory (WDDM can place it in system memory silently).
-    SpillGuard guard(*vram);
-    guard.begin();
+    // The dense arenas must land in device memory (WDDM can place them in system memory silently).
+    for (DeviceShare& share : shares) {
+        share.guard.emplace(*share.vram);
+        share.guard->begin();
+    }
     auto model =
         models::qwen4_exp::materialize_model(std::move(plan), devices, &options.startup_observer);
-    device.synchronize();
-    if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
-        throw std::runtime_error(std::to_string(mib(spilled)) +
-                                 " MiB of the dense weights were placed in shared system memory by the driver's "
-                                 "sysmem fallback: free VRAM and start again");
+    for (DeviceShare& share : shares) {
+        const DeviceGuard on(share.context->device);
+        share.context->synchronize();
+        if (const std::uint64_t spilled = share.guard->end(share.dense); spilled != 0) {
+            throw std::runtime_error(std::to_string(mib(spilled)) +
+                                     " MiB of the dense weights were placed in shared system memory" +
+                                     (split ? " of GPU " + std::to_string(share.context->device) : std::string()) +
+                                     " by the driver's sysmem fallback: free VRAM and start again");
+        }
+        share.after_weights = share.vram->query().device_free;
     }
-    const std::uint64_t after_weights = vram->query().device_free;
 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = std::make_unique<models::qwen4_exp::Program>(instance->primary(), device,
-                                                                     std::move(program_options));
-    const auto& sizing = instance->program->vram_sizing();
-    const std::uint64_t frames_bytes =
-        static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_record_stride;
-    const std::uint64_t after_startup = vram->query().device_free;
-    {
+    std::vector<const models::qwen4_exp::execution::Parameters*> parameters;
+    for (const auto& segment : instance->parameters) { parameters.push_back(segment.get()); }
+    instance->program = std::make_unique<models::qwen4_exp::Program>(
+        parameters, devices, instance->model->segments(), std::move(program_options));
+    const std::span<const models::qwen4_exp::VramSizing> sizing = instance->program->segment_vram_sizing();
+    for (const models::qwen4_exp::SegmentSpec& segment : segments.segments()) {
+        DeviceShare& share = *std::find_if(shares.begin(), shares.end(), [&](const DeviceShare& s) {
+            return s.context->device == segment.device;
+        });
+        share.frames += sizing[segment.index].frames;
+        if (!share.sizing) { share.sizing = sizing[segment.index]; }
+    }
+    const MemorySummary memory = instance->program->memory_summary();
+    auto& resolution     = instance->kv_capacity_resolution;
+    resolution.mode                     = options.kv_capacity.mode;
+    resolution.main_page_groups         = memory.kv_capacity_page_groups;
+    resolution.maximum_main_page_groups = memory.kv_capacity_max_page_groups;
+    resolution.resolved_tokens          = memory.kv_capacity;
+    // A split's devices are summed.
+    for (DeviceShare& share : shares) {
+        const std::uint64_t frames_bytes = static_cast<std::uint64_t>(share.frames) * share.plan.expert_record_stride;
+        share.after_startup              = share.vram->query().device_free;
+        const VramSnapshot& before       = share.before;
         const char* display = before.display == DisplayState::Headless   ? "no display"
                               : before.display == DisplayState::Attached ? "display attached"
                                                                          : "display unknown";
@@ -331,43 +422,42 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
         const std::string past = before.budget_allowance == 0
                                      ? std::string()
                                      : " (" + std::to_string(mib(before.budget_allowance)) + " MiB past the OS budget)";
+        const std::string gpu = split ? " (GPU " + std::to_string(share.context->device) + ")" : std::string();
         char line[704];
         std::snprintf(line, sizeof(line),
-                      "VRAM ledger: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
+                      "VRAM ledger%s: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
                       "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
-                      mib(before.device_total), display, mib(before.device_total - before.device_free), past.c_str(),
-                      device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
-                      mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
-                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
+                      gpu.c_str(), mib(before.device_total), display, mib(before.device_total - before.device_free),
+                      past.c_str(), device_contributors(share.dense, share.plan).c_str(), mib(share.sizing->reserve),
+                      share.plan.graph_bound, mib(share.sizing->headroom), options.vram_headroom_bytes ? "set" : "auto",
+                      share.frames, static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30),
+                      mib(share.after_startup));
         report(options, DiagnosticLevel::Debug, line);
         const double gib = static_cast<double>(1ULL << 30);
         char summary[320];
-        if (device_plan.kv_max > device_plan.kv) {
+        if (share.plan.kv_max > share.plan.kv) {
             std::snprintf(summary, sizeof(summary),
-                          "VRAM: model %.2f GiB, KV cache %.2f GiB (grows to %.2f GiB as contexts lengthen, taking room "
+                          "VRAM%s: model %.2f GiB, KV cache %.2f GiB (grows to %.2f GiB as contexts lengthen, taking room "
                           "from the expert cache), expert cache %u experts (%.1f GiB)",
-                          static_cast<double>(dense) / gib, static_cast<double>(device_plan.kv) / gib,
-                          static_cast<double>(device_plan.kv_max) / gib, sizing.frames,
+                          gpu.c_str(), static_cast<double>(share.dense) / gib, static_cast<double>(share.plan.kv) / gib,
+                          static_cast<double>(share.plan.kv_max) / gib, share.frames,
                           static_cast<double>(frames_bytes) / gib);
         } else {
-            std::snprintf(summary, sizeof(summary), "VRAM: model %.2f GiB, KV cache %.2f GiB, expert cache %u experts (%.1f GiB)",
-                          static_cast<double>(dense) / gib, static_cast<double>(device_plan.kv) / gib, sizing.frames,
-                          static_cast<double>(frames_bytes) / gib);
+            std::snprintf(summary, sizeof(summary),
+                          "VRAM%s: model %.2f GiB, KV cache %.2f GiB, expert cache %u experts (%.1f GiB)", gpu.c_str(),
+                          static_cast<double>(share.dense) / gib, static_cast<double>(share.plan.kv) / gib,
+                          share.frames, static_cast<double>(frames_bytes) / gib);
         }
         report(options, DiagnosticLevel::Info, summary);
+        resolution.runtime_reservation_bytes += share.plan.fixed_bytes() + frames_bytes;
+        resolution.available_after_weights_bytes += share.after_weights;
+        resolution.available_after_startup_bytes += share.after_startup;
+        resolution.automatic_headroom_bytes += share.sizing->headroom;
     }
-    const MemorySummary memory = instance->program->memory_summary();
-    auto& resolution                         = instance->kv_capacity_resolution;
-    resolution.mode                          = options.kv_capacity.mode;
-    resolution.main_page_groups              = memory.kv_capacity_page_groups;
-    resolution.maximum_main_page_groups      = memory.kv_capacity_max_page_groups;
-    resolution.resolved_tokens               = memory.kv_capacity;
-    resolution.runtime_reservation_bytes     = device_plan.fixed_bytes() + frames_bytes;
-    resolution.available_after_weights_bytes = after_weights;
-    resolution.available_after_startup_bytes = after_startup;
-    resolution.automatic_headroom_bytes      = sizing.headroom;
     resolution.planned_slack_bytes =
-        after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
+        resolution.available_after_weights_bytes > resolution.runtime_reservation_bytes
+            ? resolution.available_after_weights_bytes - resolution.runtime_reservation_bytes
+            : 0;
     LoadSummary::PrefixCacheRestore restore;
     if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid && !file.empty()) {

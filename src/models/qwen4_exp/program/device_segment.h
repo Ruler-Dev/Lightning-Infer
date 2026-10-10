@@ -18,6 +18,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/handoff.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/vmm_arena.h"
@@ -51,16 +52,19 @@ namespace infernix::models::qwen4_exp::detail {
 // [columns, 3] axis-major RoPE positions, `block_rope` its [batch, 3] block starts; `mtp_rope` and
 // `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk). `gate` is the U32 a gated
 // verification round's rows wait for (design §12.3): it precedes `ngram`, so the round uploads it
-// with the prefix and its rows go through the gate instead.
+// with the prefix and its rows go through the gate instead. `handoff` is the U32 a layer split's
+// gated handoff publishes and waits for (ForwardBatch::handoff_word), in the gate's 256-byte line,
+// so the decode prefix carries it and the layout after it is the unsplit one.
 //
 // Every segment's io has this one layout. Only the PLE reads the n-gram rows [ngram, mtp_ids), so
 // they go to the PLE segment (SegmentSpec::ple) alone, which is segment 1, not 0, when the split is
 // at layer 1: the upload rule follows the role, not the index. The other segments upload
-// [0, ngram) and [mtp_ids, bytes).
+// [0, ngram) and [mtp_ids, bytes). Decode and verification rounds upload [0, ngram) to every
+// segment; their rows reach the PLE segment through the n-gram gate.
 struct IoLayout {
-    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, gate = 0, ngram = 0,
-                mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0, vision_columns = 0,
-                mtp_vision_columns = 0, bytes = 0;
+    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, gate = 0,
+                handoff = 0, ngram = 0, mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0,
+                vision_columns = 0, mtp_vision_columns = 0, bytes = 0;
 };
 
 // Device I32 arrays of a verification round, each with room for every lane and width.
@@ -84,6 +88,9 @@ struct MtpIo {
 struct DeviceLayout {
     std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
                  pages_per_row = 0, mtp_columns = 0;
+    // The segment's roles (SegmentSpec): the head's buffers (logits, sampling, constraints, the
+    // drafter when `mtp`) and the PLE segment's gate statistics are planned only where they run.
+    bool owns_head = true, owns_ple = true;
     bool mtp = false;
     std::uint32_t kv_pages = 0, kv_layers = 0;
     std::uint64_t record_stride = 0;
@@ -117,6 +124,20 @@ struct DecodeGraph {
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
     bool warmed = false;
+};
+
+// A layer split's boundary event of a segment: recorded on its compute stream once its share of an
+// eager call or of a round is enqueued, so a segment on the same device waits for it (two
+// segments' kernels never overlap on one GPU: the MoE's results depend on that, design §19.3.8
+// "F1 nondeterminism"; ProgramImpl::SegmentWork).
+struct SegmentEvent {
+    SegmentEvent() = default;
+    SegmentEvent(const SegmentEvent&)            = delete;
+    SegmentEvent& operator=(const SegmentEvent&) = delete;
+    ~SegmentEvent() {
+        if (event != nullptr) { cudaEventDestroy(event); }
+    }
+    cudaEvent_t event = nullptr;
 };
 
 // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.
@@ -167,8 +188,8 @@ struct DeviceSegment {
     // The link's rate and the choices that follow it (derive_link_policy), set by
     // ProgramImpl::measure_link. The reference link's policy until then, and when nothing could be
     // probed (link_measured false). The Program applies the PCIe divisor, the promotion interval and
-    // the CPU split's widest call; it does not yet apply the promotion policy, the seed share or the
-    // CPU jobs.
+    // the CPU split's widest call; a layer split's segments also their promotion policy (none during
+    // requests on a slow link), seed share and CPU jobs (ProgramImpl::promotes_in_rounds).
     LinkPolicy policy;
     bool link_measured = false;
     // The CPU expert service's port that serves this segment's layers: 0 for an unsplit Program.
@@ -199,6 +220,9 @@ struct DeviceSegment {
     std::size_t wide_work = 0;               // the plan's wide arena bytes (0: none)
     ExpertResidency::FrameLease work_lease;  // the wide arena lent alone (no stream lease)
     DeviceBuffer wide_fallback;              // the wide arena when nothing could be lent
+    // A split's segment of a few layers, whose frames could never lend the wide arena: wide_fallback
+    // is its arena for good, allocated at construction.
+    bool wide_dedicated = false;
     std::unique_ptr<WorkspaceArena> wide_arena; // the arena swapped with *work around a wide call
     bool wide_active = false;                // *work is the wide arena (enter_wide .. leave_wide)
     // The stream's, the CPU split's and the walk's prefetch counters when the lease was taken.
@@ -210,6 +234,16 @@ struct DeviceSegment {
     std::unique_ptr<execution::CpuSplitPolicy> split_policy;
     bool split_call = false;
     OverlapResources overlap;
+
+    // ---- a layer split's boundaries (core/handoff.h; the Program owns them, none without a split):
+    // the channels into and out of this segment (decode and verification rounds), the bulk crossing
+    // out of it (eager calls), the event its share of a call or round records (SegmentEvent), and
+    // for a receiving segment the device U64 [2] its gated handoff waits add to (wait ns, waits) ----
+    HandoffChannel* in    = nullptr;
+    HandoffChannel* out   = nullptr;
+    BulkHandoff* bulk_out = nullptr;
+    SegmentEvent compute_done;
+    DeviceBuffer handoff_stats;
 
     // ---- the Forward and its CUDA graph families ----
     std::unique_ptr<execution::Forward> forward;

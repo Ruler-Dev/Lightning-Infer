@@ -81,6 +81,11 @@ void validate_devices(const EngineOptions& options, models::Architecture archite
         throw std::invalid_argument("a layer split across devices does not support the prefix "
                                     "cache yet: disable it (infernix-serve --no-prefix-reuse)");
     }
+    // On one GPU a waiting gate can keep the sending segment's work from running until it expires.
+    if (devices[0] == devices[1] && options.split_handoff == SplitHandoff::Gate) {
+        throw std::invalid_argument("--split-handoff gate needs the layer split on two different GPUs; a split "
+                                    "on one GPU (--devices A,A) uses the event handoff");
+    }
 }
 
 } // namespace

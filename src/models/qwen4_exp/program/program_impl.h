@@ -7,7 +7,9 @@
 #include "core/vmm_arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/device_guard.h"
 #include "core/gdn_replay_records.h"
+#include "core/handoff.h"
 #include "core/layout.h"
 #include "core/link_probe.h"
 #include "core/linear_attention_state.h"
@@ -39,6 +41,7 @@
 #include "models/qwen3_5/execution/vision_weight_stream.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/program/route_trace.h"
+#include "models/qwen4_exp/program/split_capabilities.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/qwen4_exp/segment_map.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -229,6 +232,7 @@ struct GateTraffic {
     std::uint64_t rounds = 0, reads = 0, read_ns = 0;
 };
 inline constexpr std::size_t kGateStatsBytes     = 16;          // per lane: U64 wait ns, U64 waits
+inline constexpr std::size_t kHandoffStatsBytes  = 16;          // a receiving segment: U64 wait ns, U64 waits
 inline constexpr std::uint64_t kSlowGatedReadNs  = 100000000;   // a gated round's reads warn past 100 ms
 
 inline std::uint64_t elapsed_ns(Clock::time_point start) {
@@ -308,8 +312,11 @@ public:
         std::shared_ptr<const PreparedPrompt> prompt; // a waiting sibling compares its media
         std::vector<ConstrainedDraw> constraint_round, constraint_trace;
         std::optional<DeviceKVPageReservation> reservation;
-        std::vector<DeviceKVPageLease> pages;
-        KVExecutionRowLease row;
+        std::vector<DeviceKVPageLease> pages; // the head's pool hands them out
+        KVExecutionRowLease row;              // the lane's block-table row in the head's tables
+        // A layer split: the same row in each other segment's tables (by segment index; invalid for
+        // the head and for a segment without KV), published with the head's page indices.
+        std::vector<KVExecutionRowLease> mirror_rows;
         std::uint64_t prefill_ns      = 0;
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
@@ -333,14 +340,20 @@ public:
     };
 
     // Everything a segment allocates on its device besides the expert frames; validates the options.
-    // Only the whole model's segment (SegmentMap::single) is planned: split execution sizes a
-    // segment's state, records and KV planes by its layers.
+    // A segment's recurrent state, verification records, QSA tails and KV planes cover its own
+    // layers (its compact GDN and attention ranges, and the MTP block's on the head); a segment
+    // without attention layers (a split at K <= 3) has no KV. Every segment holds the whole per-call
+    // io layout, its workspace and staging; the logits, sampling, constraint and MTP buffers are the
+    // head's, the n-gram gate's statistics the PLE segment's. The whole model's segment
+    // (SegmentMap::single) is the unsplit plan.
     static DeviceLayout plan_segment(const ProgramOptions& o, const Config& config, std::int32_t public_tokens,
                                      const SegmentSpec& segment) {
         const TextConfig& c = config.text;
-        if (segment.layers.begin != 0 || segment.layers.end != c.num_hidden_layers || !segment.embed ||
-            !segment.ple || !segment.head || segment.mtp != config.mtp) {
-            throw std::logic_error("Qwen4Exp: only a segment of the whole model can be planned (no split execution)");
+        if (segment.layers.begin >= segment.layers.end || segment.layers.end > c.num_hidden_layers ||
+            segment.embed != (segment.layers.begin == 0) || segment.head != (segment.layers.end == c.num_hidden_layers) ||
+            segment.mtp != (segment.head && config.mtp) ||
+            segment.kv_layers != segment.attention_count + (segment.mtp ? 1U : 0U)) {
+            throw std::logic_error("Qwen4Exp: the segment does not match the model's layers and roles");
         }
         if (o.max_concurrency == 0 || o.max_concurrency > kMaximumConcurrency) {
             throw std::invalid_argument("Qwen4Exp: max_concurrency must be in [1,8]");
@@ -363,10 +376,13 @@ public:
         DeviceLayout d;
         d.lanes         = static_cast<std::int32_t>(o.max_concurrency);
         d.token_domain  = public_tokens;
-        d.mtp           = config.mtp;
+        d.owns_head     = segment.head;
+        d.owns_ple      = segment.ple;
+        d.mtp           = segment.mtp;
         d.head_rows     = config.proposal_rows != 0 ? dim(config.proposal_rows) : dim(c.vocab_size);
         d.chunk         = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
-        d.mtp_k         = d.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
+        // The round's drafts, the same on every segment (its width); the drafter runs on the head.
+        d.mtp_k         = config.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
         d.max_width     = 1 + std::max(static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k);
         d.columns       = std::max(d.chunk, d.lanes * d.max_width);
         d.pages_per_row = (dim(o.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
@@ -377,35 +393,44 @@ public:
         if (o.prefix_cache) { d.kv_pages += static_cast<std::uint32_t>(lanes); }
         const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
 
-        // Recurrent state: one slot per lane; the PLE history; one QSA tail slab per attention
-        // layer, and one more for the MTP block.
-        LayoutBuilder state_builder;
-        d.gdn       = plan_linear_attention_state_pool(state_builder, {
-                                                                    .layers         = c.gdn_layers,
-                                                                    .conv_channels  = dim(c.gdn.conv_channels()),
-                                                                    .conv_width     = dim(c.gdn.conv_kernel - 1),
-                                                                    .value_heads    = dim(c.gdn.value_heads),
-                                                                    .value_head_dim = dim(c.gdn.value_head_dim),
-                                                                    .key_head_dim   = dim(c.gdn.key_head_dim),
-                                                                    .slot_count     = lanes,
-                                                                });
-        d.gdn_bytes = state_builder.finish(256);
-        d.ple       = width * c.ple.conv_span() * lanes * 2;
-        d.kv_layers = c.attention_layers + (d.mtp ? 1U : 0U);
+        // Recurrent state: one slot per lane of each of the segment's GDN layers; the PLE history (its
+        // segment's); one QSA tail slab per attention layer, and one more for the MTP block.
+        if (segment.gdn_count > 0) {
+            LayoutBuilder state_builder;
+            d.gdn       = plan_linear_attention_state_pool(state_builder, {
+                                                                        .layers         = segment.gdn_count,
+                                                                        .conv_channels  = dim(c.gdn.conv_channels()),
+                                                                        .conv_width     = dim(c.gdn.conv_kernel - 1),
+                                                                        .value_heads    = dim(c.gdn.value_heads),
+                                                                        .value_head_dim = dim(c.gdn.value_head_dim),
+                                                                        .key_head_dim   = dim(c.gdn.key_head_dim),
+                                                                        .slot_count     = lanes,
+                                                                    });
+            d.gdn_bytes = state_builder.finish(256);
+        }
+        d.ple       = segment.ple ? width * c.ple.conv_span() * lanes * 2 : 0;
+        d.kv_layers = segment.kv_layers;
         d.tails     = d.kv_layers * di * (r - 1) * lanes * 2;
-        d.window    = prefix::kv_window_geometry(c, o.kv_cache, d.mtp, static_cast<std::uint32_t>(lanes)).bytes();
+        d.window    = prefix::kv_window_geometry(c, o.kv_cache, segment.attention_count, d.mtp,
+                                                 static_cast<std::uint32_t>(lanes))
+                       .bytes();
 
-        // Paged KV: one page group holds 64 positions of every attention layer.
+        // Paged KV: one page group holds 64 positions of every attention layer of the segment, over
+        // the same page indices on every segment (the head's pool hands them out).
         // The page group's planes, in the order the prefix cache's records also use.
-        const prefix::KvPageGeometry kv_geometry = prefix::kv_page_geometry(c, o.kv_cache, d.mtp);
-        LayoutBuilder kv_builder;
-        d.pool   = plan_device_kv_page_pool(kv_builder, {.page_group_count = d.kv_pages, .geometry = kv_geometry.geometry});
-        d.tables = plan_kv_execution_tables(
-            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
-        d.kv = kv_builder.finish(256);
-        // Pages [0, n) are a prefix of each page-major plane, so growth maps whole chunks at each plane's end.
-        d.kv_elastic = d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
-        d.kv_base_pages = std::min<std::uint32_t>(d.kv_pages, kKvBaseTokens / kPagedKVPageSize);
+        if (d.kv_layers > 0) {
+            const prefix::KvPageGeometry kv_geometry =
+                prefix::kv_page_geometry(c, o.kv_cache, segment.attention_count, d.mtp);
+            LayoutBuilder kv_builder;
+            d.pool   = plan_device_kv_page_pool(kv_builder,
+                                                {.page_group_count = d.kv_pages, .geometry = kv_geometry.geometry});
+            d.tables = plan_kv_execution_tables(
+                kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
+            d.kv = kv_builder.finish(256);
+            // Pages [0, n) are a prefix of each page-major plane, so growth maps whole chunks at each plane's end.
+            d.kv_elastic    = d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
+            d.kv_base_pages = std::min<std::uint32_t>(d.kv_pages, kKvBaseTokens / kPagedKVPageSize);
+        }
 
         // Per-call inputs, logits and sampling counts.
         const std::size_t heads     = NgramHash(c.ple.ngram, 0).heads();
@@ -420,7 +445,8 @@ public:
         d.io.rows           = align(d.io.slots + 4ULL * lanes);
         d.io.columns        = align(d.io.rows + 4ULL * lanes);
         d.io.gate           = align(d.io.columns + 4ULL * columns);
-        d.io.ngram          = align(d.io.gate + 4);
+        d.io.handoff        = d.io.gate + 16; // the gate's line: the unsplit layout stays as it was
+        d.io.ngram          = align(d.io.handoff + 4);
         d.io.mtp_ids        = align(d.io.ngram + row_bytes * heads * columns);
         d.io.mtp_cells      = align(d.io.mtp_ids + 4ULL * (columns + 1));
         d.io.mtp_rope       = align(d.io.mtp_cells + 4ULL * (columns + 1));
@@ -428,12 +454,15 @@ public:
         d.io.vision_columns     = align(d.io.mtp_block_rope + 12ULL * mtp_subchunks);
         d.io.mtp_vision_columns = align(d.io.vision_columns + 4ULL * columns);
         d.io.bytes              = align(d.io.mtp_vision_columns + 4ULL * (columns + 1));
-        if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
+        if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram ||
+            d.io.handoff + 4 > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
-        d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
-        d.logits16     = 2ULL * c.vocab_size * lanes * W;
-        d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
+        if (d.owns_head) {
+            d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
+            d.logits16     = 2ULL * c.vocab_size * lanes * W;
+            d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
+        }
 
         // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
         // decode, verification and calls of up to kStaticWorkColumns columns; a wider prefill call
@@ -442,20 +471,23 @@ public:
         d.work           = workspace_bytes(c, o, d, lanes, d.static_columns);
         d.wide_work      = d.chunk > d.static_columns ? workspace_bytes(c, o, d, lanes, d.chunk) : 0;
 
-        // Verification (W > 1): GDN replay records, PLE and QSA records, the round's I32 arrays.
+        // Verification (W > 1): GDN replay records of the segment's GDN layers, the PLE's records
+        // (its segment's), QSA records of its attention layers, the round's I32 arrays.
         if (W > 1) {
-            LayoutBuilder records_builder;
-            d.records       = plan_gdn_replay_records(records_builder, {.layers          = dim(c.gdn_layers),
-                                                                        .record_capacity = lanes,
-                                                                        .width           = W,
-                                                                        .conv_channels   = dim(c.gdn.conv_channels()),
-                                                                        .qk_heads        = dim(c.gdn.key_heads),
-                                                                        .value_heads     = dim(c.gdn.value_heads),
-                                                                        .key_dim         = dim(c.gdn.key_head_dim),
-                                                                        .value_dim       = dim(c.gdn.value_head_dim)});
-            d.records_bytes = records_builder.finish(256);
-            d.ple_records   = 2ULL * width * W * lanes;
-            d.qsa_records   = 2ULL * di * W * lanes * c.attention_layers;
+            if (segment.gdn_count > 0) {
+                LayoutBuilder records_builder;
+                d.records       = plan_gdn_replay_records(records_builder, {.layers          = dim(segment.gdn_count),
+                                                                            .record_capacity = lanes,
+                                                                            .width           = W,
+                                                                            .conv_channels   = dim(c.gdn.conv_channels()),
+                                                                            .qk_heads        = dim(c.gdn.key_heads),
+                                                                            .value_heads     = dim(c.gdn.value_heads),
+                                                                            .key_dim         = dim(c.gdn.key_head_dim),
+                                                                            .value_dim       = dim(c.gdn.value_head_dim)});
+                d.records_bytes = records_builder.finish(256);
+            }
+            d.ple_records   = segment.ple ? 2ULL * width * W * lanes : 0;
+            d.qsa_records   = 2ULL * di * W * lanes * segment.attention_count;
             const std::size_t cells = static_cast<std::size_t>(lanes) * W;
             std::size_t at          = 0;
             const auto take         = [&](std::size_t words) {
@@ -507,15 +539,20 @@ public:
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
-        b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
-               sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
-               4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W) +
-               grammar_mask_bytes(d.token_domain, lanes, W);
-        b.residency            = ExpertResidency::table_bytes(c, d.columns);
+        // The head's logits, sampled tokens and positions, sampling configs, penalty counts,
+        // constraint controls and grammar masks; the PLE segment's gate statistics.
+        const std::size_t head_io = d.owns_head ? d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
+                                                 sizeof(ops::SamplingConfig) * lanes + d.token_counts
+                                           : 0;
+        b.io = d.io.bytes + head_io + 4ULL * d.spec.words + d.mtp_ones + 4ULL * d.mtp_io.words +
+               (d.owns_ple ? kGateStatsBytes * lanes : 0) + (segment.embed ? 0 : kHandoffStatsBytes) +
+               (d.owns_head ? constraint_bytes(lanes, W) + grammar_mask_bytes(d.token_domain, lanes, W) : 0);
+        b.residency            = ExpertResidency::table_bytes(c, d.columns, segment.layers.size());
         b.expert_record_stride = d.record_stride;
-        b.max_frames           = ExpertResidency::max_frames(c);
-        b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
-                                             static_cast<std::uint32_t>(d.mtp_k));
+        b.max_frames           = ExpertResidency::max_frames(c, segment.layers.size());
+        // Decode and verification graphs on every segment, the drafter's on the head.
+        b.graph_bound = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
+                                    d.mtp ? static_cast<std::uint32_t>(d.mtp_k) : 0U);
         return d;
     }
 
@@ -551,8 +588,9 @@ public:
                                        std::int32_t lanes, std::int32_t columns) {
         const std::int32_t W = d.max_width;
         std::size_t bytes =
-            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache) +
-            ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
+            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache);
+        if (!d.owns_head) { return bytes; } // sampling, acceptance and the drafter run on the head
+        bytes += ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
             bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
         }
@@ -577,186 +615,88 @@ public:
                "this fail at allocation instead.";
     }
 
-    ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
-        : parameters_(parameters), c_(parameters.model.config().text), options_(std::move(options)),
-          volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0) {
+    // A Program over the device segments of `map` (segment_map.h): segment s runs on devices[s] with
+    // parameters[s], the Parameters of its layers and role prepared on its device. One segment is the
+    // unsplit Program, the whole model on one device. A layer split builds every segment's state, KV
+    // planes, io, workspace, staging and expert cache on its own device (under its DeviceGuard), one
+    // CPU expert service with a port per segment, and joins consecutive segments' Forwards through a
+    // HandoffChannel (decode and verification rounds, in the options' handoff mode) and a BulkHandoff
+    // (eager calls). It refuses what it cannot run yet (split_capabilities.h): the prefix cache and
+    // the SSD expert tier; and the gate handoff on a split whose segments share a GPU, where a
+    // waiting gate can keep the sender from running (design §16.4, layer split).
+    ProgramImpl(std::span<const execution::Parameters* const> parameters, std::span<DeviceContext* const> devices,
+                const SegmentMap& map, ProgramOptions options)
+        : parameters_(first_parameters(parameters)), c_(parameters_.model.config().text),
+          options_(std::move(options)), volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0) {
         const Config& config = parameters_.model.config();
-        // The whole model on `device` (SegmentMap::single): one segment embeds, runs every layer and
-        // holds the head. A segment's Parameters (Parameters(model, range, role)) leave the other
-        // layers without weights or banks, which this constructor's per-layer tables would read.
-        if (parameters_.layer_range().begin != 0 || parameters_.layer_range().end != c_.num_hidden_layers) {
-            throw std::invalid_argument("Qwen4Exp: a one-segment Program needs the Parameters of every layer");
+        check_segments(parameters, devices, map);
+        const bool split = map.size() > 1;
+        if (split) {
+            if (options_.prefix_cache && !kSplitPrefixCache) {
+                throw std::invalid_argument("Qwen4Exp: a layer split does not support the prefix cache yet");
+            }
+            if (parameters_.model.expert_store().has_value() && !kSplitExpertTier) {
+                throw std::invalid_argument(
+                    "Qwen4Exp: a layer split needs every expert in Host RAM (it has no SSD expert tier yet)");
+            }
+            if (options_.handoff == SplitHandoff::Gate && map.same_device()) {
+                throw std::invalid_argument("Qwen4Exp: the gate handoff needs the split's segments on different GPUs "
+                                            "(a split on one GPU uses the event handoff)");
+            }
+            handoff_ = options_.handoff == SplitHandoff::Gate ? HandoffMode::Gate : HandoffMode::Event;
+            split_sync_ = split_sync_from_environment();
         }
-        const SegmentMap map = SegmentMap::single(c_, config.mtp, device.device);
-        ple_segment_         = map.ple().index;
-        DeviceSegment& seg   = *segments_.emplace_back(std::make_unique<DeviceSegment>());
-        seg.spec             = map[0];
-        seg.device           = &device;
-        seg.parameters       = &parameters_;
-        seg.plan = plan_segment(options_, config, dim(parameters_.model.resources().public_token_count), seg.spec);
-        const auto& draft_head = parameters_.draft_head;
-        mtp_                   = parameters_.mtp.has_value();
-        if (mtp_ != seg.plan.mtp ||
-            (mtp_ && (draft_head.rows ? dim(draft_head.rows->weight.n) : dim(c_.vocab_size)) != seg.plan.head_rows)) {
+        ple_segment_ = map.ple().index;
+        const auto public_tokens = dim(parameters_.model.resources().public_token_count);
+        for (std::size_t s = 0; s < map.size(); ++s) {
+            DeviceSegment& seg = *segments_.emplace_back(std::make_unique<DeviceSegment>());
+            seg.spec           = map[s];
+            seg.device         = devices[s];
+            seg.parameters     = parameters[s];
+            seg.plan           = plan_segment(options_, config, public_tokens, seg.spec);
+        }
+        // The drafter and its head belong to the head segment.
+        const execution::Parameters& head_parameters = *head().parameters;
+        const auto& draft_head                       = head_parameters.draft_head;
+        mtp_                                         = head_parameters.mtp.has_value();
+        if (mtp_ != head().plan.mtp ||
+            (mtp_ && (draft_head.rows ? dim(draft_head.rows->weight.n) : dim(c_.vocab_size)) != head().plan.head_rows)) {
             throw std::logic_error("Qwen4Exp: the bound drafter differs from its configuration");
         }
-        const std::int32_t lanes = seg.plan.lanes;
+        // The call shapes, the same in every segment's plan.
+        const DeviceLayout& plan = head().plan;
+        const std::int32_t lanes = plan.lanes;
         vocab_         = dim(c_.vocab_size);
-        token_domain_  = seg.plan.token_domain;
-        chunk_         = seg.plan.chunk;
-        mtp_k_         = seg.plan.mtp_k;
-        max_width_     = seg.plan.max_width;
-        columns_       = seg.plan.columns;
-        pages_per_row_ = seg.plan.pages_per_row;
-        kv_pages_      = seg.plan.kv_pages;
+        token_domain_  = plan.token_domain;
+        chunk_         = plan.chunk;
+        mtp_k_         = plan.mtp_k;
+        max_width_     = plan.max_width;
+        columns_       = plan.columns;
+        pages_per_row_ = plan.pages_per_row;
+        kv_pages_      = plan.kv_pages;
         width_         = dim(c_.residual_width());
         span_          = dim(c_.ple.conv_span());
         di_            = dim(c_.qsa.index_head_dim);
         r_             = dim(c_.qsa.compress_ratio);
-
-        // Every fixed allocation below is checked against the plan and against device free memory
-        // (an allocation the driver placed in system memory fails startup, design §19.3.7).
-        seg.vram = open_vram_budget_source(seg.device->device, options_.vram_past_budget);
-        SpillGuard guard(*seg.vram);
-        guard.begin();
-        std::uint64_t allocated = 0;
-
-        allocate(seg.state_backing, seg.plan.gdn_bytes, allocated);
-        seg.state_backing.fill(0);
-        seg.gdn = std::make_unique<LinearAttentionStatePool>(DeviceSpan{seg.state_backing.p, seg.state_backing.bytes},
-                                                             seg.plan.gdn);
-        allocate(seg.ple_backing, seg.plan.ple, allocated);
-        seg.ple_backing.fill(0);
-        allocate(seg.tails_backing, seg.plan.tails, allocated);
-        seg.tails_backing.fill(0);
-        seg.window_geometry = prefix::kv_window_geometry(c_, options_.kv_cache, mtp_,
-                                                         static_cast<std::uint32_t>(options_.max_concurrency));
-        if (seg.window_geometry.present()) {
-            allocate(seg.window_backing, seg.plan.window, allocated);
-            seg.window_backing.fill(0); // zero tags never match a row's (tags are odd)
-        }
-
-        seg.kv_geometry = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_);
-        if (seg.plan.kv_elastic) {
-            seg.kv_vmm  = std::make_unique<VmmRange>(seg.device->device, seg.plan.kv, kKvChunkBytes);
-            seg.kv_span = DeviceSpan{seg.kv_vmm->base(), seg.plan.kv};
-            if (!map_kv(seg, seg.plan.kv_base_pages)) {
-                throw std::runtime_error("Qwen4Exp: the KV pool's base pages do not fit");
-            }
-            allocated += seg.kv_vmm->mapped_bytes();
-        } else {
-            allocate(seg.kv_backing, seg.plan.kv, allocated);
-            seg.kv_backing.fill(0);
-            seg.kv_span = DeviceSpan{seg.kv_backing.p, seg.kv_backing.bytes};
-        }
-        seg.pool   = std::make_unique<DeviceKVPagePool>(seg.kv_span, seg.plan.pool);
-        seg.tables = std::make_unique<KVExecutionTablePool>(seg.kv_span, seg.plan.tables, *seg.pool);
-        if (seg.plan.kv_elastic) { seg.pool->set_backed_pages(seg.plan.kv_base_pages); }
-
-        io_layout_ = seg.plan.io;
-        allocate(seg.io_device, io_layout_.bytes, allocated);
-        io_host_ = PinnedHostBuffer(io_layout_.bytes);
-        allocate(seg.logits32, seg.plan.logits32, allocated);
-        allocate(seg.logits16, seg.plan.logits16, allocated);
-        allocate(seg.sampled, 4ULL * lanes, allocated);
-        allocate(seg.sample_pos, 4ULL * lanes, allocated);
-        allocate(seg.configs, sizeof(ops::SamplingConfig) * lanes, allocated);
-        allocate(seg.token_counts, seg.plan.token_counts, allocated);
-        seg.token_counts.fill(0);
-        host_sampled_ = PinnedHostBuffer(4ULL * lanes);
-        host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
-        allocate(seg.gate_stats, kGateStatsBytes * lanes, allocated);
-        seg.gate_stats.fill(0);
-        allocate(seg.constraint, constraint_bytes(lanes, max_width_), allocated);
-        allocate(seg.grammar_masks, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
-        grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
-        constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
-        publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
-
-        execution::ForwardState state;
-        state.gdn      = seg.gdn.get();
-        state.ple_conv = Tensor(seg.ple_backing.p, DType::BF16, {width_, span_, lanes});
-        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
-            state.qsa_tails.push_back(Tensor(static_cast<std::byte*>(seg.tails_backing.p) +
-                                                 static_cast<std::size_t>(l) * di_ * (r_ - 1) * lanes * 2,
-                                             DType::BF16, {di_, r_ - 1, lanes}));
-        }
-        const auto layout   = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
-        const auto kv_heads = dim(c_.attention.kv_heads);
-        execution::ForwardKV kv;
-        kv.block_tables  = seg.tables->matrix();
-        for (std::uint32_t l = 0; l < seg.plan.kv_layers; ++l) {
-            const prefix::PlaneRange planes = prefix::kv_layer_planes(seg.kv_geometry, l);
-            std::size_t plane               = planes.begin;
-            ops::QsaKVLayer layer;
-            layer.kv.storage      = options_.kv_cache;
-            layer.kv.head_dim     = dim(c_.attention.head_dim);
-            layer.kv.num_kv_heads = kv_heads;
-            layer.kv.k_pages      = seg.pool->plane(plane++);
-            if (layout.key.has_scale()) { layer.kv.k_scale_pages = seg.pool->plane(plane++); }
-            layer.kv.v_pages = seg.pool->plane(plane++);
-            if (layout.value.has_scale()) { layer.kv.v_scale_pages = seg.pool->plane(plane++); }
-            layer.pooled_pages = seg.pool->plane(plane++);
-            if (seg.window_geometry.present()) {
-                layer.kv.window = prefix::kv_window_view(seg.window_geometry, seg.window_backing.p, l);
-            }
-            if (plane != planes.end) { throw std::logic_error("Qwen4Exp: KV planes do not match the page geometry"); }
-            if (l < c_.attention_layers) {
-                kv.layers.push_back(layer);
-            } else {
-                kv.mtp = layer;
+        io_layout_     = plan.io;
+        if (!options_.logits_hash.empty()) {
+#ifdef _WIN32
+            logits_hash_.reset(_wfopen(options_.logits_hash.c_str(), L"w"));
+#else
+            logits_hash_.reset(std::fopen(options_.logits_hash.c_str(), "w"));
+#endif
+            if (!logits_hash_) {
+                throw std::runtime_error("Qwen4Exp: cannot create the logits hash file " + options_.logits_hash.string());
             }
         }
-        if (mtp_) {
-            state.mtp_tails = Tensor(static_cast<std::byte*>(seg.tails_backing.p) +
-                                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * lanes * 2,
-                                     DType::BF16, {di_, r_ - 1, lanes});
-            allocate_mtp(seg, lanes, allocated);
-            state.mtp_ones = Tensor(seg.mtp_ones.p, DType::FP32, {dim(c_.hc.streams), mtp_columns_});
-        }
-        execution::ForwardExperts experts;
-        experts.frames.assign(c_.num_hidden_layers, nullptr);
-        if (max_width_ > 1) { allocate_verification(seg, lanes, allocated); }
-        seg.work_capacity = seg.plan.work;
-        seg.wide_work     = seg.plan.wide_work;
-        seg.work          = std::make_unique<WorkspaceArena>(seg.work_capacity);
-        allocated += seg.work_capacity;
 
-        // The segment's own layers, in local order (layer - range.begin): the others have no bank.
-        const LayerRange owned = seg.parameters->layer_range();
-        std::vector<const std::uint8_t*> banks;
-        std::uint64_t record_stride = 0;
-        for (std::uint32_t l = owned.begin; l < owned.end; ++l) {
-            const auto& bank = *seg.parameters->layers[l].moe.bank;
-            banks.push_back(reinterpret_cast<const std::uint8_t*>(bank.planes.records));
-            record_stride = bank.planes.record_stride;
-        }
-        if (record_stride != seg.plan.record_stride) {
-            throw std::logic_error("Qwen4Exp: the expert banks' record stride differs from their format's");
-        }
-        // Staging slots for each layer call's misses (copied with a compact read window, design
-        // 8.6), allocated before the frames take the remaining memory.
-        allocate(seg.staging, seg.plan.staging, allocated);
-        experts.staging_base  = static_cast<std::uint8_t*>(seg.staging.p);
-        experts.staging_slots = kStagingSlots;
-        // The expert cache's tables and route log; its frames come last (below).
-        seg.residency =
-            std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, seg.device->device);
-        allocated += seg.plan.bytes.residency;
-        if (allocated != seg.plan.bytes.fixed_bytes()) {
-            throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
-        }
-        if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
-            throw std::runtime_error(spill_message(spilled));
-        }
-        CUDA_CHECK(cudaStreamCreateWithFlags(&seg.overlap.stream, cudaStreamNonBlocking));
-        for (auto& event : seg.overlap.events) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-        }
-        experts.overlap_stream = seg.overlap.stream;
-        experts.overlap_events = seg.overlap.events;
+        // Every segment's fixed allocations, checked against its plan and its device's free memory.
+        std::vector<SegmentBuild> builds(segments_.size());
+        for (std::size_t s = 0; s < segments_.size(); ++s) { build_segment(*segments_[s], builds[s]); }
+        const std::uint64_t record_stride = plan.record_stride;
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
+        // One segment only (refused above for a split).
         if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
             if (store->record_bytes() != record_stride) {
                 throw std::logic_error("Qwen4Exp: the expert store's records differ from the banks' stride");
@@ -784,12 +724,15 @@ public:
             // tier round per step): at most layers + n - 1 layer calls.
             tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
             tier_          = std::make_unique<HostExpertTier>(*store, std::move(tier));
-            seg.residency->attach_tier(tier_.get());
+            head().residency->attach_tier(tier_.get());
         }
         // After the tier (whose pinned slots are the probe's source when the banks stay in the
-        // artifact), before the CPU service and the split take the measured rate and the prefix
-        // cache its costs.
-        measure_link(seg);
+        // artifact), before the CPU service and the split take the measured rates and the prefix
+        // cache its costs. Each segment measures its own device's link.
+        for (const auto& segment : segments_) {
+            const DeviceGuard on(segment->device->device);
+            measure_link(*segment);
+        }
         apply_link_costs();
         if (decode_promotions_ != DecodePromotions::On) {
             diagnostic(std::string("expert cache: decode promotions ") +
@@ -798,37 +741,20 @@ public:
         }
         expert_error_ = PinnedHostBuffer(64);
         std::memset(expert_error_.data(), 0, 64);
-        experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        for (SegmentBuild& build : builds) { build.experts.error = static_cast<std::uint32_t*>(expert_error_.data()); }
         if (options_.prefill_stream && options_.expert_cache) {
-            execution::ExpertStream::RecordOf record_of;
-            if (tier_) {
-                record_of = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    return tier->record(tier->key(layer, expert));
-                };
-            } else {
-                std::vector<const std::uint8_t*> banks; // local order, as the Forward's layers
-                for (std::uint32_t l = owned.begin; l < owned.end; ++l) {
-                    banks.push_back(
-                        reinterpret_cast<const std::uint8_t*>(seg.parameters->layers[l].moe.bank->planes.records));
-                }
-                record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
-                    return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
-                };
+            for (std::size_t s = 0; s < segments_.size(); ++s) {
+                DeviceSegment& seg = *segments_[s];
+                const DeviceGuard on(seg.device->device);
+                seg.expert_stream      = make_expert_stream(seg);
+                builds[s].experts.stream = seg.expert_stream.get();
             }
-            execution::ExpertStream::Hold hold;
-            if (tier_) {
-                hold = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
-                    tier->stream_pin(tier->key(layer, expert));
-                };
-            }
-            seg.expert_stream = std::make_unique<execution::ExpertStream>(
-                c_.num_hidden_layers, c_.moe.experts, record_stride, std::move(record_of), !tier_, std::move(hold));
-            experts.stream = seg.expert_stream.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
         // kMaxCpuColumns columns (short prompts, chunk remainders, forced tokens), whose experts are
         // all thin and so give the same bits on either device (design 16.2); wider prefill chunks
-        // stay on the GPU.
+        // stay on the GPU. A split serves every segment through one service, one port per segment
+        // (on its device, with its link's PCIe divisor).
         const std::uint32_t cpu_workers = options_.cpu_expert_workers;
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
@@ -837,6 +763,11 @@ public:
             // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
             const bool assist        = assist_jobs > 0 && decode_columns < kAssistMaxColumns;
+            const int max_jobs       = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs));
+            const int max_columns    = assist ? kAssistMaxColumns : decode_columns;
+            const int wide_from      = assist ? decode_columns + 1 : 0;
+            const int wide_jobs =
+                assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0;
             // Every layer's bank (the service's layers are global), from the model: a segment's
             // Parameters hold only its own.
             std::vector<ops::offloaded_moe::CpuMissService::Layer> service_layers;
@@ -845,75 +776,158 @@ public:
                                           .record_stride = bank.planes.record_stride,
                                           .scales        = bank.scales.data()});
             }
-            cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
-                std::move(service_layers),
-                ops::offloaded_moe::CpuMissService::Options{
-                    .workers     = static_cast<int>(cpu_workers),
-                    .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
-                    .max_columns = assist ? kAssistMaxColumns : decode_columns,
-                    .pcie_divisor = pcie_divisor(seg),
-                    .wide_from   = assist ? decode_columns + 1 : 0,
-                    .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
-                    .cpus        = {},
-                    .records     = tier_.get()}); // tier mode: SSD-only jobs read through the tier
-            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
-                experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
+            if (!split) {
+                cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
+                    std::move(service_layers),
+                    ops::offloaded_moe::CpuMissService::Options{
+                        .workers      = static_cast<int>(cpu_workers),
+                        .max_jobs     = max_jobs,
+                        .max_columns  = max_columns,
+                        .pcie_divisor = pcie_divisor(head()),
+                        .wide_from    = wide_from,
+                        .wide_jobs    = wide_jobs,
+                        .cpus         = {},
+                        .records      = tier_.get()}); // tier mode: SSD-only jobs read through the tier
+            } else {
+                // Each port with its link's PCIe divisor and CPU jobs: a slow link's segment hands the
+                // CPU more of its decode misses (derive_link_policy).
+                std::vector<ops::offloaded_moe::CpuMissService::PortOptions> ports;
+                for (std::size_t s = 0; s < segments_.size(); ++s) {
+                    DeviceSegment& seg = *segments_[s];
+                    seg.cpu_port       = static_cast<int>(s);
+                    ports.push_back({.device       = seg.device->device,
+                                     .max_jobs     = static_cast<int>(std::min<std::uint32_t>(
+                                         std::max<std::uint32_t>(seg.policy.cpu_jobs, cpu_jobs),
+                                         static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))),
+                                     .max_columns  = max_columns,
+                                     .pcie_divisor = pcie_divisor(seg),
+                                     .wide_from    = wide_from,
+                                     .wide_jobs    = wide_jobs});
+                }
+                cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
+                    std::move(service_layers),
+                    ops::offloaded_moe::CpuMissService::Options{
+                        .workers = static_cast<int>(cpu_workers), .cpus = {}, .records = tier_.get()},
+                    std::move(ports));
             }
-            if (assist && seg.expert_stream && options_.prefill_cpu_split) {
-                seg.split_policy = std::make_unique<SplitPolicy>(*this, seg);
-                experts.split    = seg.split_policy.get();
+            for (std::size_t s = 0; s < segments_.size(); ++s) {
+                DeviceSegment& seg = *segments_[s];
+                for (std::uint32_t l = seg.spec.layers.begin; l < seg.spec.layers.end; ++l) {
+                    builds[s].experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l), seg.cpu_port));
+                }
+                if (assist && seg.expert_stream && options_.prefill_cpu_split) {
+                    seg.split_policy        = std::make_unique<SplitPolicy>(*this, seg);
+                    builds[s].experts.split = seg.split_policy.get();
+                }
             }
         }
         create_prefix_cache();
 
+        // A split's segment whose cache could never lend its wide arena (one of a few layers: its
+        // frame limit is every routed expert of its layers but one) holds the arena as its own
+        // allocation, made before the frames take the remaining memory.
+        if (split && options_.expert_cache) {
+            for (const auto& segment : segments_) {
+                DeviceSegment& seg         = *segment;
+                const std::uint32_t limit  = seg.residency->frame_limit();
+                const auto wide_frames     = static_cast<std::uint32_t>((seg.wide_work + record_stride - 1) / record_stride);
+                if (seg.wide_work == 0 || wide_frames < limit - limit / 4) { continue; }
+                const DeviceGuard on(seg.device->device);
+                SpillGuard guard(*seg.vram);
+                guard.begin();
+                seg.wide_fallback = DeviceBuffer(seg.wide_work);
+                if (const std::uint64_t spilled = guard.end(seg.wide_work); spilled != 0) {
+                    throw std::runtime_error(segment_name(seg) + spill_message(spilled));
+                }
+                seg.wide_dedicated = true;
+            }
+        }
         // The VRAM expert cache takes what the fixed allocations, the reserve for graph
         // executables and the display headroom leave (design §19.3.7). Its frames are the one
         // elastic allocation: a chunk the driver places in system memory (another program took
-        // memory since the reading) is given back and the cache stops growing there.
-        if (options_.expert_cache) {
-            VramDemand demand;
-            demand.headroom    = options_.vram_headroom;
-            demand.elastic     = seg.residency->elastic() && options_.vram_monitor;
-            demand.graphs      = seg.plan.bytes.graph_bound;
-            demand.frame_bytes = record_stride;
-            demand.max_frames  = seg.residency->frame_limit();
-            seg.sizing         = size_expert_frames(seg.vram->query(), demand);
-            const auto grown   = seg.residency->resize(seg.sizing.frames, seg.device->stream, *seg.vram);
-            if (grown.spilled != 0) {
-                diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
-                       "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
-                       std::to_string(seg.sizing.frames) + " frames", DiagnosticLevel::Warning);
-            } else if (grown.refused) {
-                diagnostic("the GPU refused expert-cache memory; the cache starts with " + std::to_string(grown.frames) +
-                               " of " + std::to_string(seg.sizing.frames) + " frames",
-                           DiagnosticLevel::Warning);
+        // memory since the reading) is given back and the cache stops growing there. Segments that
+        // share a device (the same-device test mode) divide one sizing of it in proportion to their
+        // layers (SegmentSpec::frame_share), each still taking what lends its wide arena, without
+        // the runtime VRAM monitor.
+        std::vector<std::pair<int, VramSizing>> shared_sizing;
+        std::vector<std::uint32_t> shared_frames(segments_.size(), 0);
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            DeviceSegment& seg = *segments_[s];
+            const DeviceGuard on(seg.device->device);
+            if (options_.expert_cache) {
+                VramDemand demand;
+                demand.headroom    = options_.vram_headroom;
+                demand.elastic     = seg.residency->elastic() && options_.vram_monitor && !seg.spec.shares_device;
+                demand.graphs      = seg.plan.bytes.graph_bound;
+                demand.frame_bytes = record_stride;
+                demand.max_frames  = seg.residency->frame_limit();
+                std::uint32_t wanted = 0;
+                if (!seg.spec.shares_device) {
+                    seg.sizing = size_expert_frames(seg.vram->query(), demand);
+                    wanted     = seg.sizing.frames;
+                } else {
+                    auto it = std::find_if(shared_sizing.begin(), shared_sizing.end(),
+                                           [&](const auto& entry) { return entry.first == seg.spec.device; });
+                    if (it == shared_sizing.end()) {
+                        // The device's one sizing, before any of its segments takes frames.
+                        VramDemand all = demand;
+                        all.graphs     = 0;
+                        all.max_frames = 0;
+                        for (const auto& other : segments_) {
+                            if (other->spec.device != seg.spec.device) { continue; }
+                            all.graphs += other->plan.bytes.graph_bound;
+                            all.max_frames += other->residency->frame_limit();
+                        }
+                        shared_sizing.emplace_back(seg.spec.device, size_expert_frames(seg.vram->query(), all));
+                        it = std::prev(shared_sizing.end());
+                        share_device_frames(seg.spec.device, it->second.frames, shared_frames);
+                    }
+                    seg.sizing = it->second;
+                    wanted     = shared_frames[seg.spec.index];
+                }
+                const auto grown = seg.residency->resize(wanted, seg.device->stream, *seg.vram);
+                if (grown.spilled != 0) {
+                    diagnostic(segment_name(seg) + std::to_string(grown.spilled >> 20) +
+                                   " MiB of the expert frames were placed in system memory and given back; the expert "
+                                   "cache starts with " + std::to_string(grown.frames) + " of " + std::to_string(wanted) +
+                                   " frames",
+                               DiagnosticLevel::Warning);
+                } else if (grown.refused) {
+                    diagnostic(segment_name(seg) + "the GPU refused expert-cache memory; the cache starts with " +
+                                   std::to_string(grown.frames) + " of " + std::to_string(wanted) + " frames",
+                               DiagnosticLevel::Warning);
+                }
+                seg.sizing.frames = grown.frames;
+                if (!seg.spec.shares_device) { start_vram_monitor(seg, demand); }
             }
-            seg.sizing.frames = grown.frames;
-            start_vram_monitor(seg, demand);
-        }
-        segment_sizing_.push_back(seg.sizing);
-        experts.frame_base   = seg.residency->frame_base();
-        experts.frame_stride = seg.residency->frame_stride();
-        experts.route_log    = seg.residency->route_log();
-        experts.route_stride = seg.residency->route_stride();
-        for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = seg.residency->table(l); }
-        experts.landing       = seg.residency->landing_table();
-        experts.landed        = seg.residency->landed_log();
-        experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
-        if (tier_) {
-            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
-                experts.host_tables.push_back(seg.residency->record_table(l));
-                experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(l)));
+            segment_sizing_.push_back(seg.sizing);
+            execution::ForwardExperts& experts = builds[s].experts;
+            experts.frame_base                 = seg.residency->frame_base();
+            experts.frame_stride               = seg.residency->frame_stride();
+            experts.route_log                  = seg.residency->route_log();
+            experts.route_stride               = seg.residency->route_stride();
+            for (std::uint32_t l = 0; l < seg.spec.layers.size(); ++l) { experts.frames[l] = seg.residency->table(l); }
+            experts.landing       = seg.residency->landing_table();
+            experts.landed        = seg.residency->landed_log();
+            experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
+            if (tier_) {
+                for (std::uint32_t l = 0; l < seg.spec.layers.size(); ++l) {
+                    experts.host_tables.push_back(seg.residency->record_table(l));
+                    experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(seg.spec.layers.begin + l)));
+                }
             }
         }
         warm_start_experts();
         if (!options_.route_trace.empty()) {
+            // A split's frames are its segments' (each caches its own layers).
+            std::uint32_t frames = 0;
+            for (const auto& segment : segments_) { frames += segment->residency->frames(); }
             trace_ = std::make_unique<RouteTrace>(
                 options_.route_trace,
                 RouteTraceSetup{.layers             = c_.num_hidden_layers,
                                 .experts            = c_.moe.experts,
                                 .top_k              = c_.moe.top_k,
-                                .frames             = seg.residency->frames(),
+                                .frames             = frames,
                                 .max_columns        = static_cast<std::uint32_t>(columns_),
                                 .lanes              = options_.max_concurrency,
                                 .max_width          = static_cast<std::uint32_t>(max_width_),
@@ -921,24 +935,361 @@ public:
                                 .ngram_draft_tokens = options_.ngram_draft_tokens,
                                 .prefill_chunk      = static_cast<std::uint32_t>(chunk_)});
         }
-        seg.forward = std::make_unique<execution::Forward>(*seg.parameters, *seg.device, *seg.work, std::move(state),
-                                                           std::move(kv), std::move(experts), dim(options_.max_context));
-        seg.device->synchronize();
+        // A split's boundaries: per pair of consecutive segments, the channel of a decode or
+        // verification round's residual (every lane at the widest round) and the bulk crossing of
+        // an eager call's.
+        if (split) {
+            const std::size_t round_bytes = 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(lanes) *
+                                            static_cast<std::size_t>(max_width_);
+            for (std::size_t s = 0; s + 1 < segments_.size(); ++s) {
+                DeviceSegment& sender   = *segments_[s];
+                DeviceSegment& receiver = *segments_[s + 1];
+                channels_.push_back(
+                    std::make_unique<HandoffChannel>(sender.device->device, receiver.device->device, round_bytes));
+                bulk_.push_back(std::make_unique<BulkHandoff>(sender.device->device, receiver.device->device));
+                sender.out      = channels_.back().get();
+                receiver.in     = channels_.back().get();
+                sender.bulk_out = bulk_.back().get();
+            }
+            for (const auto& segment : segments_) {
+                const DeviceGuard on(segment->device->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&segment->compute_done.event, cudaEventDisableTiming));
+            }
+        }
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            DeviceSegment& seg = *segments_[s];
+            const DeviceGuard on(seg.device->device);
+            const execution::ForwardSegment segment{
+                .layers         = seg.spec.layers,
+                .gdn_base       = seg.spec.gdn_base,
+                .attention_base = seg.spec.attention_base,
+                .embed          = seg.spec.embed,
+                .finish         = seg.spec.head,
+                .in             = seg.in,
+                .out            = seg.out,
+                // A gated round's receiving wait (decode and verification rounds) reports a timeout
+                // through the expert error word, with the receiving segment's first layer, and adds
+                // its waits to the segment's statistics.
+                .in_bound      = PinnedGateBound{.timeout_ns  = 1'000'000ULL * options_.handoff_timeout_ms,
+                                                 .error_word  = static_cast<std::uint32_t*>(expert_error_.data()),
+                                                 .error_value = (seg.spec.layers.begin << 16U) | kErrorHandoffTimeout},
+                .in_wait_stats = static_cast<std::uint64_t*>(seg.handoff_stats.p)};
+            seg.forward = std::make_unique<execution::Forward>(*seg.parameters, *seg.device, *seg.work,
+                                                               std::move(builds[s].state), std::move(builds[s].kv),
+                                                               std::move(builds[s].experts), dim(options_.max_context),
+                                                               segment);
+        }
+        synchronize();
         report_lane_cost(lanes, record_stride);
     }
 
-    // The unsplit Program's device plan and frame sizing: its one segment's.
-    const DeviceLayout& device_layout() const noexcept { return whole().plan; }
-    const VramSizing& vram_sizing() const noexcept { return whole().sizing; }
+    // A split's teardown: each segment is destroyed with its device current, after every lane has
+    // returned its pages and rows to the segments' pools and tables (an unsplit Program's members
+    // are destroyed in declaration order with its one device current).
+    ~ProgramImpl() {
+        if (segments_.size() < 2) { return; }
+        try {
+            synchronize();
+        } catch (...) {}
+        for (Lane& lane : lanes_) {
+            lane.pages.clear();
+            lane.reservation.reset();
+            lane.row = KVExecutionRowLease{};
+            lane.mirror_rows.clear();
+        }
+        while (!segments_.empty()) {
+            try {
+                const DeviceGuard on(segments_.back()->device->device);
+                segments_.pop_back();
+            } catch (...) {
+                segments_.pop_back();
+            }
+        }
+    }
+
+    ProgramImpl(const ProgramImpl&)            = delete;
+    ProgramImpl& operator=(const ProgramImpl&) = delete;
+
+private:
+    // A segment's Forward inputs while the constructor builds them.
+    struct SegmentBuild {
+        execution::ForwardState state;
+        execution::ForwardKV kv;
+        execution::ForwardExperts experts;
+    };
+
+    static const execution::Parameters& first_parameters(std::span<const execution::Parameters* const> parameters) {
+        if (parameters.empty() || parameters.front() == nullptr) {
+            throw std::invalid_argument("Qwen4Exp: a Program needs the Parameters of its segments");
+        }
+        return *parameters.front();
+    }
+
+    // One Parameters and one device context per segment, in order: each over the model's layers and
+    // role of its segment (Parameters ties its role to its range) on the segment's device.
+    void check_segments(std::span<const execution::Parameters* const> parameters,
+                        std::span<DeviceContext* const> devices, const SegmentMap& map) const {
+        if (parameters.size() != map.size() || devices.size() != map.size()) {
+            throw std::invalid_argument("Qwen4Exp: a Program needs one Parameters and one device per segment");
+        }
+        for (std::size_t s = 0; s < map.size(); ++s) {
+            const SegmentSpec& spec              = map[s];
+            const execution::Parameters* segment = parameters[s];
+            if (segment == nullptr || devices[s] == nullptr || &segment->model != &parameters_.model ||
+                segment->layer_range().begin != spec.layers.begin || segment->layer_range().end != spec.layers.end ||
+                segment->role().embed != spec.embed || segment->role().head != spec.head ||
+                devices[s]->device != spec.device) {
+                throw std::invalid_argument("Qwen4Exp: the Parameters or device of segment " + std::to_string(s) +
+                                            " do not match its layers, role or device");
+            }
+        }
+    }
+
+    // The frames of each segment on `device` (the same-device test mode) out of the device's `total`:
+    // in proportion to their layers (frame_share), within each one's limit, but at least what lets a
+    // segment lend its wide arena (a quarter of the frames is never lent) when its limit allows,
+    // taken from the segments with more than they need.
+    void share_device_frames(int device, std::uint32_t total, std::vector<std::uint32_t>& frames) const {
+        std::vector<std::uint32_t> need(segments_.size(), 0);
+        for (const auto& segment : segments_) {
+            const DeviceSegment& seg = *segment;
+            if (seg.spec.device != device) { continue; }
+            const std::uint32_t limit = seg.residency->frame_limit();
+            const std::uint64_t stride = seg.plan.record_stride;
+            const auto wide_frames     = static_cast<std::uint32_t>((seg.wide_work + stride - 1) / stride);
+            frames[seg.spec.index] =
+                std::min(limit, static_cast<std::uint32_t>(static_cast<double>(total) * seg.spec.frame_share));
+            if (seg.wide_work > 0 && !seg.wide_dedicated) {
+                need[seg.spec.index] = std::min(limit, wide_frames + wide_frames / 3 + 2);
+            }
+        }
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            if (frames[s] >= need[s]) { continue; }
+            std::uint32_t missing = need[s] - frames[s];
+            frames[s]             = need[s];
+            for (std::size_t o = 0; o < segments_.size() && missing > 0; ++o) {
+                if (o == s || segments_[o]->spec.device != device || frames[o] <= need[o]) { continue; }
+                const std::uint32_t taken = std::min(missing, frames[o] - need[o]);
+                frames[o] -= taken;
+                missing -= taken;
+            }
+        }
+    }
+
+    // A diagnostic's prefix naming a split's segment (empty without a split).
+    std::string segment_name(const DeviceSegment& seg) const {
+        if (segments_.size() < 2) { return {}; }
+        return "segment " + std::to_string(seg.spec.index) + " (layers " + std::to_string(seg.spec.layers.begin) + "-" +
+               std::to_string(seg.spec.layers.end - 1) + ", GPU " + std::to_string(seg.spec.device) + "): ";
+    }
+
+    // A segment's fixed device allocations, on its device: exactly its plan, which the driver must
+    // place in device memory (design §19.3.7); with the Forward's state and KV views over them, its
+    // expert cache over its own layers' banks (local order), its staging and its overlap stream. The
+    // Program's host buffers come with the segment whose role reads them (the io with the first).
+    void build_segment(DeviceSegment& seg, SegmentBuild& build) {
+        const DeviceGuard on(seg.device->device);
+        const SegmentSpec& spec  = seg.spec;
+        const std::int32_t lanes = seg.plan.lanes;
+        seg.vram                 = open_vram_budget_source(seg.device->device, options_.vram_past_budget);
+        SpillGuard guard(*seg.vram);
+        guard.begin();
+        std::uint64_t allocated = 0;
+
+        allocate(seg.state_backing, seg.plan.gdn_bytes, allocated);
+        seg.state_backing.fill(0);
+        if (spec.gdn_count > 0) {
+            seg.gdn = std::make_unique<LinearAttentionStatePool>(
+                DeviceSpan{seg.state_backing.p, seg.state_backing.bytes}, seg.plan.gdn);
+        }
+        allocate(seg.ple_backing, seg.plan.ple, allocated);
+        seg.ple_backing.fill(0);
+        allocate(seg.tails_backing, seg.plan.tails, allocated);
+        seg.tails_backing.fill(0);
+        seg.window_geometry = prefix::kv_window_geometry(c_, options_.kv_cache, spec.attention_count, spec.mtp,
+                                                         static_cast<std::uint32_t>(options_.max_concurrency));
+        if (seg.window_geometry.present()) {
+            allocate(seg.window_backing, seg.plan.window, allocated);
+            seg.window_backing.fill(0); // zero tags never match a row's (tags are odd)
+        }
+
+        // The segment's KV planes over the page indices the head's pool hands out (none without
+        // attention layers).
+        if (seg.plan.kv_layers > 0) {
+            seg.kv_geometry = prefix::kv_page_geometry(c_, options_.kv_cache, spec.attention_count, spec.mtp);
+            if (seg.plan.kv_elastic) {
+                seg.kv_vmm  = std::make_unique<VmmRange>(seg.device->device, seg.plan.kv, kKvChunkBytes);
+                seg.kv_span = DeviceSpan{seg.kv_vmm->base(), seg.plan.kv};
+                if (!map_kv(seg, seg.plan.kv_base_pages)) {
+                    throw std::runtime_error("Qwen4Exp: the KV pool's base pages do not fit");
+                }
+                allocated += seg.kv_vmm->mapped_bytes();
+            } else {
+                allocate(seg.kv_backing, seg.plan.kv, allocated);
+                seg.kv_backing.fill(0);
+                seg.kv_span = DeviceSpan{seg.kv_backing.p, seg.kv_backing.bytes};
+            }
+            seg.pool   = std::make_unique<DeviceKVPagePool>(seg.kv_span, seg.plan.pool);
+            seg.tables = std::make_unique<KVExecutionTablePool>(seg.kv_span, seg.plan.tables, *seg.pool);
+            if (seg.plan.kv_elastic) { seg.pool->set_backed_pages(seg.plan.kv_base_pages); }
+        }
+
+        allocate(seg.io_device, io_layout_.bytes, allocated);
+        if (spec.index == 0) { io_host_ = PinnedHostBuffer(io_layout_.bytes); }
+        if (spec.head) {
+            allocate(seg.logits32, seg.plan.logits32, allocated);
+            allocate(seg.logits16, seg.plan.logits16, allocated);
+            allocate(seg.sampled, 4ULL * lanes, allocated);
+            allocate(seg.sample_pos, 4ULL * lanes, allocated);
+            allocate(seg.configs, sizeof(ops::SamplingConfig) * lanes, allocated);
+            allocate(seg.token_counts, seg.plan.token_counts, allocated);
+            seg.token_counts.fill(0);
+            host_sampled_    = PinnedHostBuffer(4ULL * lanes);
+            host_sample_pos_ = PinnedHostBuffer(4ULL * lanes);
+            host_configs_    = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
+        }
+        if (spec.ple) {
+            allocate(seg.gate_stats, kGateStatsBytes * lanes, allocated);
+            seg.gate_stats.fill(0);
+        }
+        if (spec.head) {
+            allocate(seg.constraint, constraint_bytes(lanes, max_width_), allocated);
+            allocate(seg.grammar_masks, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
+            grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
+            constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
+        }
+        if (spec.ple) { publish_pinned_word(gate_ready(), 0); } // pinned memory starts undefined; 0 is never a round's word
+        if (!spec.embed) { // a split's receiving segment: its gated handoff's wait statistics
+            allocate(seg.handoff_stats, kHandoffStatsBytes, allocated);
+            seg.handoff_stats.fill(0);
+        }
+
+        execution::ForwardState& state = build.state;
+        state.gdn                      = seg.gdn.get();
+        if (spec.ple) { state.ple_conv = Tensor(seg.ple_backing.p, DType::BF16, {width_, span_, lanes}); }
+        for (std::uint32_t l = 0; l < spec.attention_count; ++l) {
+            state.qsa_tails.push_back(Tensor(static_cast<std::byte*>(seg.tails_backing.p) +
+                                                 static_cast<std::size_t>(l) * di_ * (r_ - 1) * lanes * 2,
+                                             DType::BF16, {di_, r_ - 1, lanes}));
+        }
+        const auto layout   = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
+        const auto kv_heads = dim(c_.attention.kv_heads);
+        execution::ForwardKV& kv = build.kv;
+        if (seg.tables) { kv.block_tables = seg.tables->matrix(); }
+        for (std::uint32_t l = 0; l < seg.plan.kv_layers; ++l) {
+            const prefix::PlaneRange planes = prefix::kv_layer_planes(seg.kv_geometry, l);
+            std::size_t plane               = planes.begin;
+            ops::QsaKVLayer layer;
+            layer.kv.storage      = options_.kv_cache;
+            layer.kv.head_dim     = dim(c_.attention.head_dim);
+            layer.kv.num_kv_heads = kv_heads;
+            layer.kv.k_pages      = seg.pool->plane(plane++);
+            if (layout.key.has_scale()) { layer.kv.k_scale_pages = seg.pool->plane(plane++); }
+            layer.kv.v_pages = seg.pool->plane(plane++);
+            if (layout.value.has_scale()) { layer.kv.v_scale_pages = seg.pool->plane(plane++); }
+            layer.pooled_pages = seg.pool->plane(plane++);
+            if (seg.window_geometry.present()) {
+                layer.kv.window = prefix::kv_window_view(seg.window_geometry, seg.window_backing.p, l);
+            }
+            if (plane != planes.end) { throw std::logic_error("Qwen4Exp: KV planes do not match the page geometry"); }
+            if (l < spec.attention_count) {
+                kv.layers.push_back(layer);
+            } else {
+                kv.mtp = layer;
+            }
+        }
+        if (spec.mtp) {
+            state.mtp_tails = Tensor(static_cast<std::byte*>(seg.tails_backing.p) +
+                                         static_cast<std::size_t>(spec.attention_count) * di_ * (r_ - 1) * lanes * 2,
+                                     DType::BF16, {di_, r_ - 1, lanes});
+            allocate_mtp(seg, lanes, allocated);
+            state.mtp_ones = Tensor(seg.mtp_ones.p, DType::FP32, {dim(c_.hc.streams), mtp_columns_});
+        }
+        execution::ForwardExperts& experts = build.experts;
+        experts.frames.assign(spec.layers.size(), nullptr);
+        if (max_width_ > 1) { allocate_verification(seg, lanes, allocated); }
+        seg.work_capacity = seg.plan.work;
+        seg.wide_work     = seg.plan.wide_work;
+        seg.work          = std::make_unique<WorkspaceArena>(seg.work_capacity);
+        allocated += seg.work_capacity;
+
+        // The segment's own layers, in local order (layer - range.begin): the others have no bank.
+        std::vector<const std::uint8_t*> banks;
+        std::uint64_t record_stride = 0;
+        for (std::uint32_t l = spec.layers.begin; l < spec.layers.end; ++l) {
+            const auto& bank = *seg.parameters->layers[l].moe.bank;
+            banks.push_back(reinterpret_cast<const std::uint8_t*>(bank.planes.records));
+            record_stride = bank.planes.record_stride;
+        }
+        if (record_stride != seg.plan.record_stride) {
+            throw std::logic_error("Qwen4Exp: the expert banks' record stride differs from their format's");
+        }
+        // Staging slots for each layer call's misses (copied with a compact read window, design
+        // 8.6), allocated before the frames take the remaining memory.
+        allocate(seg.staging, seg.plan.staging, allocated);
+        experts.staging_base  = static_cast<std::uint8_t*>(seg.staging.p);
+        experts.staging_slots = kStagingSlots;
+        // The expert cache's tables and route log; its frames come last (the constructor sizes them
+        // once every segment's fixed allocations are made).
+        seg.residency =
+            std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, seg.device->device);
+        allocated += seg.plan.bytes.residency;
+        if (allocated != seg.plan.bytes.fixed_bytes()) {
+            throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
+        }
+        if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
+            throw std::runtime_error(segment_name(seg) + spill_message(spilled));
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&seg.overlap.stream, cudaStreamNonBlocking));
+        for (auto& event : seg.overlap.events) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        }
+        experts.overlap_stream = seg.overlap.stream;
+        experts.overlap_events = seg.overlap.events;
+    }
+
+    // A segment's prefill expert stream over its own layers (local order, as its Forward's): records
+    // from its layers' banks, or from the SSD tier by global key.
+    std::unique_ptr<execution::ExpertStream> make_expert_stream(DeviceSegment& seg) {
+        const LayerRange owned            = seg.spec.layers;
+        const std::uint64_t record_stride = seg.plan.record_stride;
+        execution::ExpertStream::RecordOf record_of;
+        if (tier_) {
+            record_of = [tier = tier_.get(), first = owned.begin](std::uint32_t layer, std::uint32_t expert) {
+                return tier->record(tier->key(first + layer, expert));
+            };
+        } else {
+            std::vector<const std::uint8_t*> banks; // local order, as the Forward's layers
+            for (std::uint32_t l = owned.begin; l < owned.end; ++l) {
+                banks.push_back(
+                    reinterpret_cast<const std::uint8_t*>(seg.parameters->layers[l].moe.bank->planes.records));
+            }
+            record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
+                return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
+            };
+        }
+        execution::ExpertStream::Hold hold;
+        if (tier_) {
+            hold = [tier = tier_.get(), first = owned.begin](std::uint32_t layer, std::uint32_t expert) {
+                tier->stream_pin(tier->key(first + layer, expert));
+            };
+        }
+        return std::make_unique<execution::ExpertStream>(owned.size(), c_.moe.experts, record_stride,
+                                                         std::move(record_of), !tier_, std::move(hold));
+    }
+
+public:
+    // The first segment's device plan and frame sizing (the whole model's without a split).
+    const DeviceLayout& device_layout() const noexcept { return first().plan; }
+    const VramSizing& vram_sizing() const noexcept { return first().sizing; }
     std::span<const VramSizing> segment_vram_sizing() const noexcept { return segment_sizing_; }
 
     // The segments by role (SegmentMap): the first embeds; the PLE segment computes the PLE and its
     // n-gram gate; the head (the last) runs the final mixer, the head, sampling, acceptance and the
     // MTP drafter and allocates the KV pages. whole() is the one segment of an unsplit Program, which
-    // runs every layer: code that drives the layers' state, KV, expert cache and Forward reaches them
-    // through it, and split execution turns each such use into a loop over segments_. On a split
-    // Program whole() throws std::logic_error, so a use not yet turned fails instead of running on
-    // segment 0 alone.
+    // runs every layer: the paths a split does not run yet (the layer walk, the prefix cache, the
+    // SSD tier) reach the layers' state, KV, expert cache and Forward through it; on a split Program
+    // it throws std::logic_error, so such a path fails instead of running on segment 0 alone.
     DeviceSegment& first() noexcept { return *segments_.front(); }
     const DeviceSegment& first() const noexcept { return *segments_.front(); }
     DeviceSegment& head() noexcept { return *segments_.back(); }
@@ -957,14 +1308,68 @@ public:
     // Waits for every segment's compute stream: the head first (its sampling ends a round), then the
     // others.
     void synchronize() const {
-        head().device->synchronize();
+        {
+            const DeviceGuard on(head().device->device);
+            head().device->synchronize();
+        }
         for (const auto& segment : segments_) {
-            if (segment.get() != &head()) { segment->device->synchronize(); }
+            if (segment.get() == &head()) { continue; }
+            const DeviceGuard on(segment->device->device);
+            segment->device->synchronize();
         }
     }
     // Submits every segment's queued work without waiting for it.
     void flush() const {
-        for (const auto& segment : segments_) { segment->device->flush(); }
+        for (const auto& segment : segments_) {
+            const DeviceGuard on(segment->device->device);
+            segment->device->flush();
+        }
+    }
+    // Whether `a` and `b` run on one device (the same-device test mode of a layer split).
+    static bool share_device(const DeviceSegment& a, const DeviceSegment& b) noexcept {
+        return &a != &b && a.spec.device == b.spec.device;
+    }
+
+    // Work enqueued on one segment's stream, with its device current. On a GPU that runs two
+    // segments (the same-device test mode) their kernels never overlap, as the MoE's bits depend on
+    // it (design §19.3.8, "F1 nondeterminism"): the work first waits for what the device's other
+    // segments enqueued last and, once enqueued, records the segment's compute_done for them. On
+    // its own GPU a segment's work only selects the device.
+    class SegmentWork {
+    public:
+        SegmentWork(const ProgramImpl& program, DeviceSegment& segment)
+            : guard_(segment.device->device), segment_(segment) {
+            if (!segment.spec.shares_device) { return; }
+            for (const auto& other : program.segments_) {
+                if (share_device(segment, *other)) {
+                    CUDA_CHECK(cudaStreamWaitEvent(segment.device->stream, other->compute_done.event, 0));
+                }
+            }
+        }
+        ~SegmentWork() {
+            if (segment_.spec.shares_device) {
+                (void)cudaEventRecord(segment_.compute_done.event, segment_.device->stream);
+            }
+        }
+        SegmentWork(const SegmentWork&)            = delete;
+        SegmentWork& operator=(const SegmentWork&) = delete;
+
+    private:
+        DeviceGuard guard_;
+        DeviceSegment& segment_;
+    };
+
+    // Debugging aid INFERNIX_SPLIT_SYNC=1 (a split only): every segment is synchronized before the
+    // host restages the pinned io, round arrays or drafter io, so a restage can never race a later
+    // segment's upload still queued (each round already synchronizes before its successor stages).
+    static bool split_sync_from_environment() {
+        const char* value = std::getenv("INFERNIX_SPLIT_SYNC");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) { return false; }
+        if (std::strcmp(value, "1") == 0) { return true; }
+        throw std::invalid_argument(std::string("INFERNIX_SPLIT_SYNC must be 0 or 1, not '") + value + "'");
+    }
+    void before_restage() const {
+        if (split_sync_) { synchronize(); }
     }
 
     // ---------------------------------------------------------------- admission
@@ -1124,7 +1529,7 @@ public:
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
-        lane.row = whole().tables->acquire(static_cast<std::int32_t>(index));
+        acquire_rows(lane, index);
         const auto shortage_of = [&](std::uint32_t need) {
             runtime::ResourceReservation out;
             const std::uint32_t available = head().pool->available_pages();
@@ -1146,7 +1551,7 @@ public:
             if (!reservation) {
                 const auto out = shortage_of(selection->need);
                 prefix_unpin(*selection);
-                lane.row = KVExecutionRowLease{};
+                release_rows(lane);
                 return out;
             }
             if (q.vision) { vision_reserve(lane, q.vision, data); }
@@ -1162,7 +1567,7 @@ public:
             auto reservation = head().pool->reserve(q.pages);
             if (!reservation) {
                 const auto out = shortage_of(q.pages);
-                lane.row = KVExecutionRowLease{};
+                release_rows(lane);
                 return out;
             }
             if (q.vision) { vision_reserve(lane, q.vision, data); }
@@ -1170,8 +1575,7 @@ public:
             lane.pages.reserve(q.pages);
             head().pool->materialize(*reservation, q.pages, lane.pages);
             lane.reservation = std::move(*reservation);
-            whole().tables->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages),
-                                    whole().device->stream);
+            publish_rows(lane, 0, lane.pages);
             reset_slot(index);
             lane.calls = plan_prefill(data, 0, {}, false).ends;
         }
@@ -1202,7 +1606,7 @@ public:
         lane.prefill_ns      = 0;
         lane.decode_ns       = 0;
         lane.decode_share_ns = 0;
-        lane.cache_at_admission = whole().residency->stats();
+        lane.cache_at_admission = cache_stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         if (tier_) { lane.tier_at_admission = tier_->stats(); }
         lane.ngram                   = {};
@@ -1211,8 +1615,11 @@ public:
                                            .reused_prompt_tokens = source.reused_tokens,
                                            .prefix_reuse_path =
                                                source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple().gate_stats.p) + kGateStatsBytes * index, 0,
-                                   kGateStatsBytes, ple().device->stream));
+        {
+            const SegmentWork on(*this, ple());
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple().gate_stats.p) + kGateStatsBytes * index, 0,
+                                       kGateStatsBytes, ple().device->stream));
+        }
         lane.prefill_end = lane.prompt_tokens;
         lane.replay      = false;
         lane.extent      = b.positions;
@@ -1309,7 +1716,7 @@ public:
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
-        lane.row            = whole().tables->acquire(static_cast<std::int32_t>(index));
+        acquire_rows(lane, index);
         if (selection) {
             lane.prefix.reuse          = b.reuse;
             lane.prefix.hashes         = ledger.block_hashes;
@@ -1324,7 +1731,7 @@ public:
                 runtime::ResourceReservation out;
                 out.shortage.main_kv_pages = selection->need - std::min(selection->need, head().pool->available_pages());
                 prefix_unpin(*selection);
-                lane.row = KVExecutionRowLease{};
+                release_rows(lane);
                 return out;
             }
             if (b.vision) { vision_reserve(lane, plan_vision(ledger, selection->frontier), ledger); }
@@ -1342,7 +1749,7 @@ public:
             if (!reservation) {
                 runtime::ResourceReservation out;
                 out.shortage.main_kv_pages = pages - std::min(pages, head().pool->available_pages());
-                lane.row = KVExecutionRowLease{};
+                release_rows(lane);
                 return out;
             }
             if (b.vision) { vision_reserve(lane, plan_vision(ledger, 0), ledger); }
@@ -1350,8 +1757,7 @@ public:
             lane.pages.reserve(pages);
             head().pool->materialize(*reservation, pages, lane.pages);
             lane.reservation = std::move(*reservation);
-            whole().tables->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages),
-                                    whole().device->stream);
+            publish_rows(lane, 0, lane.pages);
             reset_slot(index);
             lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {},
                                             prefix::CallCost{.model = options_.prefix_cost,
@@ -1373,8 +1779,11 @@ public:
         lane.constraint_round.clear();
         lane.epoch = ++next_epoch_;
         restore_request(lane, r);
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple().gate_stats.p) + kGateStatsBytes * index, 0,
-                                   kGateStatsBytes, ple().device->stream));
+        {
+            const SegmentWork on(*this, ple());
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple().gate_stats.p) + kGateStatsBytes * index, 0,
+                                       kGateStatsBytes, ple().device->stream));
+        }
         lane.extent      = b.positions;
         lane.prefill_end = r.target;
         // The cached state may reach the paused frontier itself: then nothing replays.
@@ -1392,6 +1801,7 @@ public:
     // Penalty counts over the request's output so far (the sampler counts output tokens only),
     // counted on the host: a binding may overlap a round that still uses the workspace.
     void rebuild_token_counts(const Lane& lane) {
+        const SegmentWork on(*this, head());
         const cudaStream_t s = head().device->stream;
         auto* counts         = lane.sampling.token_counts;
         if (lane.sampling.presence_penalty == 0.0F && lane.sampling.frequency_penalty == 0.0F) {
@@ -1493,8 +1903,7 @@ public:
             std::vector<DeviceKVPageLease> grown;
             grown.reserve(missing);
             head().pool->materialize(*reservation, missing, grown);
-            whole().tables->publish(lane.row.handle(), static_cast<std::int32_t>(have),
-                                    std::span<const DeviceKVPageLease>(grown), whole().device->stream);
+            publish_rows(lane, have, grown);
             for (DeviceKVPageLease& page : grown) { lane.pages.push_back(std::move(page)); }
             ++revision_;
         }
@@ -1601,8 +2010,7 @@ public:
         // frames and pick its experts, while the prompt's would displace them (16 per layer per
         // call measured slower than none in every regime: serve C = 4 fill -4.3 %, warm -5.6 %;
         // design §19.3.17). Their routes still count toward the cache's scores.
-        const std::size_t promotions =
-            width <= kServedCallColumns ? decode_budget(whole(), static_cast<std::uint32_t>(width)) : 0;
+        const std::vector<std::size_t> promotions = prefill_budgets(width);
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
         const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                             static_cast<std::uint64_t>(width));
@@ -1615,12 +2023,9 @@ public:
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
         // a copy-out of this lane's state still in flight (design §19.3.1).
         prefix_.next_waits = prefix_waits(lane);
-        const bool streamed = !walk_.span.active && stream_chunk(whole(), width);
-        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
-        if (last && !prefilling_besides(index)) {
-            return_stream_lease(whole());
-            return_wide_work(whole());
-        }
+        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width),
+            /*stream=*/!walk_.span.active);
+        if (last && !prefilling_besides(index)) { return_leases(); }
         lane.state_tokens += static_cast<std::uint32_t>(width);
         prefix_after_prefill_call(lane, index, last);
         // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
@@ -1631,22 +2036,55 @@ public:
                 synchronize();
             }
             check_expert_error();
+            hash_logits("prefill", index, begin, width, 1);
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions.front(),
                         static_cast<std::uint32_t>(begin));
-            whole().residency->after_round(whole().device->stream, width, promotions);
+            after_call(width, promotions);
             apply_vram_target(false);
         }
 
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
     }
 
+    // Each segment's promotions for a prefill call of `width` columns: a call the CPU serves (an
+    // opener tail, a tiny suffix) promotes at the decode rate (design §19.3.1), wider calls promote
+    // nothing.
+    std::vector<std::size_t> prefill_budgets(std::int32_t width) {
+        std::vector<std::size_t> out(segments_.size(), 0);
+        if (width > kServedCallColumns) { return out; }
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            out[s] = decode_budget(*segments_[s], static_cast<std::uint32_t>(width));
+        }
+        return out;
+    }
+
+    // Once an eager call has completed (every segment synchronized): each segment's expert cache
+    // applies the call's routes, with its promotions.
+    void after_call(std::int32_t columns, std::span<const std::size_t> budgets) {
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            DeviceSegment& seg = *segments_[s];
+            const SegmentWork on(*this, seg);
+            seg.residency->after_round(seg.device->stream, columns, budgets[s]);
+        }
+    }
+
+    // After a prompt's last call is enqueued, with no other lane prefilling: each segment's stream
+    // lease and wide arena go back.
+    void return_leases() {
+        for (const auto& segment : segments_) {
+            const DeviceGuard on(segment->device->device);
+            return_stream_lease(*segment);
+            return_wide_work(*segment);
+        }
+    }
+
     // The progress of a prefill unit whose calls were enqueued (the last ends at `begin + width`,
     // `tokens` prompt tokens in all): for the prompt's last call the first token is sampled and the
     // pending batch returned. Non-last units have already synchronized and applied their routes.
     PrefillProgress prefill_progress(Lane& lane, std::uint32_t index, std::int32_t begin, std::int32_t width,
-                                     std::uint32_t tokens, bool last, std::size_t promotions,
+                                     std::uint32_t tokens, bool last, std::span<const std::size_t> promotions,
                                      Clock::time_point start) {
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
@@ -1659,9 +2097,10 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 synchronize();
             }
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+            hash_logits("prefill", index, begin, width, 1);
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions.front(),
                         static_cast<std::uint32_t>(begin));
-            whole().residency->after_round(whole().device->stream, width, promotions);
+            after_call(width, promotions);
             apply_vram_target(false);
             lane.replay = false;
             lane.phase  = Phase::Decode;
@@ -1674,12 +2113,13 @@ public:
             const std::int32_t positions[] = {begin + width - 1};
             sample(lanes, positions);
             if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+            hash_logits("prefill", index, begin, width, 1);
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
-                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
-                            static_cast<std::uint32_t>(begin));
-                whole().residency->after_round(whole().device->stream, width, promotions);
+                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
+                            promotions.front(), static_cast<std::uint32_t>(begin));
+                after_call(width, promotions);
                 apply_vram_target(false);
             }
             const SequenceHandle rows[] = {handle(index)};
@@ -1703,6 +2143,7 @@ public:
 
     PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
                         runtime::TokenMaskProvider* masks) {
+        static_assert(kSplitDecode, "a layer split's rounds run across its segments");
         const GrammarScope grammar(*this, masks);
         const auto start = Clock::now();
         const auto batch = static_cast<std::int32_t>(sequences.size());
@@ -1807,22 +2248,28 @@ public:
         // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
-        const bool gated = whole().graphs[static_cast<std::size_t>(batch - 1)].executable.ready() &&
-                           !decode_rows_cached(round_lanes, round_positions);
+        const bool gated = round_replayed(batch, 1, false) && !decode_rows_cached(round_lanes, round_positions);
+        before_restage();
         stage_decode(round_lanes, round_positions);
         const std::uint32_t word = next_gate_word();
         if (!gated) {
             stage_decode_rows(round_lanes, round_positions);
             publish_pinned_word(gate_ready(), word);
         }
-        run_decode(batch);
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
+        GateRelease release_gate{nullptr, word, io_prefix(batch) - io_layout_.ngram};
+        HandoffRelease release_handoff;
+        const auto read_rows = [&] {
+            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
+        };
+        const bool rows_read = run_decode(batch, gated, release_gate, release_handoff, read_rows);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(round_lanes, round_positions, [&] {
-            if (!gated) { return; }
-            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
+            if (!gated || rows_read) { return; }
+            read_rows();
             release_gate.owner = nullptr;
         });
+        release_handoff.owner = nullptr; // every segment has synchronized
+        hash_logits("decode", lanes[0], positions[0], 1, batch);
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -1862,10 +2309,12 @@ public:
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             synchronize();
             check_expert_error();
-            const std::size_t promotions = forced_budget(whole());
-            trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride, promotions,
+            hash_logits("forced", index, begin, static_cast<std::int32_t>(stride), 1);
+            std::vector<std::size_t> promotions(segments_.size());
+            for (std::size_t s = 0; s < segments_.size(); ++s) { promotions[s] = forced_budget(*segments_[s]); }
+            trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride, promotions.front(),
                         static_cast<std::uint32_t>(begin));
-            whole().residency->after_round(whole().device->stream, static_cast<std::int32_t>(stride), promotions);
+            after_call(static_cast<std::int32_t>(stride), promotions);
             apply_vram_target(false);
             lane.state_tokens += stride;
         }
@@ -1881,7 +2330,12 @@ public:
         }
         const auto rows = ContractAccess::rows(pending);
         if (decisions.size() != rows.size()) { throw std::logic_error("Qwen4Exp: commit decisions are not row aligned"); }
+        // A verification round's commit runs on every segment; a plain round's (the drafter's
+        // catch-up, a cancelled row's saved column) on the head.
         if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
+        std::optional<SegmentWork> on_head;
+        on_head.emplace(*this, head());
+        before_restage();
         CommitResult out;
         out.row_count = rows.size();
         // After a plain decode round the drafter writes the round's cell (its pending cell moves
@@ -1930,6 +2384,7 @@ public:
             upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), head().device->stream);
             mtp_catch_up(rows, 1, commit);
         }
+        on_head.reset(); // the head's work is enqueued; each segment settles on its own
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::size_t row = 0; row < rows.size(); ++row) {
             if (!decisions[row].cancelled) {
@@ -1979,13 +2434,14 @@ public:
             out.timings           = timings(lanes_[index]);
             out.speculative       = lanes_[index].speculative;
             out.constrained_draws = std::move(lanes_[index].constraint_trace);
-            if (whole().residency) {
-                const auto& s = whole().residency->stats();
-                const auto& a = lanes_[index].cache_at_admission;
+            if (first().residency) {
+                const ExpertResidency::Stats s = cache_stats();
+                const auto& a                  = lanes_[index].cache_at_admission;
                 out.expert_cache = ExpertCacheStats{.routed = s.routed - a.routed, .hits = s.hits - a.hits};
             }
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
+            report_handoff();
             prefix_finish(lanes_[index], index);
             release(index);
             out.status = runtime::ConsumeStatus::Consumed;
@@ -2071,8 +2527,11 @@ public:
         out.kv_capacity_page_groups = kv_pages_;
         out.kv_capacity_max_page_groups = kv_pages_;
         out.kv_cache                = options_.kv_cache;
-        out.kv_payload_bytes        = whole().kv_vmm ? whole().kv_vmm->mapped_bytes() : whole().kv_backing.bytes;
-        out.workspace_logical_peak_bytes = whole().work_capacity;
+        // Every segment's KV planes and workspace.
+        for (const auto& segment : segments_) {
+            out.kv_payload_bytes += segment->kv_vmm ? segment->kv_vmm->mapped_bytes() : segment->kv_backing.bytes;
+            out.workspace_logical_peak_bytes += segment->work_capacity;
+        }
         return out;
     }
 
@@ -2096,7 +2555,7 @@ private:
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
     std::size_t decode_budget(DeviceSegment& seg, std::uint32_t tokens) {
-        if (decode_promotions_ == DecodePromotions::Off) { return 0; }
+        if (decode_promotions_ == DecodePromotions::Off || !promotes_in_rounds(seg)) { return 0; }
         // The fill phase: until this session promoted or landed as many experts as there are frames.
         // Seeded frames (a warm start) do not end it: promotions only follow misses, so a workload
         // the saved state matches promotes little anyway, while one it does not match replaces the
@@ -2115,7 +2574,7 @@ private:
     // A forced-token call's promotions: one per layer, as a decode round's while the frames fill,
     // within INFERNIX_DECODE_PROMOTIONS (none when off, none once the frames have filled with fill).
     std::size_t forced_budget(const DeviceSegment& seg) const {
-        if (decode_promotions_ == DecodePromotions::Off) { return 0; }
+        if (decode_promotions_ == DecodePromotions::Off || !promotes_in_rounds(seg)) { return 0; }
         const ExpertResidency::Stats& stats = seg.residency->stats();
         if (decode_promotions_ == DecodePromotions::Fill &&
             stats.promotions + stats.landed >= seg.residency->frames()) {
@@ -2130,6 +2589,16 @@ private:
         static_assert(kDecodePromotionInterval == LinkPolicy{}.promotion_interval,
                       "derive_link_policy scales the reference link's promotion interval");
         return seg.policy.promotion_interval;
+    }
+    // Whether a segment's cache promotes during requests (its rounds and calls). A layer split's
+    // segment follows its link's promotion policy (derive_link_policy): one on a slow link (PCIe
+    // 3.0 x4: a promoted expert costs more link time than a CPU-served miss) promotes nothing while
+    // requests run, not even while its frames fill, and its misses go to the CPU; its frames fill
+    // from the warm start (its seed share) and from landed misses. An unsplit Program keeps the
+    // dynamic policy on every link (multi-GPU WP19 extends the policies to it).
+    bool promotes_in_rounds(const DeviceSegment& seg) const noexcept {
+        if (segments_.size() < 2) { return true; }
+        return seg.policy.promotions == PromotionPolicy::Dynamic;
     }
 
     // Measurement knob INFERNIX_DECODE_PROMOTIONS: `on` (unset) promotes as above; `fill` only until
@@ -2160,23 +2629,49 @@ private:
     void settle_round() {
         if (!deferred_.pending) { return; }
         deferred_.pending = false;
-        const std::size_t budget = decode_budget(whole(), deferred_.tokens);
+        // Each segment's cache applies the round's routes with its own budget.
+        std::vector<std::size_t> budgets(segments_.size());
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            budgets[s] = decode_budget(*segments_[s], deferred_.tokens);
+        }
         if (trace_) {
             const std::int32_t width = deferred_.live ? round_width_ : 1;
             trace_round(deferred_.live ? RouteTraceKind::Verify : RouteTraceKind::Decode, deferred_.columns / width,
-                        width, deferred_.tokens, budget, RouteTrace::kUnknownPosition,
+                        width, deferred_.tokens, budgets.front(), RouteTrace::kUnknownPosition,
                         deferred_.live ? std::span<const std::uint8_t>(live_.data(),
                                                                        static_cast<std::size_t>(deferred_.columns))
                                        : std::span<const std::uint8_t>{});
         }
-        whole().residency->after_round(whole().device->stream, deferred_.columns, budget,
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            DeviceSegment& seg = *segments_[s];
+            const SegmentWork on(*this, seg);
+            seg.residency->after_round(seg.device->stream, deferred_.columns, budgets[s],
                                        deferred_.live ? std::span<const std::uint8_t>(
                                                             live_.data(), static_cast<std::size_t>(deferred_.columns))
                                                       : std::span<const std::uint8_t>{});
+        }
         apply_vram_target(false);
     }
 
+    // The expert caches' counters, summed over the segments.
+    ExpertResidency::Stats cache_stats() const {
+        ExpertResidency::Stats out;
+        for (const auto& segment : segments_) {
+            const ExpertResidency::Stats& s = segment->residency->stats();
+            out.routed += s.routed;
+            out.hits += s.hits;
+            out.promotions += s.promotions;
+            out.lent_frames += s.lent_frames;
+            out.lend_evictions += s.lend_evictions;
+            out.seeded += s.seeded;
+            out.landed += s.landed;
+            out.demotions += s.demotions;
+        }
+        return out;
+    }
+
     // ---------------------------------------------------------------- VRAM monitor (design §19.3.7)
+    // With `seg`'s device current.
     void start_vram_monitor(DeviceSegment& seg, const VramDemand& demand) {
         if (!options_.vram_monitor) { return; }
         const VramSnapshot now = seg.vram->query();
@@ -2336,6 +2831,8 @@ private:
     }
 
     // The frames' warm start from the saved state; returns how many experts it loaded.
+    // The saved state keys the whole model; a split's segments each load their part
+    // (expert_cache::split_saved_state).
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
         if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
         if (!load.state) {
@@ -2344,24 +2841,45 @@ private:
             expert_state_saved_ = std::chrono::steady_clock::now();
             return 0;
         }
-        DeviceSegment& seg         = whole();
-        const auto start           = std::chrono::steady_clock::now();
-        const auto max_keys = static_cast<std::uint32_t>(seed_share() * seg.residency->frames());
-        const std::uint32_t loaded = seg.residency->warm_start(*load.state, kSeedCountCap, max_keys, seg.device->stream);
-        seg.device->synchronize();
+        const auto start     = std::chrono::steady_clock::now();
+        std::uint32_t loaded = 0, frames = 0;
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg = *segment;
+            const DeviceGuard on(seg.device->device);
+            // A split's segment seeds its link policy's share (every frame on a slow link, whose
+            // cache does not promote during requests); INFERNIX_SEED_SHARE overrides both.
+            const double share =
+                segments_.size() > 1 && !seed_share_set() ? seg.policy.seed_share : seed_share();
+            const auto max_keys = static_cast<std::uint32_t>(share * seg.residency->frames());
+            expert_cache::SavedState part;
+            const expert_cache::SavedState* state = &*load.state;
+            if (segments_.size() > 1) {
+                part  = expert_cache::split_saved_state(*load.state, seg.spec.layers.begin, seg.spec.layers.end,
+                                                        c_.moe.experts);
+                state = &part;
+                // A segment that seeds every frame (a slow link's, whose cache does not promote
+                // during requests) follows the ranking (the last session's residents, which fill
+                // only as many frames as that cache had) with every other key the session used,
+                // most used first, as the SSD tier's fill order does.
+                if (share >= 1.0) { extend_ranking(part); }
+            }
+            loaded += seg.residency->warm_start(*state, kSeedCountCap, max_keys, seg.device->stream);
+            frames += seg.residency->frames();
+        }
+        synchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const double loaded_gib =
-            static_cast<double>(loaded) * static_cast<double>(seg.residency->frame_stride()) / (1ULL << 30);
+            static_cast<double>(loaded) * static_cast<double>(head().residency->frame_stride()) / (1ULL << 30);
         char line[256];
         std::snprintf(line, sizeof(line),
                       "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
                       loaded, loaded_gib, seconds);
         diagnostic(line);
-        std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
-                      seg.residency->frames(), options_.expert_state.string().c_str());
+        std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded, frames,
+                      options_.expert_state.string().c_str());
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
-        expert_state_routed_ = seg.residency->stats().routed;
+        expert_state_routed_ = cache_stats().routed;
         return loaded;
     }
 
@@ -2389,6 +2907,14 @@ public:
             }
         }
         const std::uint32_t code = value & 0xFFFFU;
+        if (code == kErrorHandoffTimeout) {
+            // A layer split's gated handoff ran out of its bound (ForwardSegment::in_bound): the
+            // receiving segment's first layer ran on a stale residual.
+            throw runtime::RecoverableExecutionError(
+                "Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) +
+                ": the layer split's handoff from the previous GPU did not arrive within " +
+                std::to_string(options_.handoff_timeout_ms) + " ms (--handoff-timeout-ms)");
+        }
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the host expert service stopped answering"
                                                                                      : "an expert record could not be read (" +
@@ -2398,23 +2924,38 @@ public:
 
 public:
     // Writes the saved state (at stop, and from maintain_expert_state). Never throws.
+    // A split's segments' states merge into the whole model's (expert_cache::merge_saved_states).
     void save_expert_state() noexcept {
-        const DeviceSegment& seg = whole();
-        if (options_.expert_state.empty() || !seg.residency || seg.residency->frames() == 0) { return; }
+        if (options_.expert_state.empty() || segments_.empty() || !first().residency) { return; }
+        std::uint32_t frames = 0;
+        for (const auto& segment : segments_) { frames += segment->residency->frames(); }
+        if (frames == 0) { return; }
         try {
+            expert_cache::SavedState state;
+            if (segments_.size() == 1) {
+                state = first().residency->saved_state();
+            } else {
+                std::vector<expert_cache::SavedState> parts;
+                std::vector<LayerRange> ranges;
+                for (const auto& segment : segments_) {
+                    parts.push_back(segment->residency->saved_state());
+                    ranges.push_back(segment->spec.layers);
+                }
+                state = expert_cache::merge_saved_states(parts, ranges, c_.num_hidden_layers, c_.moe.experts);
+            }
             const std::string error =
-                expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity, seg.residency->saved_state());
+                expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity, state);
             if (!error.empty()) { diagnostic("expert state not saved: " + error, DiagnosticLevel::Warning); }
             expert_state_saved_  = std::chrono::steady_clock::now();
-            expert_state_routed_ = seg.residency->stats().routed;
+            expert_state_routed_ = cache_stats().routed;
         } catch (const std::exception& error) {
             diagnostic(std::string("expert state not saved: ") + error.what(), DiagnosticLevel::Warning);
         } catch (...) {}
     }
     // Between requests: saves when rounds ran since the last save and 10 minutes have passed.
     void maintain_expert_state() noexcept {
-        const DeviceSegment& seg = whole();
-        if (options_.expert_state.empty() || !seg.residency || seg.residency->stats().routed == expert_state_routed_) {
+        if (options_.expert_state.empty() || segments_.empty() || !first().residency ||
+            cache_stats().routed == expert_state_routed_) {
             return;
         }
         if (std::chrono::steady_clock::now() - expert_state_saved_ < kExpertStateInterval) { return; }
@@ -2437,6 +2978,26 @@ private:
             throw std::invalid_argument(std::string("INFERNIX_SEED_SHARE must be a number in [0, 1], not '") + value + "'");
         }
         return share;
+    }
+    // Appends to `state`'s ranking every key it does not list whose count is nonzero, by count
+    // (descending; ties by key).
+    static void extend_ranking(expert_cache::SavedState& state) {
+        if (state.counts.empty()) { return; }
+        std::vector<std::uint8_t> listed(state.counts.size(), 0);
+        for (const std::uint32_t key : state.ranked) {
+            if (key < listed.size()) { listed[key] = 1; }
+        }
+        std::vector<std::uint32_t> used;
+        for (std::uint32_t key = 0; key < state.counts.size(); ++key) {
+            if (listed[key] == 0 && state.counts[key] != 0) { used.push_back(key); }
+        }
+        std::stable_sort(used.begin(), used.end(),
+                         [&](std::uint32_t a, std::uint32_t b) { return state.counts[a] > state.counts[b]; });
+        state.ranked.insert(state.ranked.end(), used.begin(), used.end());
+    }
+    static bool seed_share_set() {
+        const char* value = std::getenv("INFERNIX_SEED_SHARE");
+        return value != nullptr && *value != '\0';
     }
     static constexpr std::chrono::minutes kExpertStateInterval{10};
     std::chrono::steady_clock::time_point expert_state_saved_{};
@@ -2461,6 +3022,7 @@ public:
 private:
     void apply_vram_target(DeviceSegment& seg, bool idle) {
         if (!seg.control) { return; }
+        const DeviceGuard on(seg.device->device);
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         const auto d =
             seg.control->decide(seg.monitor->latest(), seg.pool_now, seg.frames_now, vram_seconds(seg), idle);
@@ -2470,7 +3032,7 @@ private:
         seg.frames_now             = resized.frames;
         seg.pool_now               = seg.residency->pool_bytes();
         const VramSnapshot after   = seg.monitor->refresh();
-        diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
+        diagnostic(segment_name(seg) + (d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
                    std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
                    " -> " + std::to_string(seg.frames_now) + " frames" +
                    (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
@@ -2495,40 +3057,62 @@ private:
     void trace_round(RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
                      std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {}) {
         if (!trace_) { return; }
-        trace_->append({.kind     = kind,
-                        .rows     = static_cast<std::uint32_t>(rows),
-                        .width    = static_cast<std::uint32_t>(width),
-                        .tokens   = tokens,
-                        .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
-                        .position = position},
-                       std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)), live,
-                       whole().residency->route_host(), whole().residency->route_stride());
+        const RouteTraceRound round{.kind     = kind,
+                                    .rows     = static_cast<std::uint32_t>(rows),
+                                    .width    = static_cast<std::uint32_t>(width),
+                                    .tokens   = tokens,
+                                    .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
+                                    .position = position};
+        const std::span<const std::int32_t> lanes(host_lanes_.data(), static_cast<std::size_t>(rows));
+        if (segments_.size() == 1) {
+            trace_->append(round, lanes, live, first().residency->route_host(), first().residency->route_stride());
+            return;
+        }
+        // A split's segments log their own layers; the record covers the whole model.
+        std::vector<RouteTraceSegment> parts;
+        for (const auto& segment : segments_) {
+            parts.push_back({.routes       = segment->residency->route_host(),
+                             .route_stride = segment->residency->route_stride(),
+                             .layer_begin  = segment->spec.layers.begin,
+                             .layer_end    = segment->spec.layers.end});
+        }
+        trace_->append_segments(round, lanes, live, parts);
     }
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
-    // or on stderr without an observer.
+    // or on stderr without an observer: a split's segments summed, with each device's free memory.
     void report_cache(const Lane& lane) noexcept {
         try {
-            const ExpertResidency& residency = *whole().residency;
+            const ExpertResidency& residency = *head().residency;
             const auto& at_admission         = lane.cache_at_admission;
-            const auto& s       = residency.stats();
+            const ExpertResidency::Stats s   = cache_stats();
             const auto routed   = s.routed - at_admission.routed;
             const auto hits     = s.hits - at_admission.hits;
             const auto promoted = s.promotions - at_admission.promotions;
             const auto landed   = s.landed - at_admission.landed;
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
-            std::size_t free_vram = 0, total_vram = 0;
-            if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
+            std::uint32_t frames = 0;
+            std::string free_text;
+            for (const auto& segment : segments_) {
+                frames += segment->residency->frames();
+                if (!free_text.empty() && share_device(*segment, *segments_[segment->spec.index - 1])) { continue; }
+                std::size_t free_vram = 0, total_vram = 0;
+                {
+                    const DeviceGuard on(segment->device->device);
+                    if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
+                }
+                free_text += (free_text.empty() ? "" : " / ") + std::to_string(free_vram >> 20);
+            }
             char text[384];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
-                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
-                          residency.frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
+                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %s MiB",
+                          frames, routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
                           static_cast<unsigned long long>(landed),
                           static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
-                          free_vram >> 20);
+                          free_text.c_str());
             diagnostic(text, DiagnosticLevel::Debug);
             if (tier_) {
                 // The tier's counters as of the last round boundary.
@@ -2551,10 +3135,10 @@ private:
         } catch (...) {}
     }
 
-    // The workspace arena of a Program with `lanes` lanes: the forward at its widest call (a prefill
-    // chunk or every lane's widest round), sampling, acceptance and the drafter.
-    std::size_t workspace_capacity(std::int32_t lanes) const {
-        return workspace_bytes(c_, options_, whole().plan, lanes, whole().plan.static_columns);
+    // The workspace arena of `seg` in a Program with `lanes` lanes: the forward at its widest call (a
+    // prefill chunk or every lane's widest round), and on the head sampling, acceptance and the drafter.
+    std::size_t workspace_capacity(const DeviceSegment& seg, std::int32_t lanes) const {
+        return workspace_bytes(c_, options_, seg.plan, lanes, seg.plan.static_columns);
     }
 
     // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
@@ -2563,8 +3147,10 @@ private:
     // counts; and its share of the workspace. Every other allocation is independent of the lane
     // count, so one more lane costs these frames.
     void report_lane_cost(std::int32_t lanes, std::uint64_t record_stride) noexcept {
+        for (const auto& segment : segments_) { report_lane_cost(*segment, lanes, record_stride); }
+    }
+    void report_lane_cost(const DeviceSegment& seg, std::int32_t lanes, std::uint64_t record_stride) noexcept {
         try {
-            const DeviceSegment& seg = whole();
             const auto n             = static_cast<std::size_t>(lanes);
             const bool fixed_kv      = options_.kv_capacity_tokens != 0;
             const std::size_t kv     = fixed_kv ? 0 : seg.kv_span.bytes / n;
@@ -2576,8 +3162,8 @@ private:
                 n;
             // The workspace grows with the lane count by its sampling, acceptance and drafter rows:
             // the mean step from one lane to this count, or the second lane's at one lane.
-            const std::size_t wide   = workspace_capacity(lanes > 1 ? lanes : 2);
-            const std::size_t narrow = workspace_capacity(1);
+            const std::size_t wide   = workspace_capacity(seg, lanes > 1 ? lanes : 2);
+            const std::size_t narrow = workspace_capacity(seg, 1);
             const std::size_t workspace = wide > narrow ? (wide - narrow) / (lanes > 1 ? n - 1 : 1) : 0;
             const double lane_frames = static_cast<double>(kv + state + workspace) /
                                        static_cast<double>(std::max<std::uint64_t>(record_stride, 1));
@@ -2593,7 +3179,7 @@ private:
                           "recurrent state, records and workspace %zu MiB)",
                           seg.residency->frames(), static_cast<double>(record_stride) / 1048576.0, lanes,
                           lanes == 1 ? "" : "s", lane_frames, kv_text, (state + workspace) >> 20);
-            diagnostic(text, DiagnosticLevel::Debug);
+            diagnostic(segment_name(seg) + text, DiagnosticLevel::Debug);
         } catch (...) {}
     }
 
@@ -2610,6 +3196,7 @@ private:
                           static_cast<unsigned long long>(n.reads), static_cast<double>(n.read_ns) * 1e-6);
             std::string line = text;
             if (const auto& g = lane.gate; g.rounds > 0) {
+                const DeviceGuard on(ple().device->device);
                 std::uint64_t waits[2] = {};
                 CUDA_CHECK(cudaMemcpyAsync(waits,
                                            static_cast<const std::byte*>(ple().gate_stats.p) +
@@ -2625,6 +3212,29 @@ private:
                 line += text;
             }
             diagnostic(line, DiagnosticLevel::Debug);
+        } catch (...) {}
+    }
+
+    // A split's gated handoffs since start (ForwardSegment::in_wait_stats): how often each receiving
+    // segment's gate found the residual not yet published, and its mean wait.
+    void report_handoff() noexcept {
+        if (handoff_ != HandoffMode::Gate) { return; }
+        try {
+            for (const auto& segment : segments_) {
+                const DeviceSegment& seg = *segment;
+                if (seg.handoff_stats.p == nullptr) { continue; }
+                const DeviceGuard on(seg.device->device);
+                std::uint64_t waits[2] = {};
+                CUDA_CHECK(cudaMemcpyAsync(waits, seg.handoff_stats.p, sizeof(waits), cudaMemcpyDeviceToHost,
+                                           seg.device->stream));
+                seg.device->synchronize();
+                char text[192];
+                std::snprintf(text, sizeof(text),
+                              "gated handoff into layer %u: waited in %llu rounds since start (mean %.1f us)",
+                              seg.spec.layers.begin, static_cast<unsigned long long>(waits[1]),
+                              waits[1] ? static_cast<double>(waits[0]) * 1e-3 / static_cast<double>(waits[1]) : 0.0);
+                diagnostic(segment_name(seg) + text, DiagnosticLevel::Debug);
+            }
         } catch (...) {}
     }
 
@@ -2659,6 +3269,33 @@ private:
             publish_pinned_word(owner->gate_ready(), word);
         }
     };
+
+    // ProgramOptions::logits_hash: after a call or round that computed `columns` columns of logits
+    // (its device work finished), one line with the 64-bit FNV-1a of the head's FP32 logits32, bit
+    // for bit. `begin` and `width` name the positions of the call's (or round's first row's) lane.
+    void hash_logits(const char* kind, std::uint32_t lane, std::int32_t begin, std::int32_t width,
+                     std::int32_t columns) {
+        if (!logits_hash_) { return; }
+        DeviceSegment& seg = head();
+        const DeviceGuard on(seg.device->device);
+        std::vector<std::uint8_t> logits(sizeof(float) * static_cast<std::size_t>(vocab_) *
+                                         static_cast<std::size_t>(columns));
+        CUDA_CHECK(cudaMemcpyAsync(logits.data(), seg.logits32.p, logits.size(), cudaMemcpyDeviceToHost,
+                                   seg.device->stream));
+        seg.device->synchronize();
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (const std::uint8_t byte : logits) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        std::fprintf(logits_hash_.get(), "%s lane=%u begin=%d width=%d columns=%d fnv1a64=%016llx\n", kind, lane,
+                     begin, width, columns, static_cast<unsigned long long>(hash));
+        std::fflush(logits_hash_.get());
+    }
+    struct FileCloser {
+        void operator()(std::FILE* file) const noexcept { std::fclose(file); }
+    };
+    std::unique_ptr<std::FILE, FileCloser> logits_hash_;
 
     // A diagnostic (Info unless stated) for the Engine's observer, or stderr without one.
     void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
@@ -2701,19 +3338,60 @@ private:
         return out;
     }
 
+    // ---- block tables: one per segment with KV, every one holding the head pool's page indices ----
+    // The lane's row in the head's tables and, in a split, the same row in every other segment's.
+    void acquire_rows(Lane& lane, std::uint32_t index) {
+        lane.row = head().tables->acquire(static_cast<std::int32_t>(index));
+        lane.mirror_rows.clear();
+        if (segments_.size() < 2) { return; }
+        lane.mirror_rows.resize(segments_.size());
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            DeviceSegment& seg = *segments_[s];
+            if (&seg == &head() || !seg.tables) { continue; }
+            const DeviceGuard on(seg.device->device);
+            lane.mirror_rows[s] = seg.tables->acquire(static_cast<std::int32_t>(index));
+        }
+    }
+    static void release_rows(Lane& lane) noexcept {
+        lane.row = KVExecutionRowLease{};
+        lane.mirror_rows.clear();
+    }
+    // Publishes `pages` (leases of the head's pool) at logical pages [logical_begin, ...) of the
+    // lane's row: into the head's tables, then by page index into every other segment's, each on its
+    // own stream (a split grows every segment's backed pages before any index past them is published).
+    void publish_rows(const Lane& lane, std::uint32_t logical_begin, std::span<const DeviceKVPageLease> pages) {
+        {
+            const SegmentWork on(*this, head());
+            head().tables->publish(lane.row.handle(), logical_begin, pages, head().device->stream);
+        }
+        if (lane.mirror_rows.empty()) { return; }
+        const std::vector<std::int32_t> indices = KVExecutionTablePool::indices_of(pages);
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            if (!lane.mirror_rows[s].valid()) { continue; }
+            DeviceSegment& seg = *segments_[s];
+            const SegmentWork on(*this, seg);
+            seg.tables->publish_indices(lane.mirror_rows[s].handle(), logical_begin, indices, seg.device->stream);
+        }
+    }
+
     void release(std::uint32_t index) noexcept {
         Lane& lane = lanes_[index];
         if (walk_.span.active && walk_.span.lane == index) { walk_abandon(); }
-        if (whole().stream_lease.valid() && !prefilling_besides(index)) {
-            try { return_stream_lease(whole()); } catch (...) {}
-        }
         if (!prefilling_besides(index)) {
-            try { return_wide_work(whole()); } catch (...) {}
+            for (const auto& segment : segments_) {
+                try {
+                    const DeviceGuard on(segment->device->device);
+                    if (segment->stream_lease.valid()) {
+                        try { return_stream_lease(*segment); } catch (...) {}
+                    }
+                    try { return_wide_work(*segment); } catch (...) {}
+                } catch (...) {}
+            }
         }
         prefix_release(lane);
         lane.pages.clear();
         lane.reservation.reset();
-        lane.row = KVExecutionRowLease{};
+        release_rows(lane);
         lane.history.clear();
         lane.history.shrink_to_fit();
         lane.rope = {};
@@ -2741,50 +3419,64 @@ private:
 
     // The pages one growth could add at most: grow_kv takes up to a quarter of the frames, and none
     // while frames are lent (an estimate; grow_kv decides).
+    // A split grows every segment's planes in lockstep, so the fewest pages any segment could add.
     std::uint32_t kv_grow_pages() const noexcept {
-        const DeviceSegment& seg = whole();
-        if (!seg.kv_vmm || !seg.residency || !seg.residency->elastic() || seg.residency->frames() == 0 ||
-            seg.residency->stats().lent_frames != 0) {
-            return 0;
+        std::uint32_t pages = UINT32_MAX;
+        for (const auto& segment : segments_) {
+            const DeviceSegment& seg = *segment;
+            if (!seg.pool) { continue; } // no attention layers: no KV to grow
+            if (!seg.kv_vmm || !seg.residency || !seg.residency->elastic() || seg.residency->frames() == 0 ||
+                seg.residency->stats().lent_frames != 0) {
+                return 0;
+            }
+            const std::uint32_t room = seg.pool->capacity_pages() - seg.pool->backed_pages();
+            const std::uint64_t page_bytes =
+                std::max<std::uint64_t>(1, seg.kv_span.bytes / std::max<std::uint32_t>(1, seg.pool->capacity_pages()));
+            const std::uint64_t frame_room =
+                static_cast<std::uint64_t>(seg.residency->frames() / 4) * seg.residency->frame_stride();
+            const std::uint64_t slack  = ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * seg.plan.pool.planes.size();
+            const std::uint64_t usable = frame_room > slack ? frame_room - slack : 0;
+            pages = std::min(pages, static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes)));
         }
-        const std::uint32_t room = seg.pool->capacity_pages() - seg.pool->backed_pages();
-        const std::uint64_t page_bytes =
-            std::max<std::uint64_t>(1, seg.kv_span.bytes / std::max<std::uint32_t>(1, seg.pool->capacity_pages()));
-        const std::uint64_t frame_room = static_cast<std::uint64_t>(seg.residency->frames() / 4) * seg.residency->frame_stride();
-        const std::uint64_t slack      = ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * seg.plan.pool.planes.size();
-        const std::uint64_t usable     = frame_room > slack ? frame_room - slack : 0;
-        return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes));
+        return pages == UINT32_MAX ? 0 : pages;
     }
 
     // Zeroes a slot's recurrent state, PLE convolution history, QSA tails (and exact-window tags) and
-    // penalty counts.
+    // penalty counts: each segment its own layers' on its stream, the PLE segment the PLE history,
+    // the head the counts.
     void reset_slot(std::uint32_t slot) {
-        DeviceSegment& seg   = whole();
-        const cudaStream_t s = seg.device->stream;
-        for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
-            Tensor conv      = seg.gdn->conv_slot(l, static_cast<std::int32_t>(slot));
-            Tensor recurrent = seg.gdn->recurrent_slot(l, static_cast<std::int32_t>(slot));
-            CUDA_CHECK(cudaMemsetAsync(conv.data, 0, conv.bytes(), s));
-            CUDA_CHECK(cudaMemsetAsync(recurrent.data, 0, recurrent.bytes(), s));
-        }
-        const std::size_t ple_bytes = static_cast<std::size_t>(width_) * span_ * 2;
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple().ple_backing.p) + slot * ple_bytes, 0, ple_bytes,
-                                   ple().device->stream));
-        const auto lanes            = static_cast<std::size_t>(options_.max_concurrency);
+        const std::size_t ple_bytes  = static_cast<std::size_t>(width_) * span_ * 2;
+        const auto lanes             = static_cast<std::size_t>(options_.max_concurrency);
         const std::size_t tail_bytes = static_cast<std::size_t>(di_) * (r_ - 1) * 2;
-        for (std::uint32_t l = 0; l < c_.attention_layers + (mtp_ ? 1U : 0U); ++l) {
-            CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(seg.tails_backing.p) + (l * lanes + slot) * tail_bytes, 0,
-                                       tail_bytes, s));
-            if (seg.window_geometry.present()) { // the window's tags: no earlier history's row is read
-                const std::size_t tags = seg.window_geometry.lane_bytes(4);
-                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(seg.window_backing.p) +
-                                               seg.window_geometry.plane_offset(l, 4) + slot * tags,
-                                           0, tags, s));
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg   = *segment;
+            const SegmentWork on(*this, seg);
+            const cudaStream_t s = seg.device->stream;
+            for (std::uint32_t l = 0; l < seg.spec.gdn_count; ++l) {
+                Tensor conv      = seg.gdn->conv_slot(l, static_cast<std::int32_t>(slot));
+                Tensor recurrent = seg.gdn->recurrent_slot(l, static_cast<std::int32_t>(slot));
+                CUDA_CHECK(cudaMemsetAsync(conv.data, 0, conv.bytes(), s));
+                CUDA_CHECK(cudaMemsetAsync(recurrent.data, 0, recurrent.bytes(), s));
+            }
+            if (seg.spec.ple) {
+                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(seg.ple_backing.p) + slot * ple_bytes, 0, ple_bytes, s));
+            }
+            for (std::uint32_t l = 0; l < seg.plan.kv_layers; ++l) {
+                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(seg.tails_backing.p) + (l * lanes + slot) * tail_bytes, 0,
+                                           tail_bytes, s));
+                if (seg.window_geometry.present()) { // the window's tags: no earlier history's row is read
+                    const std::size_t tags = seg.window_geometry.lane_bytes(4);
+                    CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(seg.window_backing.p) +
+                                                   seg.window_geometry.plane_offset(l, 4) + slot * tags,
+                                               0, tags, s));
+                }
+            }
+            if (seg.spec.head) {
+                CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(seg.token_counts.p) +
+                                               slot * static_cast<std::size_t>(token_domain_),
+                                           0, 4ULL * token_domain_, s));
             }
         }
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(head().token_counts.p) +
-                                       slot * static_cast<std::size_t>(token_domain_),
-                                   0, 4ULL * token_domain_, head().device->stream));
     }
 
     std::byte* host_io() const { return static_cast<std::byte*>(io_host_.data()); }
@@ -2864,6 +3556,7 @@ private:
     // `rows`: also read the n-gram rows (a walk chunk whose rows were prefetched skips them).
     void stage_sequence(std::uint32_t lane, std::int32_t begin, std::int32_t width,
                         const std::vector<std::int32_t>& history, bool rows = true) {
+        before_restage();
         auto* ids       = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
         auto* positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         auto* columns   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.columns);
@@ -2929,6 +3622,32 @@ private:
         return word;
     }
 
+    // A layer split's round word (IoLayout::handoff), staged with the io prefix: a gated handoff's
+    // sender publishes it after the residual and its receiver waits for it. Strictly increasing and
+    // never 0, as the gate's.
+    std::uint32_t next_handoff_word() {
+        if (++handoff_sequence_ == 0) { ++handoff_sequence_; }
+        const std::uint32_t word = handoff_sequence_;
+        *reinterpret_cast<std::uint32_t*>(host_io() + io_layout_.handoff) = word;
+        return word;
+    }
+
+    // Publishes a gated round's handoff word on every boundary if the host unwinds once a receiving
+    // segment is launched and before the round's synchronization: the receivers' gates pass at
+    // once (over a stale residual; the round's results are discarded with the error) instead of
+    // waiting out their bound.
+    struct HandoffRelease {
+        const ProgramImpl* owner = nullptr;
+        std::uint32_t word       = 0;
+        HandoffRelease()                                 = default;
+        HandoffRelease(const HandoffRelease&)            = delete;
+        HandoffRelease& operator=(const HandoffRelease&) = delete;
+        ~HandoffRelease() {
+            if (owner == nullptr) { return; }
+            for (const auto& channel : owner->channels_) { channel->release(word); }
+        }
+    };
+
     // After a gated launch: submits the queued work, reads the rows (`read`), releases the gate and
     // counts the reads toward `lane` (the round's first row).
     void read_behind_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
@@ -2948,13 +3667,19 @@ private:
     }
 
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
-    // `logit_columns` columns land in the head's logits32.
+    // `logit_columns` columns land in the head's logits32. With `stream`, a segment whose call is wide
+    // enough streams its experts (stream_chunk). A split runs it segment by segment (run_split).
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
              const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr,
-             bool streamed = false) {
+             bool stream = false) {
+        if (segments_.size() > 1) {
+            run_split(batch, width, logit_columns, chunk, vision, stream);
+            return;
+        }
         DeviceSegment& seg   = whole();
+        const bool streamed  = stream && stream_chunk(seg, batch * width);
         const cudaStream_t s = seg.device->stream;
-        CUDA_CHECK(cudaMemcpyAsync(seg.io_device.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        upload_io(seg);
         seg.residency->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
         // share (design §19.3.12) gates the stream on each layer's routing.
@@ -2965,6 +3690,20 @@ private:
         if (streamed) { seg.expert_stream->end(); }
         seg.split_call = false;
         seg.residency->enqueue_route_download(s, batch * width);
+    }
+
+    // Uploads the staged io image into `seg`'s copy on its stream: all of it to the PLE segment, which
+    // alone reads the n-gram rows, and the rest around the rows to the others (IoLayout).
+    void upload_io(DeviceSegment& seg) {
+        const cudaStream_t s = seg.device->stream;
+        auto* device         = static_cast<std::byte*>(seg.io_device.p);
+        if (seg.spec.ple) {
+            CUDA_CHECK(cudaMemcpyAsync(device, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+            return;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(device, host_io(), io_layout_.ngram, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(device + io_layout_.mtp_ids, host_io() + io_layout_.mtp_ids,
+                                   io_layout_.bytes - io_layout_.mtp_ids, cudaMemcpyHostToDevice, s));
     }
 
     // ---- prefill expert streaming (design §19.3.8 F2, F3) ----
@@ -2985,10 +3724,12 @@ private:
     bool stream_chunk(DeviceSegment& seg, std::int32_t width, std::size_t walk_bytes = 0) {
         if (!seg.expert_stream || width < kStreamMinColumns || seg.residency->frames() == 0) { return false; }
         if (!seg.stream_lease.valid()) {
-            const std::int32_t* table = seg.residency->host_table();
-            const std::uint32_t E     = c_.moe.experts;
-            std::uint32_t most        = 0;
-            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+            // The segment's layers (its cache's tables hold them from 0).
+            const std::uint32_t layers = seg.residency->layers();
+            const std::int32_t* table  = seg.residency->host_table();
+            const std::uint32_t E      = c_.moe.experts;
+            std::uint32_t most         = 0;
+            for (std::uint32_t l = 0; l < layers; ++l) {
                 std::uint32_t absent = 0;
                 for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
                 most = std::max(most, absent);
@@ -2999,15 +3740,14 @@ private:
             };
             // The wide arena rides in the lease whenever the plan has one: a prompt with a streamed
             // call runs wide calls.
-            const std::uint32_t wide_frames = frames_of(seg.wide_work);
+            const std::uint32_t wide_frames = seg.wide_dedicated ? 0U : frames_of(seg.wide_work);
             const auto walk_frames          = frames_of(walk_bytes);
             const std::uint32_t lendable    = seg.residency->lendable();
             if (wide_frames >= lendable) { return false; }
             const std::uint32_t evicted = wide_frames + walk_frames;
-            const std::uint32_t widened = std::min(E, most + (evicted + c_.num_hidden_layers - 1) / c_.num_hidden_layers);
+            const std::uint32_t widened = std::min(E, most + (evicted + layers - 1) / layers);
             const bool walk = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
-            const std::uint32_t half = walk ? widened : std::min(E, most + (wide_frames + c_.num_hidden_layers - 1) /
-                                                                              c_.num_hidden_layers);
+            const std::uint32_t half = walk ? widened : std::min(E, most + (wide_frames + layers - 1) / layers);
             const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
             if (half == 0 || seg.expert_stream->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
                 return false;
@@ -3062,7 +3802,9 @@ private:
 
     void enter_wide(DeviceSegment& seg) {
         DeviceSpan span{};
-        if (seg.stream_lease.valid() && seg.stream_wide_bytes >= seg.wide_work) {
+        if (seg.wide_dedicated) {
+            span = DeviceSpan{seg.wide_fallback.p, seg.wide_work};
+        } else if (seg.stream_lease.valid() && seg.stream_wide_bytes >= seg.wide_work) {
             span = {static_cast<std::byte*>(seg.stream_lease.memory.data) + seg.stream_ring_bytes, seg.wide_work};
         } else {
             if (!seg.work_lease.valid() && seg.wide_fallback.p == nullptr) {
@@ -3096,7 +3838,7 @@ private:
     void return_wide_work(DeviceSegment& seg) {
         if (seg.work_lease.valid()) { seg.residency->give_back(seg.work_lease, seg.device->stream); }
         seg.work_lease = {};
-        if (seg.wide_fallback.p != nullptr) {
+        if (seg.wide_fallback.p != nullptr && !seg.wide_dedicated) {
             seg.device->synchronize();
             seg.wide_fallback = DeviceBuffer{};
         }
@@ -3126,7 +3868,112 @@ private:
                       static_cast<unsigned long long>(split.cpu_experts - seg.split_at_lease.cpu_experts),
                       static_cast<unsigned long long>(split.streamed_experts - seg.split_at_lease.streamed_experts),
                       static_cast<unsigned long long>(walk_.prefetched_chunks - seg.prefetched_at_lease));
-        diagnostic(line, DiagnosticLevel::Debug);
+        diagnostic(segment_name(seg) + line, DiagnosticLevel::Debug);
+    }
+
+    // ---- a layer split's eager calls ----
+    // One segment's share of an eager call while the later segments are enqueued: its batch over its
+    // io, its residual in its workspace (alloc_residual's fixed address), the head's logits, and the
+    // wide arena and expert stream it holds until it ends.
+    struct EagerShare {
+        execution::ForwardBatch batch;
+        Tensor residual;
+        Tensor logits;
+        std::optional<WideWork> wide;
+        bool streamed = false;
+    };
+
+    // An eager call of a split Program (prefill chunks, forced tokens): segment by segment in layer
+    // order, each with its device current, composed from its Forward's steps (begin_call,
+    // alloc_residual, embed or the crossing, its layers, finish on the head). The residual crosses
+    // each boundary through the boundary's BulkHandoff, ordered on both streams without a host wait
+    // (a decode round's one-slot HandoffChannel cannot hold a chunk); the caller synchronizes once
+    // every segment is enqueued. A segment's share is prepared (io, expert cache, stream lease and
+    // copies) before the crossing, so on two devices it overlaps the previous segment's layers; on
+    // one device each share waits for the kernels of the previous one (SegmentEvent).
+    void run_split(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
+                   const execution::MtpChunk* chunk, const execution::VisionInput* vision, bool stream) {
+        const std::int32_t columns = batch * width;
+        std::vector<EagerShare> shares(segments_.size());
+        for (std::size_t i = 0; i < segments_.size(); ++i) {
+            DeviceSegment& seg = *segments_[i];
+            EagerShare& share  = shares[i];
+            {
+                const DeviceGuard on(seg.device->device);
+                begin_share(i, share, batch, width, logit_columns, chunk, vision, stream);
+            }
+            if (i > 0) {
+                DeviceSegment& sender = *segments_[i - 1];
+                sender.bulk_out->transfer(shares[i - 1].residual.data, share.residual.data, share.residual.bytes(),
+                                          sender.device->stream, seg.device->stream);
+                const DeviceGuard on(sender.device->device);
+                sender.device->flush();
+                end_share(sender, shares[i - 1], columns);
+            }
+            const DeviceGuard on(seg.device->device);
+            if (seg.spec.embed) { seg.forward->embed(share.batch, share.residual); }
+            for (std::uint32_t l = seg.spec.layers.begin; l < seg.spec.layers.end; ++l) {
+                seg.forward->layer(l, share.batch, share.residual);
+            }
+            if (seg.spec.head) { seg.forward->finish(share.batch, share.residual, &share.logits); }
+            CUDA_CHECK(cudaEventRecord(seg.compute_done.event, seg.device->stream));
+            seg.device->flush();
+        }
+        DeviceSegment& last = head();
+        const DeviceGuard on(last.device->device);
+        end_share(last, shares.back(), columns);
+    }
+
+    // Segment i's share up to its residual, with its device current: the wait for a previous share on
+    // its device, the stream lease, the io, the expert cache's round, the stream, the wide arena,
+    // begin_call and alloc_residual.
+    void begin_share(std::size_t i, EagerShare& share, std::int32_t batch, std::int32_t width,
+                     std::int32_t logit_columns, const execution::MtpChunk* chunk, const execution::VisionInput* vision,
+                     bool stream) {
+        DeviceSegment& seg         = *segments_[i];
+        const cudaStream_t s       = seg.device->stream;
+        const std::int32_t columns = batch * width;
+        // On one device two segments' kernels never overlap: this share follows the previous
+        // segment's (this call's, or for the first the last segment's in the previous call).
+        const DeviceSegment& before = i > 0 ? *segments_[i - 1] : head();
+        if (share_device(seg, before)) { CUDA_CHECK(cudaStreamWaitEvent(s, before.compute_done.event, 0)); }
+        share.streamed = stream && stream_chunk(seg, columns);
+        upload_io(seg);
+        seg.residency->before_round(s);
+        seg.split_call = share.streamed && seg.split_policy && columns <= split_columns(seg);
+        if (share.streamed) { seg.expert_stream->begin(ring_span(seg), seg.residency->host_table(), s, seg.split_call); }
+        share.wide.emplace(*this, seg, columns);
+        share.batch = eager_batch(seg, batch, width, logit_columns, chunk, vision, share.streamed);
+        if (seg.spec.head) { share.logits = Tensor(seg.logits32.p, DType::FP32, {vocab_, logit_columns}); }
+        seg.forward->begin_call(share.batch, seg.spec.head ? &share.logits : nullptr);
+        share.residual = seg.forward->alloc_residual(share.batch);
+    }
+
+    // The end of a segment's share once its kernels and its crossing are enqueued.
+    void end_share(DeviceSegment& seg, EagerShare& share, std::int32_t columns) {
+        if (share.streamed) { seg.expert_stream->end(); }
+        seg.split_call = false;
+        share.wide.reset();
+        seg.residency->enqueue_route_download(seg.device->stream, columns);
+    }
+
+    // A segment's batch of an eager call, over its io copy: the MTP cells (and a round's residual
+    // export) are the head's, the image columns the first segment's; the prefix waits are every
+    // segment's, consumed by the head's.
+    execution::ForwardBatch eager_batch(const DeviceSegment& seg, std::int32_t batch, std::int32_t width,
+                                        std::int32_t logit_columns, const execution::MtpChunk* chunk,
+                                        const execution::VisionInput* vision, bool streamed) {
+        execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(seg.io_device.p), batch, width, logit_columns);
+        fb.mtp_chunk   = seg.spec.head ? chunk : nullptr;
+        fb.layer_waits = prefix_.waits_for(seg.spec.index);
+        if (seg.spec.head) { prefix_.next_waits = {}; }
+        fb.vision = seg.spec.embed ? vision : nullptr;
+        fb.stream = streamed;
+        fb.split  = streamed && seg.split_call;
+        if (mtp_ && chunk == nullptr && seg.spec.head) {
+            fb.residual_out = Tensor(seg.mtp_residuals.p, DType::BF16, {width_, batch * width});
+        }
+        return fb;
     }
 
     // Whether a lane other than `index` is prefilling.
@@ -3141,15 +3988,95 @@ private:
     // every row is chosen on the device, so one CUDA graph per batch size serves every round. The
     // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
     // captured and later rounds replay it.
-    void run_decode(std::int32_t batch) {
-        DeviceSegment& seg   = whole();
-        const cudaStream_t s = seg.device->stream;
-        upload_pinned(seg.io_device.p, io_host_.data(), io_layout_.ngram, s);
-        seg.residency->before_round(s, /*landing=*/true);
+    bool run_decode(std::int32_t batch, bool gated, GateRelease& release_gate, HandoffRelease& release_handoff,
+                    const std::function<void()>& read_rows) {
+        return launch_round(batch, 1, false, gated, release_gate, release_handoff, read_rows);
+    }
+
+    // Holds `stream` for `ms` milliseconds before its next work (a host function that sleeps): the
+    // testing::delay_next_round hook, which makes a gated handoff time out.
+    static void CUDART_CB sleep_host(void* data) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(reinterpret_cast<std::uintptr_t>(data)));
+    }
+    static void delay_stream(cudaStream_t stream, std::uint32_t ms) {
+        CUDA_CHECK(cudaLaunchHostFunc(stream, &sleep_host, reinterpret_cast<void*>(static_cast<std::uintptr_t>(ms))));
+    }
+
+    // The graph of `seg` for a decode (width 1) or verification round of `batch` rows.
+    DecodeGraph& round_graph(DeviceSegment& seg, std::int32_t batch, std::int32_t width, bool verify) {
+        if (!verify) { return seg.graphs[static_cast<std::size_t>(batch - 1)]; }
+        return seg.verify_graphs[static_cast<std::size_t>(batch - 1) * max_width_ + (width - 1)];
+    }
+
+    // Whether every segment's graph of the round is replayed (none warms or captures): a gated
+    // round reads its n-gram rows after the launch only then (a warm run's one-time setup may wait
+    // on the host, which would then never publish the rows).
+    bool round_replayed(std::int32_t batch, std::int32_t width, bool verify) {
+        return std::all_of(segments_.begin(), segments_.end(), [&](const auto& segment) {
+            return round_graph(*segment, batch, width, verify).executable.ready();
+        });
+    }
+
+    // Launches a decode (width 1) or verification round of `batch` rows over the staged io: segment
+    // by segment in layer order, each with its device current (SegmentWork) and its own graph family
+    // (replay: warmed, captured and replayed on its stream). Each segment uploads the io prefix (the
+    // head also the round's acceptance arrays), opens its expert cache's round with landing frames,
+    // runs its layers between its boundaries and enqueues its route download. The handoff of each
+    // boundary (core/handoff.h): Event: the sender records `sent` after its graph and the receiver's
+    // stream waits for it before its own; Gate: no host step between them, the receiver's graph
+    // starts with its bounded gate (release_handoff publishes the round's word if the host unwinds
+    // after that). A gated round's n-gram gate is armed (release_gate) once the PLE segment's graph
+    // is launched; with the gate handoff and a PLE segment before the head, its rows are read right
+    // after that launch (read_rows), so a later segment's bounded gate does not wait on the host's
+    // reads. Returns whether the rows were read here; otherwise the caller reads them after the
+    // head's work is enqueued, as an unsplit round does.
+    bool launch_round(std::int32_t batch, std::int32_t width, bool verify, bool gated, GateRelease& release_gate,
+                      HandoffRelease& release_handoff, const std::function<void()>& read_rows) {
+        const bool split    = segments_.size() > 1;
+        const std::int32_t columns = batch * width;
+        const std::uint32_t word   = split ? next_handoff_word() : 0U;
+        // Test hook (testing::delay_next_round): the first segment's graph starts late.
+        const std::uint32_t delay_ms       = split ? testing::take_round_delay() : 0U;
         const execution::NgramRowGate gate = row_gate();
-        replay(seg, seg.graphs[static_cast<std::size_t>(batch - 1)],
-               [&] { forward_call(seg, batch, 1, batch, nullptr, nullptr, nullptr, &gate); });
-        seg.residency->enqueue_route_download(s, batch);
+        bool read = false;
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg = *segment;
+            const SegmentWork on(*this, seg);
+            const cudaStream_t s = seg.device->stream;
+            upload_pinned(seg.io_device.p, io_host_.data(), io_layout_.ngram, s);
+            if (verify && seg.spec.head) {
+                upload_pinned(head().spec_device.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
+            }
+            seg.residency->before_round(s, /*landing=*/true);
+            if (seg.in != nullptr && handoff_ == HandoffMode::Event) { seg.in->wait_sent(s); }
+            if (&seg == &first() && delay_ms != 0) { delay_stream(s, delay_ms); }
+            replay(seg, round_graph(seg, batch, width, verify), [&] {
+                if (!verify) {
+                    forward_call(seg, batch, 1, batch, nullptr, nullptr, nullptr, &gate);
+                    return;
+                }
+                const execution::ForwardVerify view = verify_view(seg, batch, width);
+                forward_call(seg, batch, width, columns, &view, nullptr, nullptr, &gate);
+            });
+            // From here an enqueued gate waits for its word: an error before the word is published
+            // still publishes it (over zeroed rows or a stale residual), so the streams drain and
+            // the error keeps its class.
+            if (gated && &seg == &ple()) { release_gate.owner = this; }
+            if (seg.out != nullptr && handoff_ == HandoffMode::Event) { seg.out->record_sent(s); }
+            if (seg.in != nullptr && handoff_ == HandoffMode::Gate) {
+                release_handoff.owner = this;
+                release_handoff.word  = word;
+            }
+            seg.residency->enqueue_route_download(s, columns);
+            if (!split) { continue; }
+            seg.device->flush();
+            if (handoff_ == HandoffMode::Gate && gated && &seg == &ple() && &seg != &head()) {
+                read_rows();
+                release_gate.owner = nullptr;
+                read = true;
+            }
+        }
+        return read;
     }
 
     // Runs a fixed-address round: the first time eagerly (the Ops' one-time setup), the second
@@ -3202,12 +4129,18 @@ private:
                       free_before, trace_free());
     }
 
+    // One segment's share of a call through its Forward's run(): the whole call without a split; in a
+    // split a decode or verification round's share, which receives the residual from the previous
+    // segment and sends it to the next through their HandoffChannels in the round's handoff mode (its
+    // word in the segment's io). The n-gram gate is the PLE segment's, the logits and the drafter's
+    // residual export the head's.
     void forward_call(DeviceSegment& seg, std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
                       bool streamed = false) {
-        execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(seg.io_device.p), batch, width, logit_columns);
-        fb.ngram_gate    = gate;
+        auto* io                   = static_cast<std::byte*>(seg.io_device.p);
+        execution::ForwardBatch fb = io_batch(io, batch, width, logit_columns);
+        fb.ngram_gate    = &seg == &ple() ? gate : nullptr;
         fb.verify        = verify;
         fb.mtp_chunk     = chunk;
         fb.layer_waits   = prefix_.waits_for(seg.spec.index);
@@ -3217,9 +4150,17 @@ private:
         fb.vision        = vision;
         fb.stream        = streamed;
         fb.split         = streamed && seg.split_call;
+        fb.handoff       = handoff_;
+        fb.handoff_word  = reinterpret_cast<const std::uint32_t*>(io + io_layout_.handoff);
         // Decode and verification rounds export their final residuals for the MTP catch-up.
         const std::int32_t cols = batch * width;
-        if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(seg.mtp_residuals.p, DType::BF16, {width_, cols}); }
+        if (mtp_ && chunk == nullptr && seg.spec.head) {
+            fb.residual_out = Tensor(seg.mtp_residuals.p, DType::BF16, {width_, cols});
+        }
+        if (!seg.spec.head) {
+            seg.forward->run(fb, nullptr);
+            return;
+        }
         Tensor logits(seg.logits32.p, DType::FP32, {vocab_, logit_columns});
         seg.forward->run(fb, logits);
     }
@@ -3247,17 +4188,22 @@ private:
     }
 
     // ---------------------------------------------------------------- speculative verification
+    // A segment's verification records (its layers', the PLE's on its segment) and round arrays; the
+    // host side of the round with the head's.
     void allocate_verification(DeviceSegment& seg, std::int32_t lanes, std::uint64_t& allocated) {
         allocate(seg.records_backing, seg.plan.records_bytes, allocated);
-        seg.records = GdnReplayRecords(DeviceSpan{seg.records_backing.p, seg.records_backing.bytes}, seg.plan.records);
+        if (seg.spec.gdn_count > 0) {
+            seg.records = GdnReplayRecords(DeviceSpan{seg.records_backing.p, seg.records_backing.bytes}, seg.plan.records);
+        }
         allocate(seg.ple_records, seg.plan.ple_records, allocated);
         allocate(seg.qsa_records, seg.plan.qsa_records, allocated);
         seg.folds.resize(static_cast<std::size_t>(max_width_) + 1);
         seg.verify_graphs.resize(static_cast<std::size_t>(lanes) * max_width_);
         const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
+        allocate(seg.spec_device, 4ULL * seg.plan.spec.words, allocated);
+        if (!seg.spec.head) { return; }
         spec_layout_ = seg.plan.spec;
-        allocate(seg.spec_device, 4ULL * spec_layout_.words, allocated);
-        spec_host_ = PinnedHostBuffer(4ULL * spec_layout_.words);
+        spec_host_   = PinnedHostBuffer(4ULL * spec_layout_.words);
         pending_tokens_.assign(cells, 0);
         live_.assign(cells, 0);
         proposer_tokens_ = std::bit_ceil(std::max<std::size_t>(64, options_.max_context + 64ULL));
@@ -3268,11 +4214,15 @@ private:
         return static_cast<std::int32_t*>(head().spec_device.p) + offset;
     }
 
+    // The segment's records: its GDN layers', the PLE's (its segment's), its attention layers' keys.
     execution::ForwardVerify verify_view(const DeviceSegment& seg, std::int32_t batch, std::int32_t width) const {
         execution::ForwardVerify v;
-        v.gdn        = seg.records.narrowed(width);
-        v.ple_inputs = Tensor(seg.ple_records.p, DType::BF16, {width_, width, batch});
-        v.qsa_keys   = Tensor(seg.qsa_records.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
+        // A split's segment may have no GDN layers (K = 47), no attention layers (K <= 3) and no PLE.
+        if (seg.spec.gdn_count > 0) { v.gdn = seg.records.narrowed(width); }
+        if (seg.spec.ple) { v.ple_inputs = Tensor(seg.ple_records.p, DType::BF16, {width_, width, batch}); }
+        if (seg.spec.attention_count > 0) {
+            v.qsa_keys = Tensor(seg.qsa_records.p, DType::BF16, {di_, width, batch, dim(seg.spec.attention_count)});
+        }
         return v;
     }
 
@@ -3295,10 +4245,9 @@ private:
     PendingBatch verify(std::span<const SequenceHandle> sequences, std::span<const std::uint32_t> lanes,
                         std::span<const std::int32_t> positions, std::int32_t width,
                         std::span<const std::int32_t> staged, Clock::time_point start) {
-        DeviceSegment& seg   = whole();
-        const cudaStream_t s = seg.device->stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::int32_t W = width, K = width - 1;
+        before_restage();
         auto* ids     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
         auto* pos     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         auto* columns = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.columns);
@@ -3328,26 +4277,21 @@ private:
             }
         };
         const std::uint32_t word = next_gate_word();
-        DecodeGraph& graph = seg.verify_graphs[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
-        const bool gated   = graph.executable.ready();
+        const bool gated         = round_replayed(batch, W, true);
         if (!gated) {
             read_rows();
             publish_pinned_word(gate_ready(), word);
         }
-        upload_pinned(seg.io_device.p, io_host_.data(), io_layout_.ngram, s);
-        upload_pinned(head().spec_device.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
-        seg.residency->before_round(s, /*landing=*/true);
-        const execution::NgramRowGate gate = row_gate();
-        replay(seg, graph, [&] {
-            const execution::ForwardVerify view = verify_view(seg, batch, W);
-            forward_call(seg, batch, W, batch * W, &view, nullptr, nullptr, &gate);
-        });
-        // From here an enqueued gate waits for `word`: an error before it is published still
-        // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
-        seg.residency->enqueue_route_download(s, batch * W);
+        // An enqueued gate waits for `word`: an error before it is published still publishes it
+        // (over zeroed rows), so the streams drain and the error keeps its class.
+        GateRelease release_gate{nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
+        HandoffRelease release_handoff;
+        const bool rows_read = launch_round(batch, W, true, gated, release_gate, release_handoff,
+                                            [&] { read_behind_gate(lanes_[lanes[0]], word, read_rows); });
 
-        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
+        // Acceptance on the head's device, from BF16-rounded logits as in plain decode (design 16.5).
+        const SegmentWork on_head(*this, head());
+        const cudaStream_t s = head().device->stream;
         Tensor wide(head().logits32.p, DType::FP32, {vocab_, batch * W});
         Tensor narrow(head().logits16.p, DType::BF16, {vocab_, batch * W});
         ops::cast_fp32_to_bf16(wide, narrow, s);
@@ -3378,12 +4322,14 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
-        if (gated) {
+        if (gated && !rows_read) {
             read_behind_gate(lanes_[lanes[0]], word, read_rows);
             release_gate.owner = nullptr;
         }
         synchronize();
+        release_handoff.owner = nullptr; // every segment has synchronized
         check_expert_error();
+        hash_logits("verify", lanes[0], positions[0], W, batch * W);
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -3448,15 +4394,17 @@ private:
     // Commits a verification round: each row keeps its first accepted_tokens licensed tokens, so
     // the model state advances by that many columns (the anchor and the accepted drafts before the
     // last kept token). The GDN fold, the QSA tails and the PLE history replay those columns' records.
+    // Each segment commits its own layers on its stream, from its copy of the round's io and the commit
+    // counts uploaded to it: its GDN layers' fold, its attention layers' QSA tails, the PLE history on
+    // the PLE segment; then the drafter's catch-up on the head.
     CommitResult commit_verified(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
-        DeviceSegment& seg   = whole();
-        const cudaStream_t s = seg.device->stream;
         const auto rows      = ContractAccess::rows(pending);
         const auto batch     = static_cast<std::int32_t>(rows.size());
         const std::int32_t W = round_width_;
         CommitResult out;
         out.row_count = rows.size();
         std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
+        before_restage();
         std::int32_t* commit = spec_host(spec_layout_.commit);
         for (std::int32_t row = 0; row < batch; ++row) {
             const auto index = ContractAccess::lane(rows[row]);
@@ -3489,21 +4437,32 @@ private:
                 out.rows[row].disposition = runtime::CommitDisposition::Active;
             }
         }
-        upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
-        fold(seg, W).execute(
-            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
-        auto* io = static_cast<std::byte*>(seg.io_device.p);
-        const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
-        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
-        const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
-        const auto layers = dim(c_.attention_layers);
-        Tensor tails(seg.tails_backing.p, DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), layers});
-        ops::qsa_commit_tails(Tensor(seg.qsa_records.p, DType::BF16, {di_, W, batch, layers}), positions, commit_columns,
-                              tails, slots, execution::qsa_geometry(c_), s);
-        Tensor ple_states(ple().ple_backing.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
-        ops::ple_conv_commit(Tensor(ple().ple_records.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
-                             slots, ple().device->stream);
-        if (mtp_) { mtp_catch_up(rows, W, commit); }
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg = *segment;
+            const SegmentWork on(*this, seg);
+            const cudaStream_t s = seg.device->stream;
+            auto* commit_device  = static_cast<std::int32_t*>(seg.spec_device.p) + spec_layout_.commit;
+            upload_pinned(commit_device, commit, 4ULL * batch, s);
+            if (seg.spec.gdn_count > 0) {
+                fold(seg, W).execute(
+                    std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
+            }
+            auto* io = static_cast<std::byte*>(seg.io_device.p);
+            const Tensor commit_columns(commit_device, DType::I32, {batch});
+            const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+            const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
+            if (const auto layers = dim(seg.spec.attention_count); layers > 0) {
+                Tensor tails(seg.tails_backing.p, DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), layers});
+                ops::qsa_commit_tails(Tensor(seg.qsa_records.p, DType::BF16, {di_, W, batch, layers}), positions,
+                                      commit_columns, tails, slots, execution::qsa_geometry(c_), s);
+            }
+            if (seg.spec.ple) {
+                Tensor ple_states(seg.ple_backing.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
+                ops::ple_conv_commit(Tensor(seg.ple_records.p, DType::BF16, {width_, W, batch}), commit_columns,
+                                     ple_states, slots, s);
+            }
+            if (seg.spec.head && mtp_) { mtp_catch_up(rows, W, commit); }
+        }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::int32_t row = 0; row < batch; ++row) {
             if (!decisions[static_cast<std::size_t>(row)].cancelled) {
@@ -3667,6 +4626,9 @@ private:
         }
         // Without drafts (a gated or zero-length round) only unwritten pending cells need the drafter.
         if (!any || (steps == 0 && !unwritten)) { return; }
+        // The drafter runs on the head, before the round's segments.
+        const SegmentWork on_head(*this, head());
+        before_restage();
         auto* slots = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
         auto* rows  = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -3776,8 +4738,10 @@ private:
     // After a verification round's commit: the drafter's cells of the verified window from its
     // residuals and committed tokens (index-key tails advance by the committed count), and each
     // row's last committed residual becomes its pending cell, already written.
+    // With the head's device current (its SegmentWork).
     void mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
         const cudaStream_t s = head().device->stream;
+        before_restage();
         const auto batch     = static_cast<std::int32_t>(rows.size());
         const std::size_t column = 2ULL * width_;
         auto* io = static_cast<std::byte*>(head().io_device.p);
@@ -3805,8 +4769,9 @@ private:
                                  .width       = W,
                                  .kv_only     = true,
                                  .key_records = Tensor(head().mtp_records.p, DType::BF16, {di_, W, batch})});
-        Tensor tails(static_cast<std::byte*>(head().tails_backing.p) +
-                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * options_.max_concurrency * 2,
+        // The MTP block's tail slab follows the head's attention layers' (the whole model's unsplit).
+        Tensor tails(static_cast<std::byte*>(head().tails_backing.p) + static_cast<std::size_t>(head().spec.attention_count) *
+                                                                         di_ * (r_ - 1) * options_.max_concurrency * 2,
                      DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), 1});
         ops::qsa_commit_tails(Tensor(head().mtp_records.p, DType::BF16, {di_, W, batch, 1}),
                               positions.view({W, batch}), Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}),
@@ -3827,6 +4792,7 @@ private:
     // `before_wait` runs on the host after the sampling work is queued, before its wait.
     void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
                 const std::function<void()>& before_wait = {}) {
+        const SegmentWork on(*this, head());
         const cudaStream_t s = head().device->stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         Tensor wide(head().logits32.p, DType::FP32, {vocab_, batch});
@@ -3835,7 +4801,9 @@ private:
         // (design §16.5).
         ops::cast_fp32_to_bf16(wide, narrow, s);
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
-        auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
+        // Its own pinned staging, not the io image's positions: a split's later segments upload the io
+        // only once the earlier ones have run, so the call's io copies may still be queued here.
+        auto* sample_positions = static_cast<std::int32_t*>(host_sample_pos_.data());
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
             configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
@@ -4001,7 +4969,19 @@ private:
         diagnostic(text, DiagnosticLevel::Debug);
         std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
                       fixed ? " (fixed)" : " measured");
-        diagnostic(text);
+        std::string line = segment_name(seg) + text;
+        if (segments_.size() > 1) {
+            // A split's segment follows its link's policy (promotes_in_rounds, the CPU port's jobs,
+            // the warm start's seed share).
+            std::snprintf(text, sizeof(text),
+                          "; %s; decode misses kept on the link: 1/%d, at most %u CPU jobs per layer call; warm "
+                          "start seeds %.0f%% of the frames",
+                          seg.policy.promotions == PromotionPolicy::Dynamic ? "the expert cache promotes during requests"
+                                                                            : "no promotions during requests (slow link)",
+                          pcie_divisor(seg), seg.policy.cpu_jobs, 100.0 * seg.policy.seed_share);
+            line += text;
+        }
+        diagnostic(line);
     }
 
     // Rescales the link-bound costs once every segment has measured its link: the prefix cost's
@@ -4036,7 +5016,12 @@ private:
     }
 
 public:
-    [[nodiscard]] double link_bytes_per_second() const { return whole().policy.bytes_per_second; }
+    // The slowest segment's link (the whole model's without a split).
+    [[nodiscard]] double link_bytes_per_second() const {
+        double rate = head().policy.bytes_per_second;
+        for (const auto& segment : segments_) { rate = std::min(rate, segment->policy.bytes_per_second); }
+        return rate;
+    }
 
 private:
     // ---- elastic KV (design §19.3.11) ----
@@ -4068,46 +5053,84 @@ private:
 
     // Raises the pool's backed pages so `need` pages are available, taking the memory from the expert
     // frames (never below three quarters of them). False when it cannot: a lease holds the frames, or
-    // the pool is at its capacity.
+    // the pool is at its capacity. A split grows every segment's planes in lockstep (the head's pool
+    // hands out the pages, every segment's tables index them), each segment from its own device's
+    // frames; the growth fails, and every segment keeps its frames, when one segment cannot grow.
     bool grow_kv(std::uint32_t need) {
-        DeviceSegment& seg = whole();
-        if (!seg.kv_vmm || seg.pool->available_pages() >= need) { return seg.pool->available_pages() >= need; }
-        const std::uint32_t backed = seg.pool->backed_pages();
-        std::uint32_t target       = backed + (need - seg.pool->available_pages());
-        target = std::min(seg.pool->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
-        if (target - backed < need - seg.pool->available_pages()) { return false; }
+        DeviceSegment& top = head();
+        if (!top.kv_vmm || top.pool->available_pages() >= need) { return top.pool->available_pages() >= need; }
+        const std::uint32_t backed = top.pool->backed_pages();
+        std::uint32_t target       = backed + (need - top.pool->available_pages());
+        target = std::min(top.pool->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
+        if (target - backed < need - top.pool->available_pages()) { return false; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        const std::size_t added    = kv_mapped_bytes(seg.plan, target) - seg.kv_vmm->mapped_bytes();
-        const std::uint64_t stride = seg.residency->frame_stride();
-        const std::uint32_t frames = seg.residency->frames();
-        // Memory the sizing function would give the frames anyway comes first; the rest is taken from
-        // the frames, one frame chunk over so the pool unmaps at least that much.
-        const std::uint32_t spare =
-            seg.control ? std::max<std::uint32_t>(seg.control->target(seg.vram->query(), seg.pool_now), frames) - frames
-                        : 0;
-        const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
-        std::uint32_t give              = 0;
-        if (added > spare_bytes) {
-            give = static_cast<std::uint32_t>((added - spare_bytes + ExpertResidency::kChunkBytes + stride - 1) / stride);
+        // Per segment with KV: the bytes its planes map, its frames before, and the frames it gives.
+        struct Growth {
+            DeviceSegment* seg  = nullptr;
+            std::size_t added   = 0;
+            std::uint32_t frames = 0, give = 0;
+        };
+        std::vector<Growth> growth;
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg = *segment;
+            if (!seg.pool) { continue; } // no attention layers
+            const DeviceGuard on(seg.device->device);
+            const std::size_t added    = kv_mapped_bytes(seg.plan, target) - seg.kv_vmm->mapped_bytes();
+            const std::uint64_t stride = seg.residency->frame_stride();
+            const std::uint32_t frames = seg.residency->frames();
+            // Memory the sizing function would give the frames anyway comes first; the rest is taken
+            // from the frames, one frame chunk over so the pool unmaps at least that much.
+            const std::uint32_t spare =
+                seg.control
+                    ? std::max<std::uint32_t>(seg.control->target(seg.vram->query(), seg.pool_now), frames) - frames
+                    : 0;
+            const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
+            std::uint32_t give              = 0;
+            if (added > spare_bytes) {
+                give = static_cast<std::uint32_t>((added - spare_bytes + ExpertResidency::kChunkBytes + stride - 1) /
+                                                  stride);
+            }
+            if (give > frames / 4) { return false; } // grow by at most a quarter of the cache at once
+            growth.push_back({.seg = &seg, .added = added, .frames = frames, .give = give});
         }
-        if (give > frames / 4) { return false; } // grow by at most a quarter of the cache at once
-        seg.device->synchronize();
-        if (give != 0) {
-            const auto resized = seg.residency->resize(frames - give, seg.device->stream, *seg.vram);
-            if (resized.frames > frames - give) { return false; } // a lease holds the frames
+        synchronize();
+        // The frames of the segments before `n` that gave some come back.
+        const auto undo = [&](std::size_t n) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const Growth& g = growth[i];
+                if (g.give == 0) { continue; }
+                const DeviceGuard on(g.seg->device->device);
+                (void)g.seg->residency->resize(g.frames, g.seg->device->stream, *g.seg->vram);
+            }
+        };
+        for (std::size_t i = 0; i < growth.size(); ++i) {
+            const Growth& g = growth[i];
+            if (g.give == 0) { continue; }
+            const DeviceGuard on(g.seg->device->device);
+            const auto resized = g.seg->residency->resize(g.frames - g.give, g.seg->device->stream, *g.seg->vram);
+            if (resized.frames > g.frames - g.give) { // a lease holds the frames
+                undo(i);
+                return false;
+            }
         }
-        if (!map_kv(seg, target)) {
-            if (give != 0) { (void)seg.residency->resize(frames, seg.device->stream, *seg.vram); }
-            return false;
+        for (const Growth& g : growth) {
+            const DeviceGuard on(g.seg->device->device);
+            if (!map_kv(*g.seg, target)) {
+                undo(growth.size());
+                return false;
+            }
         }
-        seg.pool->set_backed_pages(target);
+        for (const Growth& g : growth) {
+            DeviceSegment& seg = *g.seg;
+            seg.pool->set_backed_pages(target);
+            if (seg.control) { seg.control->account_fixed(static_cast<std::int64_t>(g.added)); }
+            seg.frames_now = seg.residency->frames();
+            seg.pool_now   = seg.residency->pool_bytes();
+            diagnostic(segment_name(seg) + "KV pool grew to " + std::to_string(target) + " pages (" +
+                       std::to_string(seg.kv_vmm->mapped_bytes() >> 20) + " MiB); expert cache " +
+                       std::to_string(g.frames) + " -> " + std::to_string(seg.residency->frames()) + " frames");
+        }
         kv_grown_.store(true);
-        if (seg.control) { seg.control->account_fixed(static_cast<std::int64_t>(added)); }
-        seg.frames_now = seg.residency->frames();
-        seg.pool_now   = seg.residency->pool_bytes();
-        diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
-                   std::to_string(seg.kv_vmm->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(seg.residency->frames()) + " frames");
         return true;
     }
 
@@ -4118,39 +5141,46 @@ private:
     // conversation that has ended gives its memory back to the frames. The delay keeps a follow-up
     // turn from paying a restore and an expert reload for memory the idle gap never used.
     void shrink_kv(bool evict = false) {
-        DeviceSegment& seg = whole();
-        if (!seg.kv_vmm || seg.pool->backed_pages() <= seg.plan.kv_base_pages) { return; }
+        DeviceSegment& top = head();
+        if (!top.kv_vmm || top.pool->backed_pages() <= top.plan.kv_base_pages) { return; }
         if (evict && prefix_.cache) {
             runtime::prefix_cache::PrefixCacheIndex& index = prefix_.cache->index();
-            for (std::uint32_t budget = seg.pool->backed_pages() - seg.plan.kv_base_pages;
-                 budget != 0 && !seg.pool->can_back(seg.plan.kv_base_pages) && index.evict_backed_device_blocks(1) != 0;
+            for (std::uint32_t budget = top.pool->backed_pages() - top.plan.kv_base_pages;
+                 budget != 0 && !top.pool->can_back(top.plan.kv_base_pages) && index.evict_backed_device_blocks(1) != 0;
                  --budget) {}
         }
-        std::uint32_t target = seg.pool->backed_pages();
-        while (target > seg.plan.kv_base_pages && seg.pool->can_back(target - std::min(target, kKvGrowPages))) {
+        std::uint32_t target = top.pool->backed_pages();
+        while (target > top.plan.kv_base_pages && top.pool->can_back(target - std::min(target, kKvGrowPages))) {
             target -= std::min(target, kKvGrowPages);
         }
-        target = std::max(target, seg.plan.kv_base_pages);
-        if (target == seg.pool->backed_pages()) { return; }
+        target = std::max(target, top.plan.kv_base_pages);
+        if (target == top.pool->backed_pages()) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        seg.device->synchronize();
-        const std::size_t before = seg.kv_vmm->mapped_bytes();
-        seg.pool->set_backed_pages(target);
-        const auto need = kv_chunks(seg.plan, target);
-        for (std::size_t c = 0; c < need.size(); ++c) {
-            if (!need[c] && seg.kv_vmm->mapped(c)) { seg.kv_vmm->unmap(c); }
+        synchronize();
+        // Every segment's planes in lockstep (another segment's pool never hands out pages, so it can
+        // always lower its limit with the head's).
+        for (const auto& segment : segments_) {
+            DeviceSegment& seg = *segment;
+            if (!seg.pool) { continue; }
+            const DeviceGuard on(seg.device->device);
+            const std::size_t before = seg.kv_vmm->mapped_bytes();
+            seg.pool->set_backed_pages(target);
+            const auto need = kv_chunks(seg.plan, target);
+            for (std::size_t c = 0; c < need.size(); ++c) {
+                if (!need[c] && seg.kv_vmm->mapped(c)) { seg.kv_vmm->unmap(c); }
+            }
+            const std::size_t freed    = before - seg.kv_vmm->mapped_bytes();
+            const std::uint64_t stride = seg.residency->frame_stride();
+            const std::uint32_t frames = seg.residency->frames();
+            (void)seg.residency->resize(frames + static_cast<std::uint32_t>(freed / stride), seg.device->stream,
+                                        *seg.vram);
+            if (seg.control) { seg.control->account_fixed(-static_cast<std::int64_t>(freed)); }
+            seg.frames_now = seg.residency->frames();
+            seg.pool_now   = seg.residency->pool_bytes();
+            diagnostic(segment_name(seg) + "KV pool shrank to " + std::to_string(target) + " pages; expert cache " +
+                       std::to_string(frames) + " -> " + std::to_string(seg.residency->frames()) + " frames");
         }
-        kv_grown_.store(target > seg.plan.kv_base_pages);
-        const std::size_t freed    = before - seg.kv_vmm->mapped_bytes();
-        const std::uint64_t stride = seg.residency->frame_stride();
-        const std::uint32_t frames = seg.residency->frames();
-        (void)seg.residency->resize(frames + static_cast<std::uint32_t>(freed / stride), seg.device->stream,
-                                    *seg.vram);
-        if (seg.control) { seg.control->account_fixed(-static_cast<std::int64_t>(freed)); }
-        seg.frames_now = seg.residency->frames();
-        seg.pool_now   = seg.residency->pool_bytes();
-        diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(seg.residency->frames()) + " frames");
+        kv_grown_.store(target > top.plan.kv_base_pages);
     }
 
     // ---- /v1/decide (constraint.cpp) ----
@@ -4225,7 +5255,7 @@ private:
     std::int32_t constraint_columns_ = 0; // the staged round's columns
     std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
-    PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
+    PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_sample_pos_{1}, host_configs_{1};
     IoLayout io_layout_;
     // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
@@ -4313,11 +5343,15 @@ private:
         const DeviceSegment& segment_;
     };
 
-    // The device segments in layer order (device_segment.h): one, covering every layer. Declared
-    // after the host objects their expert caches, Forwards and VRAM monitors read (the SSD tier and
-    // its fetch channel, the expert error word, the CPU expert service, the route trace, the VRAM
-    // mutex, the waker and the KV idle clock), and before the lanes and the prefix cache, whose page
-    // leases return to a segment's pool.
+    // A layer split's boundaries, one per pair of consecutive segments (DeviceSegment::in, out and
+    // bulk_out point at them): declared before the segments, whose Forwards and streams use them.
+    std::vector<std::unique_ptr<HandoffChannel>> channels_;
+    std::vector<std::unique_ptr<BulkHandoff>> bulk_;
+    // The device segments in layer order (device_segment.h): one covering every layer, or a layer
+    // split's. Declared after the host objects their expert caches, Forwards and VRAM monitors read
+    // (the SSD tier and its fetch channel, the expert error word, the CPU expert service, the route
+    // trace, the boundaries, the VRAM mutex, the waker and the KV idle clock), and before the lanes
+    // and the prefix cache, whose page leases return to a segment's pool.
     std::vector<std::unique_ptr<DeviceSegment>> segments_;
     // Each segment's frame sizing at construction (DeviceSegment::sizing), contiguous in segment order.
     std::vector<VramSizing> segment_sizing_;
@@ -4368,6 +5402,11 @@ private:
     // wait statistics.
     PinnedHostBuffer gate_host_{64};
     std::uint32_t gate_sequence_ = 0;
+    // A layer split's rounds: how the residual crosses each boundary (ProgramOptions::handoff), the
+    // last round word staged (next_handoff_word) and INFERNIX_SPLIT_SYNC (before_restage).
+    HandoffMode handoff_            = HandoffMode::Event;
+    std::uint32_t handoff_sequence_ = 0;
+    bool split_sync_                = false;
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

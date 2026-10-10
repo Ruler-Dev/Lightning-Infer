@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/program/program_impl.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <mutex>
 
 namespace infernix::models::qwen4_exp {
 
@@ -17,8 +19,18 @@ ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
 ResumeState::~ResumeState()                                 = default;
 std::uint32_t ResumeState::frontier() const noexcept { return impl_ ? impl_->target : 0U; }
 
-Program::Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
-    : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {}
+Program::Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options) {
+    const execution::Parameters* const segment_parameters[] = {&parameters};
+    DeviceContext* const devices[]                         = {&device};
+    const Config& config                                   = parameters.model.config();
+    impl_ = std::make_unique<detail::ProgramImpl>(segment_parameters, devices,
+                                                  SegmentMap::single(config.text, config.mtp, device.device),
+                                                  std::move(options));
+}
+
+Program::Program(std::span<const execution::Parameters* const> parameters, std::span<DeviceContext* const> devices,
+                 const SegmentMap& map, ProgramOptions options)
+    : impl_(std::make_unique<detail::ProgramImpl>(parameters, devices, map, std::move(options))) {}
 
 Program::~Program() noexcept = default;
 
@@ -161,6 +173,37 @@ bool take_expert_fault() noexcept {
         if (g_expert_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
     }
     return false;
+}
+
+namespace {
+std::atomic<std::uint32_t> g_round_delay{0};
+} // namespace
+
+void delay_next_round(std::uint32_t milliseconds) noexcept { g_round_delay.store(milliseconds); }
+
+std::uint32_t take_round_delay() noexcept { return g_round_delay.exchange(0); }
+
+namespace {
+std::mutex g_logits_hash_mutex;
+std::filesystem::path g_logits_hash;
+} // namespace
+
+void set_logits_hash(std::filesystem::path path) {
+    const std::lock_guard lock(g_logits_hash_mutex);
+    g_logits_hash = std::move(path);
+}
+
+std::filesystem::path logits_hash() {
+    {
+        const std::lock_guard lock(g_logits_hash_mutex);
+        if (!g_logits_hash.empty()) { return g_logits_hash; }
+    }
+#ifdef _WIN32
+    if (const wchar_t* path = _wgetenv(L"INFERNIX_LOGITS_HASH"); path != nullptr && *path != L'\0') { return path; }
+#else
+    if (const char* path = std::getenv("INFERNIX_LOGITS_HASH"); path != nullptr && *path != '\0') { return path; }
+#endif
+    return {};
 }
 
 } // namespace testing

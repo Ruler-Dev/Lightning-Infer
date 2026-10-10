@@ -46,6 +46,7 @@ class Parameters;
 }
 
 struct SegmentSpec;
+class SegmentMap;
 
 namespace detail {
 class ProgramImpl;
@@ -465,24 +466,48 @@ struct ProgramOptions {
     // graph executable's device memory are appended to this file for the expert-cache replay and
     // the graph-memory measurement (program/route_trace.h). Changes no result.
     std::filesystem::path route_trace;
+    // Internal (tests and split checks; INFERNIX_LOGITS_HASH, testing::logits_hash): when set, every
+    // call and round that computes logits (prefill and forced-token calls, decode and verification
+    // rounds) appends one line with the FNV-1a of the head's FP32 logits to this file, so runs that
+    // must agree bit for bit (a layer split and the unsplit Program) can be compared call by call.
+    // Changes no result; each such call waits for its logits.
+    std::filesystem::path logits_hash;
+    // A layer split (more than one segment): how decode and verification rounds hand the residual
+    // across a boundary (EngineOptions::split_handoff, Auto taken as Event; Gate needs the segments
+    // on different GPUs) and the bound of a gated handoff's wait, past which the round fails with a
+    // RecoverableExecutionError.
+    SplitHandoff handoff            = SplitHandoff::Event;
+    std::uint32_t handoff_timeout_ms = kDefaultHandoffTimeoutMs;
 };
 
 class Program {
 public:
     // One device segment: the whole model on `device`.
     Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options);
+    // A layer split (segment_map.h): segment s of `map` runs on devices[s] with parameters[s], the
+    // Parameters prepared for its layers and role (Parameters(model, range, role)) on that device.
+    // Two segments may name one device (separate contexts: the same-device test mode, whose segments'
+    // work never overlaps on the GPU). The eager calls (prefill, forced tokens, the first token) and
+    // the rounds (decode, the MTP drafter on the head, verification, their commits) run across the
+    // segments, the rounds with one CUDA graph family per segment and the residual handed over in
+    // ProgramOptions::handoff's mode. The prefix cache and the SSD expert tier are refused
+    // (split_capabilities.h), and so is the gate handoff when the segments share a GPU.
+    Program(std::span<const execution::Parameters* const> parameters, std::span<DeviceContext* const> devices,
+            const SegmentMap& map, ProgramOptions options);
     ~Program() noexcept;
 
     // The device plan of a Program with these options over a model with this configuration and
     // public token count; validates the options.
     [[nodiscard]] static ProgramDevicePlan plan_device(const ProgramOptions& options, const Config& config,
                                                        std::uint32_t public_tokens);
-    // The device plan of one segment of a Program (segment_map.h); plan_device is the whole model's
-    // segment's. Only the whole model's segment can be planned until split execution.
+    // The device plan of one segment of a Program (segment_map.h): its layers' state, records and KV,
+    // and the buffers of its roles; plan_device is the whole model's segment's.
     [[nodiscard]] static ProgramDevicePlan plan_segment(const ProgramOptions& options, const Config& config,
                                                         std::int32_t public_tokens, const SegmentSpec& segment);
+    // The first segment's plan (the whole model's without a split).
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
-    // How the expert frames were sized at construction.
+    // How the first segment's expert frames were sized at construction (the whole model's without a
+    // split; segment_vram_sizing has every segment's).
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
     // How each segment's expert frames were sized at construction, in segment order (an unsplit
     // Program's one entry is vram_sizing()).
@@ -642,6 +667,16 @@ namespace testing {
 void set_expert_fault(std::uint32_t checks) noexcept;
 // Consumes one check; true on the armed one.
 [[nodiscard]] bool take_expert_fault() noexcept;
+// The process-wide logits-hash file that construct_qwen4_exp passes to ProgramOptions::logits_hash:
+// the path set here, else INFERNIX_LOGITS_HASH, else none. For engine-level tests and split checks.
+void set_logits_hash(std::filesystem::path path);
+[[nodiscard]] std::filesystem::path logits_hash();
+// Handoff-timeout injection for layer-split tests: the next decode or verification round of a split
+// Program (process-wide) holds its first segment's stream `milliseconds` before that segment's
+// graph, so a gated handoff into the next segment outlasts its bound. 0 disarms.
+void delay_next_round(std::uint32_t milliseconds) noexcept;
+// Consumes the armed delay (0 when none).
+[[nodiscard]] std::uint32_t take_round_delay() noexcept;
 } // namespace testing
 
 } // namespace infernix::models::qwen4_exp

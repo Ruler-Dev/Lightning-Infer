@@ -14,10 +14,13 @@ finite execution unit and can be paused and resumed under resource pressure.
 A Qwen3.8-Flash-Next layer split across two GPUs (`EngineOptions::devices`) is being added. The
 Engine names devices in PCI bus order (`CUDA_DEVICE_ORDER=PCI_BUS_ID` unless set) and creates every
 device's context at startup, the primary (`EngineOptions::device`, which runs the worker) first.
-`validate_engine_options` refuses a split, before any context exists, until
-`models/qwen4_exp/program/split_capabilities.h` enables its execution; after that it refuses the
-features a split does not support yet (Vision, the prefix cache), and the Qwen4Exp construction
-refuses the SSD expert tier when the RAM ledger selects it.
+`models/qwen4_exp/program/split_capabilities.h` lists what a split runs: construction, the eager
+calls (prefill, forced tokens, the first token) and the rounds (decode, the MTP drafter,
+verification and their commits). `validate_engine_options` refuses, before any context exists, the
+features a split does not support yet (Vision, the prefix cache) and the gate handoff on a split
+whose segments share a GPU, and the Qwen4Exp construction refuses the SSD expert tier when the RAM
+ledger selects it. One worker drives every device: each
+segment's work runs under its `DeviceGuard`.
 Each round, the decode-ready requests holding an execution permit form one compact batch, and prefill
 and Replay chunks are interleaved.
 

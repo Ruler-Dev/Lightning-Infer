@@ -41,9 +41,11 @@ std::size_t ProgramImpl::walk_bytes(std::uint32_t tokens, std::size_t chunks) co
 // chunk-major. Lends the stream lease (with the walk's area) when none is held, or lends it again
 // with the area when the held one has none for the span (another lane's chunk-major calls lent
 // it). Another prefilling lane waits while the span runs (context_blocks), so two long prompts
-// walk span by span instead of both re-streaming every expert per call.
+// walk span by span instead of both re-streaming every expert per call. A layer split's prompts run
+// chunk-major (its eager calls cross segments chunk by chunk; the walk is one segment's).
 std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     const std::size_t first = lane.next_call;
+    if (segments_.size() > 1) { return first; }
     if (!whole().expert_stream || whole().residency->frames() == 0 || walk_.span.active) { return first; }
     std::size_t end     = first;
     std::uint32_t from  = lane.state_tokens;
@@ -340,7 +342,8 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     // prompt they would fill the returned frames with the prompt's experts while the answer's own
     // staged misses land there anyway: 16 per layer and chunk measured slower than none for every
     // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §19.3.17).
-    return prefill_progress(lane, index, begin, width, tokens, last, 0, start);
+    const std::size_t none[] = {0};
+    return prefill_progress(lane, index, begin, width, tokens, last, none, start);
 }
 
 void ProgramImpl::walk_abandon() noexcept {

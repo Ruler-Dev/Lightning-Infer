@@ -1,8 +1,10 @@
 #include "models/qwen4_exp/program/route_trace.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -64,6 +66,37 @@ void RouteTrace::write(const void* data, std::size_t bytes) {
 
 void RouteTrace::append(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
                         std::span<const std::uint8_t> live, const std::int32_t* routes, std::size_t route_stride) {
+    const std::uint64_t columns = write_round(round, lanes, live, route_stride);
+    const std::size_t used      = static_cast<std::size_t>(top_k_) * columns;
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        write(routes + static_cast<std::size_t>(layer) * route_stride, used * sizeof(std::int32_t));
+    }
+}
+
+void RouteTrace::append_segments(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
+                                 std::span<const std::uint8_t> live, std::span<const RouteTraceSegment> segments) {
+    std::uint32_t covered = 0;
+    std::size_t stride    = std::numeric_limits<std::size_t>::max();
+    for (const RouteTraceSegment& segment : segments) {
+        if (segment.layer_begin != covered || segment.layer_end <= segment.layer_begin || segment.routes == nullptr) {
+            throw std::logic_error("route trace: the segments do not cover the layers in order");
+        }
+        covered = segment.layer_end;
+        stride  = std::min(stride, segment.route_stride);
+    }
+    if (covered != layers_) { throw std::logic_error("route trace: the segments do not cover the layers in order"); }
+    const std::uint64_t columns = write_round(round, lanes, live, stride);
+    const std::size_t used      = static_cast<std::size_t>(top_k_) * columns;
+    for (const RouteTraceSegment& segment : segments) {
+        for (std::uint32_t layer = segment.layer_begin; layer < segment.layer_end; ++layer) {
+            write(segment.routes + static_cast<std::size_t>(layer - segment.layer_begin) * segment.route_stride,
+                  used * sizeof(std::int32_t));
+        }
+    }
+}
+
+std::uint64_t RouteTrace::write_round(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
+                                      std::span<const std::uint8_t> live, std::size_t route_stride) {
     const std::uint64_t columns = static_cast<std::uint64_t>(round.rows) * round.width;
     if (round.kind == RouteTraceKind::Graph || columns == 0 || columns > max_columns_ || lanes.size() != round.rows ||
         (!live.empty() && live.size() < columns) || static_cast<std::uint64_t>(top_k_) * columns > route_stride) {
@@ -82,10 +115,7 @@ void RouteTrace::append(const RouteTraceRound& round, std::span<const std::int32
     std::vector<std::uint8_t> mask((columns + 3) / 4 * 4, 0);
     for (std::size_t c = 0; c < columns; ++c) { mask[c] = live.empty() ? 1 : (live[c] != 0 ? 1 : 0); }
     write(mask.data(), mask.size());
-    const std::size_t used = static_cast<std::size_t>(top_k_) * columns;
-    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-        write(routes + static_cast<std::size_t>(layer) * route_stride, used * sizeof(std::int32_t));
-    }
+    return columns;
 }
 
 void RouteTrace::graph(RouteTraceGraph family, std::uint32_t batch, std::uint32_t width, std::uint64_t free_before,

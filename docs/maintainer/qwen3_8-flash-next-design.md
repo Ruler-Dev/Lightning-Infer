@@ -2450,6 +2450,82 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   Its Gate decode step launches only the receiver's gate ahead of the sender and the receiver's
   layers after it: on one GPU (RTX PRO 4000, WDDM) eager work queued behind a waiting gate kept the
   sender's stream from running until the gate expired.
+- **Layer split** (multi-GPU WP13). A Program over a split (`Program(parameters, devices,
+  SegmentMap, options)`) builds one `DeviceSegment` per segment on its device, under its
+  `DeviceGuard`: `plan_segment` sizes its GDN state, verification records, QSA tails and KV planes
+  by its own layers (`kv_page_geometry` / `kv_window_geometry` of its attention count, the MTP
+  block's on the head; no KV without attention layers, K <= 3), every segment holds the whole io
+  layout, its workspace and staging, the head the logits, sampling, constraint and drafter buffers,
+  the PLE segment the n-gram gate's statistics. The head's pool hands out the KV pages; every other
+  segment's pool has the same page count over its own planes and never reserves: a lane's row is
+  taken in every segment's tables and published with the head's page indices (`publish_indices`),
+  and an elastic pool grows and shrinks in lockstep, each segment from its own frames, the growth
+  failing when one segment cannot. Each segment measures its own link and derives its policy;
+  one `CpuMissService` serves all layers with a port per segment; the expert caches are sized per
+  device after every segment's fixed allocations (two segments on one device split one sizing by
+  `frame_share`, each keeping enough to lend its wide arena, without the VRAM monitor; a segment of a
+  few layers, whose frame limit could never lend that arena, holds it as its own allocation); the
+  saved expert state is split per segment at the warm start and merged at the save. The eager calls
+  (prefill chunks, forced tokens) run segment by
+  segment: each segment's share is prepared (stream lease, io upload with the n-gram rows only to
+  the PLE segment, expert cache round, prefill stream, wide arena), then the previous segment's
+  residual crosses into its `alloc_residual` buffer through the boundary's `BulkHandoff`, then its
+  layers run and the head finishes (MTP cells, logits); the host synchronizes once at the end of
+  the call, as unsplit, and each segment's cache applies the routes with its own budget. On one
+  device a segment's share first waits for the previous segment's kernels (a stream event), so two
+  segments never overlap there. A later segment's io copy (from the one pinned io image) is queued
+  behind the earlier segments' layers, so nothing restages the image before the call's
+  synchronization: sampling stages its positions in a pinned buffer of its own (it used to rewrite
+  the image's positions, which on `--devices A,A` with a short head segment reached the head's
+  attention before its io copy ran: K >= 43 gave other logits for prompts of 9 to 255 tokens, whose
+  calls the host enqueues without waiting on the device; found with per-layer residual hashes and
+  fixed). The layer walk stays one segment's (a
+  split prefills chunk-major).
+  A split refuses the prefix cache and the SSD expert tier. `ProgramOptions::logits_hash`
+  (`INFERNIX_LOGITS_HASH`, `testing::set_logits_hash`) writes the FNV-1a of the head's FP32 logits
+  after every call and round that computes them. `infernix_qwen4_exp_split_prefill_real_test`
+  compares split and unsplit Engines with it: prompts of 1, 255, 256 and 4,113 tokens, a decoded
+  request, forced tokens and a request after a cancelled prompt, at K = 1, 2, 24, 47 on two
+  contexts of device 0, and at K = 24 across two GPUs with `INFERNIX_NUMERICS_SMS=70` (`--long`
+  adds a 40,000-token prompt that grows the KV pool past its base).
+- **Layer split** (multi-GPU WP14). A split's decode and verification rounds (`launch_round`) run
+  segment by segment in layer order, each segment with its device current and its own graph
+  family (decode and verification graphs on every segment, the drafter's draft and catch-up graphs
+  on the head), warmed, captured on its stream and replayed as unsplit. Each segment uploads the io
+  prefix `[0, ngram)` (the head also the acceptance arrays), opens its cache's round with landing
+  frames and enqueues its route download; inside its graph `Forward::run` receives the residual
+  from the previous segment's `HandoffChannel` and sends it to the next. `IoLayout::handoff` (in
+  the n-gram gate's 256-byte line, so the unsplit io layout is unchanged) holds the round's word,
+  strictly increasing like the gate's. Event handoff (the default and `auto`): the sender records
+  `sent` after its graph and the receiver's stream waits for it before its graph, so no host step
+  separates them. Gate handoff (opt-in, two different GPUs only: on one GPU a waiting gate can
+  starve the sender): the receiver's graph starts with its bounded gate; a gated round whose PLE
+  segment precedes the head reads its n-gram rows right after that segment's launch, so the next
+  segment's bound never waits on the host; `HandoffRelease` publishes the word if the host unwinds
+  after a receiver's launch; a gate that runs out of `--handoff-timeout-ms` stores
+  `(layer << 16) | 0xFF03` in the expert error word, which `check_expert_error` turns into a
+  `RecoverableExecutionError`; the receiving segment's wait statistics are reported at each
+  request's end. The head samples or accepts, then every segment synchronizes (the head first).
+  Commits run per segment on its own copy of the round's io and of the commit counts: the GDN fold
+  over its own GDN layers (`gdn_replay_fold` admits 1..48 layers of the 48-head geometry for
+  this: each layer folds on its own), the QSA tails over its attention layers, the PLE history on
+  the PLE segment, the drafter's catch-up on the head (the MTP tail slab follows the head's
+  attention layers); `settle_round` applies each segment's routes with its own budget, and the
+  route trace writes one record over the whole model (`RouteTrace::append_segments`). On one GPU
+  every segment's work first waits for the work the other segment there enqueued last
+  (`SegmentWork`, the segments' `compute_done` events), so the two never overlap (F1). The
+  rounds' host restaging (io, round arrays, drafter io) follows each round's synchronization;
+  `INFERNIX_SPLIT_SYNC=1` also synchronizes every segment before each restage, as a debugging aid.
+  A split's segments apply their link's policy (`derive_link_policy`): on a slow link (below
+  8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment promotes nothing during requests,
+  not even while its frames fill (`promotes_in_rounds`), its CPU port takes up to 32 jobs per
+  layer call besides keeping only misses / 19 on the link, and the warm start seeds every frame
+  (the saved ranking, the last cache's residents, then every other key the session used, most used
+  first: `extend_ranking`);
+  an unsplit Program keeps the dynamic policy on every link. Each segment's frames come from its
+  own device's sizing (on one device, its layer share of that device's). `testing::
+  delay_next_round` holds the first segment's next round (a host function on its stream) to test
+  the gate's timeout. Measured: see the multi-GPU wave 3 report.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer

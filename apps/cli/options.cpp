@@ -122,16 +122,17 @@ std::string usage_text(const char* argv0) {
            "                           lists the GPUs (default 0)\n"
            "  --devices A,B            Qwen3.8-Flash-Next layer split: the first layers on\n"
            "                           GPU A, which runs the engine, the rest and the output\n"
-           "                           head on GPU B; A,A splits on one GPU (a test mode).\n"
-           "                           Not available yet: startup refuses two devices\n"
+           "                           head and the MTP drafter on GPU B; A,A splits on one\n"
+           "                           GPU (a test mode)\n"
            "  --layer-split K|auto|@FILE\n"
            "                           split after layer K, choose K at startup (default\n"
            "                           with two devices), or read it from a plan file\n"
            "  --layer-split-report     report the split table of candidate K at startup\n"
            "  --split-handoff auto|event|gate\n"
            "                           how rounds pass the hidden state between the GPUs:\n"
-           "                           event (copy and event wait) or gate (lower latency,\n"
-           "                           a spinning kernel); auto = event (default)\n"
+           "                           event (copy and event wait) or gate (no host step,\n"
+           "                           a spinning kernel; two different GPUs); auto = event\n"
+           "                           (default)\n"
            "  --handoff-timeout-ms N   gate handoff bound, 1-" +
            std::to_string(kMaximumHandoffTimeoutMs) + " (default " +
            std::to_string(kDefaultHandoffTimeoutMs) +

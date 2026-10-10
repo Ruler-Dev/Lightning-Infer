@@ -53,9 +53,11 @@ struct ConstructedQwen4Exp {
 [[nodiscard]] bool artifact_is_qwen4_exp(const std::filesystem::path& artifact);
 
 // `devices` holds one context per device of `options` (EngineOptions::devices, or `device` alone)
-// in that order; the first is the primary. The model's device segments (LoadOptions::segment_ends)
-// map one to one onto them, and the Program runs on the primary: a layer split is refused until
-// its execution exists (program/split_capabilities.h).
+// in that order; the first is the primary, on which the engine's worker runs. The model's device
+// segments (LoadOptions::segment_ends, from --layer-split K) map one to one onto them: each device's
+// VRAM is checked for its segments' dense arenas and Program allocations before the weights are read,
+// each segment's Parameters are prepared on its device, and the Program runs every segment on its
+// own device (program/split_capabilities.h lists what a split runs so far).
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
                                                       std::span<DeviceContext* const> devices);
 

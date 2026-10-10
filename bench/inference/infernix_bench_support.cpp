@@ -391,7 +391,7 @@ std::string usage_text(std::string_view program) {
            "backend\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --devices <a,b>             Qwen3.8-Flash-Next layer split across two devices, as\n"
-           "                             infernix's (not available yet; replaces --device)\n"
+           "                             infernix's (replaces --device)\n"
         << "  --layer-split <K|auto|@FILE>  --layer-split-report  --split-handoff <auto|event|gate>\n"
            "  --handoff-timeout-ms <n>    the split's options, as infernix's\n"
         << "  --no-cuda-graph             use eager decode\n"

@@ -265,10 +265,10 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device ordinal, in PCI bus order ([device order](#device-order)) | `0` |
-| `--devices A,B` | Qwen3.8-Flash-Next layer split across two GPUs: the first layers on `A`, which also runs the engine, the remaining layers and the output head on `B`; `A,A` splits on one GPU (a test mode). One ordinal is the same as `--device N`; the two flags cannot be combined. Not available yet: startup refuses two devices ([layer split](#layer-split)) | one device |
+| `--devices A,B` | Qwen3.8-Flash-Next layer split across two GPUs: the first layers on `A`, which also runs the engine, the remaining layers, the output head and the MTP drafter on `B`; `A,A` splits on one GPU (a test mode). One ordinal is the same as `--device N`; the two flags cannot be combined ([layer split](#layer-split)) | one device |
 | `--layer-split K\|auto\|@FILE` | where the split falls: after layer `K` (at least 1 and below the layer count), chosen at startup, or read from a plan file; requires two devices | `auto` with two devices |
 | `--layer-split-report` | report the split planner's table of candidate `K` at startup; requires two devices | off |
-| `--split-handoff auto\|event\|gate` | how rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (lower latency, but that kernel spins); `auto` is `event`; requires two devices | `auto` |
+| `--split-handoff auto\|event\|gate` | how decode and verification rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (no host step between the GPUs, but that kernel spins); `auto` is `event`; requires two devices, and `gate` two different GPUs | `auto` |
 | `--handoff-timeout-ms N` | bound of a `gate` handoff's wait, `1..1500`; a wait that runs out fails the round with a recoverable error instead of reaching Windows' 2 s GPU timeout; requires two devices | `1000` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
@@ -376,15 +376,48 @@ two different GPUs an ordinal can name another GPU than in builds before this or
 
 ## Layer split
 
-`--devices A,B` will split Qwen3.8-Flash-Next's layers across two GPUs: the first layers, with
-their KV cache and state, on `A`, which also runs the engine; the remaining layers, the output
-head, sampling and the MTP drafter on `B`. Startup checks the split's options and then refuses two
-devices, because the split execution is not available yet. Once it is, a split also refuses, until
-each is supported, `--vision`, the prefix cache (`infernix-serve --no-prefix-reuse` disables it),
-the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier), which needs every expert in
-Host RAM, and `--layer-split auto` (the default with two devices) or `@FILE`, which need the split
-planner: pass `--layer-split K`, with `K` below the model's layer count. `--devices A` with one
-ordinal runs exactly as `--device A`.
+`--devices A,B --layer-split K` splits Qwen3.8-Flash-Next's 48 layers across two GPUs: layers
+`[0, K)`, with their KV cache, recurrent state and expert cache, on `A`, which also runs the engine;
+layers `[K, 48)`, the output head, sampling and the MTP drafter on `B`, which also holds the KV
+page allocator. Each GPU gets its own share of the dense weights, its own expert cache sized from
+its own free memory (`--vram-headroom-mib` applies to each), and startup checks each GPU's memory
+before reading the weights. The routed experts stay in Host RAM once, read by both. The hidden
+state crosses from `A` to `B` once per call, through pinned host memory (no peer access is needed).
+
+Prefill, forced tokens (an injected thinking-close control) and decoding run across the split:
+plain decode rounds and, with `--spec mtp` or n-gram drafts, the drafter on `B` and verification
+rounds. Their logits and greedy output are the unsplit run's bit for bit when both GPUs use the
+same launch decompositions (`--devices A,A`, or two different GPUs with
+[`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls run
+chunk by chunk on `A`, then on `B` (each GPU streams its own layers' experts per chunk, so long
+prompts prefill slower than on one GPU, most on a slow `A` link). A round runs `A`'s layers, then
+`B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` (the default) orders `B`
+after `A` with a cross-device event; `gate` lets `B` start at once and wait on the GPU, bounded
+by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a recoverable
+error and the engine keeps serving).
+
+Each GPU's expert cache follows its own PCIe link. A GPU on a slow link (below 8 GB/s, such as
+PCIe 3.0 x4) promotes no experts while requests run: its misses go to the CPU (it hands the CPU
+more of them, at most 32 per layer call), and its frames fill from the saved expert state at
+startup (every frame, not half: the last session's cached experts, then the other experts it used,
+most used first) and from the misses its decode stages anyway. A faster GPU keeps
+the dynamic cache of a single GPU. The startup line of each segment names its link and policy.
+
+A split refuses, until each is supported, `--vision`, the prefix cache (`infernix-serve
+--no-prefix-reuse` disables it), the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier),
+which needs every expert in Host RAM, and `--layer-split auto` (the default with two devices) or
+`@FILE`, which need the split planner: pass `--layer-split K`, with `1 <= K < 48`. `--devices A`
+with one ordinal runs exactly as `--device A`. `--devices A,A` runs both segments on one GPU, each
+with its own context, one after the other (their work never overlaps on the GPU), with the event
+handoff only: a test mode for exactness. `INFERNIX_SPLIT_SYNC=1` (a debugging aid) synchronizes
+both GPUs before the host restages a call's or round's inputs.
+
+`INFERNIX_LOGITS_HASH=FILE` (a check for this exactness, for both the CLI and the HTTP server)
+appends one line per call or round that computes logits to `FILE`: its kind (`prefill`, `forced`,
+`decode` or `verify`), the lane and first position of its first row, its width and logit columns,
+and the 64-bit FNV-1a of its FP32 logits. Two runs that must agree
+bit for bit, such as a split and an unsplit run of the same prompt, write the same lines. Each such
+call waits for its logits, so leave it unset otherwise.
 
 ## Context and memory
 

@@ -151,14 +151,14 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
 }
 
+// The registered head and channel geometries, each over any layer count up to its model's: a
+// layer split's segment folds only its own GDN layers (each layer folds independently).
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
-                             spec.conv_channels == 8192;
-    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    return geometry_48 || geometry_30 || geometry_36;
+    const bool geometry_48 = spec.layers >= 1 && spec.layers <= 48 && spec.qk_heads == 16 &&
+                             spec.value_heads == 48 && spec.conv_channels == 10240;
+    const bool geometry_30 = spec.layers >= 1 && spec.layers <= 30 && spec.qk_heads == 16 &&
+                             spec.value_heads == 32 && spec.conv_channels == 8192;
+    return geometry_48 || geometry_30;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {
@@ -205,12 +205,16 @@ void validate_fold_states(const GdnReplayRecords& records,
     require_tensor(states.recurrent_layer0, DType::FP32,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
-    if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
-        states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
-        states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
-        static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
-        static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
-            states.recurrent_layer0.bytes()) {
+    // A single layer (a layer split's segment of one GDN layer) has no stride: its pool reports 0.
+    const bool strided = record.layers > 1 || states.conv_layer_stride_bytes != 0 ||
+                         states.recurrent_layer_stride_bytes != 0;
+    if (strided &&
+        (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
+         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
+         states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
+         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
+         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
+             states.recurrent_layer0.bytes())) {
         throw std::invalid_argument(std::string(kOp) + ": invalid state layer stride");
     }
 

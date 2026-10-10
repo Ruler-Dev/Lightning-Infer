@@ -54,6 +54,14 @@ struct RouteTraceRound {
     std::uint32_t position = 0;
 };
 
+// A layer split's segment's route log: the routes of decoder layers [layer_begin, layer_end) at
+// routes[(layer - layer_begin) * route_stride] (each segment's expert cache logs its own layers).
+struct RouteTraceSegment {
+    const std::int32_t* routes = nullptr;
+    std::size_t route_stride   = 0;
+    std::uint32_t layer_begin = 0, layer_end = 0;
+};
+
 class RouteTrace {
 public:
     static constexpr std::uint32_t kUnknownPosition = 0xFFFFFFFFU;
@@ -68,12 +76,20 @@ public:
     // routes[layer * route_stride + i] for i < top_k * columns. Throws on a write error.
     void append(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
                 std::span<const std::uint8_t> live, const std::int32_t* routes, std::size_t route_stride);
+    // The same record from a layer split's segments, which together cover every layer once in order:
+    // the file is the unsplit Program's (one record per round over the whole model). The header's
+    // frames are the segments' sum.
+    void append_segments(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
+                         std::span<const std::uint8_t> live, std::span<const RouteTraceSegment> segments);
     // Appends one graph instantiation. Throws on a write error.
     void graph(RouteTraceGraph family, std::uint32_t batch, std::uint32_t width, std::uint64_t free_before,
                std::uint64_t free_after);
 
 private:
     void write(const void* data, std::size_t bytes);
+    // The round's head words, lanes and live mask; returns the round's columns.
+    std::uint64_t write_round(const RouteTraceRound& round, std::span<const std::int32_t> lanes,
+                              std::span<const std::uint8_t> live, std::size_t route_stride);
 
     std::FILE* file_ = nullptr;
     std::uint32_t layers_ = 0, top_k_ = 0, max_columns_ = 0;

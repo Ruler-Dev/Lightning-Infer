@@ -115,8 +115,7 @@ enabled by default.
 
 `--devices`, `--layer-split`, `--layer-split-report`, `--split-handoff` and `--handoff-timeout-ms`
 configure a Qwen3.8-Flash-Next layer split exactly as `infernix`'s flags do
-([layer split](../docs/cli.md#layer-split)); `--devices` replaces `--device`. Like `infernix`,
-the benchmark refuses two devices until the split execution is available.
+([layer split](../docs/cli.md#layer-split)); `--devices` replaces `--device`.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
