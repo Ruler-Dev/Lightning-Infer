@@ -5105,7 +5105,7 @@ Today the five kernels cost, per forward (A): `norm_kernel` 1.36 µs, `gates_ker
 
 | Kernel (T ≤ 16) | Grid | Steps | Output |
 |---|---|---|---|
-| K1a `hc_down_partials`, [324 or 320, 10240] | 4 K slices (one per stream, K = 2560) × 41 row groups of 8 rows = 164 CTAs × 8 warps; a row per warp, 10 chunks per lane | Weights first (20 KB per CTA); PDL wait; stage R[s, pass columns] and the norm weight; block-reduce each column's sum of squares in fixed order to inv[s, t]; write Rn = R·inv·(1 + w) in **FP32** to shared memory (80 KB per 8-column pass: 1 CTA per SM, 164 ≤ 170); K1 with `Fp32Shared` | FP32 `partial[s][row][t]` (4 × 324 × T × 4 B) in workspace; row group 0 also writes inv[s][t] |
+| K1a `hc_down_partials`, [324 or 320, 10240] | 4 K slices (one per stream, K = 2560) × 41 row groups of 8 rows = 164 CTAs × 8 warps; a row per warp, 10 chunks per lane | Weights first (20 KB per CTA); PDL wait; stage R[s, pass columns] and the norm weight; block-reduce each column's sum of squares in fixed order to inv[s, t]; write Rn = R·inv·(1 + w) in **FP32** to shared memory (80 KB per 8-column pass: 1 CTA per SM, 164 ≤ 170; on GB203 resident grids and two rows per warp, §19.3.21); K1 with `Fp32Shared` | FP32 `partial[s][row][t]` (4 × 324 × T × 4 B) in workspace; row group 0 also writes inv[s][t] |
 | K1b `hc_gates_up_collapse`, [10240, 320] | 160 CTAs × 16 warps; a CTA owns 16 d, a warp one d with `StreamQuad<2560>` rows (d, H+d, 2H+d, 3H+d) | Weights first; PDL wait; read all partials (5.2 KB × T per CTA); z = Σ_s partial[s] in order s = 0..3; m = SiLU(z/S) in FP32 shared memory; CTA 0 writes inject[s, t] = 2σ(z[rank+s]/S) when requested; K1 over W_up rows | The butterfly gathers a column's 4 streams into one lane, which forms Rn from R and inv in FP32 and writes x[d, t] = bf16((1/S)·Σ_s σ(u_s)·Rn_s) |
 
 - **Deviation from §8.3**, which takes the stream sums of squares from the previous kernel's
@@ -9014,6 +9014,87 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
   diverged from Gold (deterministically, three runs) and the prefix-cache real test's restored
   resume differed from the original turn at token 30. Synthetic-input equality is not evidence of
   bit-exactness for a different reduction order.
+
+### 19.3.21 Decode kernels on GB203: RTX 5080 and RTX PRO 4000 (2026-10-11)
+
+The layer split across two GPUs (`--devices 0,1 --layer-split K`, §16.4) runs on an RTX PRO 4000
+(70 SMs, 48 MB L2, 672 GB/s) and an RTX 5080 (84 SMs, 64 MB L2, 960 GB/s). Several decode kernels
+were sized for the RTX 5090's 170 SMs and need two or three waves there. Every change below is occupancy-only: it
+keeps each output's reduction order, so the bits do not change. The choices read the device's own
+SM count (`ops::device_multiprocessors()`, `src/ops/common/device_sms.h`) and ignore
+`INFERNIX_NUMERICS_SMS` (op development §4.2). The routes measured here serve parts of at most 96
+SMs (`gb203_class()`); larger parts keep the RTX 5090's routes, which this rig cannot measure.
+
+**Where decode time goes.** Nsight Systems on the K = 28 split (`infernix_bench`, int8 KV, MTP 4
+drafts, 48K context, 57 rounds of about 4.5 tokens). Kernel time per round:
+
+| Kernel | RTX PRO 4000 (layers 0-27) | RTX 5080 (layers 28-47, head, MTP) |
+|---|---:|---:|
+| `cpu_wait_kernel` (CPU-served misses) | 26.3 ms | 4.9 ms |
+| `stage_kernel` (staged misses, forked) | 10.0 ms | 11.5 ms |
+| narrow expert `gate_up` + `down` | 11.4 ms | 6.3 ms |
+| Q8 stream (GDN q/k/v/z, PLE, shared down) | 2.2 ms | 1.2 ms |
+| shared expert gate/up (`stream_pair`) | 2.2 ms | 0.9 ms |
+| HC mixer K1a + K1b | 3.2 ms | 1.6 ms |
+| Q8 SIMT out projection [2560, 6144] | 1.0 ms | 0.6 ms |
+| MTP drafter experts (`resident_moe`) | - | 0.8 ms |
+| proposal head + lm_head | - | 1.7 ms |
+
+In the same profile the GPUs are busy for 8 % (PRO) and 4 % (5080) of a 48K prompt's prefill
+span: prefill on the split waits on expert copies, not on its kernels, so its MMA tiles were not
+retuned.
+
+**Changes** (op benchmarks per card, cold L2, graph-captured, median µs; the decode widths are
+T = 1 and the T = 5 of an MTP verification with four drafts):
+
+| Op | Change | RTX PRO 4000 | RTX 5080 |
+|---|---|---|---|
+| `hyper_connection_mix` fused, inject mixer | K1a and K1b grids resident at once (each CTA loops over row groups or feature blocks and forms Rn or m once); two W_down rows per K1a warp | T = 1: 32.7 → 28.5; T = 5: 69.9 → 40.9 | T = 1: 20.7 → 18.6; T = 5: 43.5 → 27.1 |
+| `moe_experts` narrow route | the one-column kernels (two gate/up CTAs per SM) up to 8 columns instead of 4 | T = 5: 701 → 375; T = 8: 937 → 517 | T = 5: 507 → 262; T = 8: 656 → 358 |
+| Q8 [2560, 6144] (GDN/QSA out) | T ≤ 4 SIMT with 16-group stages, T = 5-8 register-streamed with x through L1 | T = 4: 41.5 → 36.4; T = 5: 46.4 → 38.4 | T = 4: 25.1 → 23.5; T = 5: 31.3 → 23.1 |
+| Q8 [16384, 2560] (GDN q/k/v/z) | T ≤ 4 SIMT with 16-group stages, T = 5-6 a 6-column register-streamed tile | T = 4: 85.7 → 79.8; T = 5: 92.1 → 85.5 | T = 4: 53.8 → 47.3; T = 5: 57.9 → 53.8 |
+| `linear_swiglu` shared expert | a build capped at 168 registers (three CTAs per SM) when the 160 CTAs exceed one wave of the 232-register build | T = 1: 18.8 → 14.2; T = 5: 35.1 → 29.0 | unchanged (one wave) |
+| `resident_moe_experts` (MTP drafter) | the staged FP32 activation padded by four floats after every 32: the warp's lanes no longer hit one shared-memory bank (32-way conflicts) | T = 1: 308 → 59 | T = 1: 218 → 35 |
+
+The `resident_moe` fix applies to every GPU. The 5090 keeps a row per K1a warp (its 164-CTA grid is
+one wave) and the BF16 codec too.
+
+**Bit identity.**
+- Op level: `--dump` of `infernix_hyper_connection_mix_bench`, `infernix_offloaded_moe_narrow_bench`,
+  `infernix_q8_linear_swiglu_bench --problem flash_next_shared` and `infernix_resident_moe_bench`
+  byte-equal to the d8383c7 build on both cards. A temporary sweep (op development §7) compared
+  134 Q8 decode candidates per card, the old production routes among them, byte for byte with the
+  new routes. The HC, offloaded-MoE (layer, CUDA, wide), Q8 A16 (column invariance), LinearSwiGLU
+  and resident-MoE tests pass on both cards.
+- End to end (real activations; §19.3.20 shows why synthetic equality is not enough): greedy ids
+  of the code prompt (256 tokens, plain and MTP) equal `ref-master` on the RTX 5080; per-step logits
+  hashes equal the d8383c7 build on both cards, plain and MTP; `forward_real_test` logits (int8 KV,
+  chunk 64) are byte-equal to the reference on the RTX 5080 and to d8383c7 on the RTX PRO 4000
+  (perplexity 3.6792); a six-turn chat on `--devices 0,1 --layer-split 28` at
+  `INFERNIX_NUMERICS_SMS=70` replies byte for byte as the unsplit `--device 0` run.
+
+**End to end** (`infernix-serve --devices 0,1 --layer-split 28`, production flags, d8383c7 against
+this build in one session; the 20-turn `bench_conversation.py` to 49.5K tokens, whose replies are
+byte-identical in all six runs):
+- Second-half decode mean, in ABBA order: 81.4 and 81.3 tok/s for d8383c7, 85.8 and 85.2 for this
+  build (+5 %); the 1-s peak rises from 120.7 to 127.7. An earlier pair gave 81.8 against 81.8,
+  with turns 11-14 of the new run slowed by another job's file copies on the host; its first half
+  was 81.8 → 86.7. TTFT is unchanged.
+- One 50K prefill step (`bench_context_steps.py --step 50000 --max-total 55000`, 63,487 new
+  tokens): 570.0 → 570.8 tok/s, as expected for a link-bound prefill; the decode after it
+  63.5 → 65.3 tok/s.
+
+**Not adopted.**
+- PDL on the two HC kernels: at most 0.6 µs at T = 1 with weights in L2, slower at T = 4 on the
+  RTX 5080 (18.9 → 20.2 µs), nothing cold.
+- Narrow experts with the staged slice split into four `cp.async` groups so the first pass starts on
+  the first quarter: slower at T = 1 on the RTX 5080 (111 → 130 µs cold).
+- The capped shared-expert build everywhere: slower on the RTX 5080 (T = 5: 23.1 → 25.1 µs).
+- A T = 5 SIMT tile for [2560, 6144] (R4 T5 G16): 1.9 µs faster than the streamed route on the RTX
+  PRO 4000, 2 µs slower on the RTX 5080; one route serves both.
+- Prefill MMA tiles: every tile accumulates in the same order, so a retune would be bit-exact, but
+  the big 4096-column grids are 8-59 waves deep on either card, and prefill kernels are not the
+  bound (above).
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

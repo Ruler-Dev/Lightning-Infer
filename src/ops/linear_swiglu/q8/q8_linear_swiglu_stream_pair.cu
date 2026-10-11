@@ -5,7 +5,7 @@
 // butterfly) and writes bf16(SiLU(gate) * up) with gate and up in FP32. A column's result does not
 // depend on how many columns share the call.
 //
-// The kernel is built twice: unconstrained (216 registers, two CTAs per SM) and capped for three
+// The kernel is built twice: unconstrained (232 registers, two CTAs per SM) and capped for three
 // CTAs per SM (168 registers, no spills). The launch takes the capped build when the grid would need
 // more than one wave of the unconstrained one on this device (the 640-row shared expert's 160 CTAs
 // on a 70-SM RTX PRO 4000; 84- and 170-SM parts keep the unconstrained build). Register allocation
