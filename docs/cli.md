@@ -268,7 +268,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--devices A,B` | Qwen3.8-Flash-Next layer split across two GPUs: the first layers on `A`, which also runs the engine, the remaining layers, the output head and the MTP drafter on `B`; `A,A` splits on one GPU (a test mode). One ordinal is the same as `--device N`; the two flags cannot be combined ([layer split](#layer-split)) | one device |
 | `--layer-split K\|auto\|@FILE` | where the split falls: after layer `K` (at least 1 and below the layer count), chosen at startup, or read from a plan file; requires two devices | `auto` with two devices |
 | `--layer-split-report` | report the split planner's table of candidate `K` at startup; requires two devices | off |
-| `--split-handoff auto\|event\|gate` | how decode and verification rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (no host step between the GPUs, but that kernel spins); `auto` is `event`; requires two devices, and `gate` two different GPUs | `auto` |
+| `--split-handoff auto\|event\|gate` | how decode and verification rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (no host step between the GPUs, but that kernel spins); `auto` is `gate` on two different GPUs (measured faster, same output) and `event` on one; requires two devices, and `gate` two different GPUs | `auto` |
 | `--handoff-timeout-ms N` | bound of a `gate` handoff's wait, `1..1500`; a wait that runs out fails the round with a recoverable error instead of reaching Windows' 2 s GPU timeout; requires two devices | `1000` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
@@ -391,10 +391,13 @@ same launch decompositions (`--devices A,A`, or two different GPUs with
 [`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls run
 chunk by chunk on `A`, then on `B` (each GPU streams its own layers' experts per chunk, so long
 prompts prefill slower than on one GPU, most on a slow `A` link). A round runs `A`'s layers, then
-`B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` (the default) orders `B`
-after `A` with a cross-device event; `gate` lets `B` start at once and wait on the GPU, bounded
-by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a recoverable
-error and the engine keeps serving).
+`B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` orders `B` after `A` with
+a cross-device event; `gate` (the default on two different GPUs) lets `B` start at once and wait
+on the GPU, bounded by `--handoff-timeout-ms` (a round whose state does not arrive in time fails
+with a recoverable error and the engine keeps serving). On an RTX PRO 4000 + RTX 5080 split at
+`K = 28` the gate made rounds 0.1 ms shorter over the 20-turn conversation benchmark (23.18
+against 23.29 ms) and 0.6 ms on the CLI code prompt, with the same tokens; `--devices A,A` uses
+the event handoff.
 
 Each GPU's expert cache follows its own PCIe link. A GPU on a slow link (below 8 GB/s, such as
 PCIe 3.0 x4) sends most misses to the CPU (it hands the CPU more of them, at most 32 per layer

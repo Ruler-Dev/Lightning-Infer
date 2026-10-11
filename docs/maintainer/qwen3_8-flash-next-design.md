@@ -2496,10 +2496,16 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   frames and enqueues its route download; inside its graph `Forward::run` receives the residual
   from the previous segment's `HandoffChannel` and sends it to the next. `IoLayout::handoff` (in
   the n-gram gate's 256-byte line, so the unsplit io layout is unchanged) holds the round's word,
-  strictly increasing like the gate's. Event handoff (the default and `auto`): the sender records
+  strictly increasing like the gate's. Event handoff (`auto` on one GPU): the sender records
   `sent` after its graph and the receiver's stream waits for it before its graph, so no host step
-  separates them. Gate handoff (opt-in, two different GPUs only: on one GPU a waiting gate can
-  starve the sender): the receiver's graph starts with its bounded gate. In either mode a gated
+  separates them. Gate handoff (`auto` on two different GPUs, since multi-GPU wave 5; never on one
+  GPU, where a waiting gate can starve the sender): the receiver's graph starts with its bounded
+  gate, and the sender publishes the residual with SM stores instead of a copy-engine download.
+  Measured at K = 28 (RTX PRO 4000 + RTX 5080, INFERNIX_SPLIT_TIMING): over the second half of the
+  20-turn conversation benchmark (6,319 rounds) the gate's rounds took 23.18 ms against 23.29 (the
+  RTX PRO 4000's graph 13.32 against 13.54 ms, the handoff and acceptance after the graphs about
+  0.28 ms with the event), on the CLI code prompt 24.5-24.6 against 25.2 ms (85.9-86.2 against
+  83.8 tok/s); the replies were byte-identical. In either mode a gated
   round whose PLE segment precedes the head reads its n-gram rows right after that segment's
   launch, so the next segment's bound never waits on the host and the PLE segment's layer 1 waits
   less (with the event handoff the rows used to be read after the head's work was enqueued, and

@@ -131,8 +131,8 @@ std::string usage_text(const char* argv0) {
            "  --split-handoff auto|event|gate\n"
            "                           how rounds pass the hidden state between the GPUs:\n"
            "                           event (copy and event wait) or gate (no host step,\n"
-           "                           a spinning kernel; two different GPUs); auto = event\n"
-           "                           (default)\n"
+           "                           a spinning kernel; two different GPUs); auto = gate\n"
+           "                           on two different GPUs, event on one (default)\n"
            "  --handoff-timeout-ms N   gate handoff bound, 1-" +
            std::to_string(kMaximumHandoffTimeoutMs) + " (default " +
            std::to_string(kDefaultHandoffTimeoutMs) +
