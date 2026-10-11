@@ -2496,10 +2496,16 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   frames and enqueues its route download; inside its graph `Forward::run` receives the residual
   from the previous segment's `HandoffChannel` and sends it to the next. `IoLayout::handoff` (in
   the n-gram gate's 256-byte line, so the unsplit io layout is unchanged) holds the round's word,
-  strictly increasing like the gate's. Event handoff (the default and `auto`): the sender records
+  strictly increasing like the gate's. Event handoff (`auto` on one GPU): the sender records
   `sent` after its graph and the receiver's stream waits for it before its graph, so no host step
-  separates them. Gate handoff (opt-in, two different GPUs only: on one GPU a waiting gate can
-  starve the sender): the receiver's graph starts with its bounded gate. In either mode a gated
+  separates them. Gate handoff (`auto` on two different GPUs, since multi-GPU wave 5; never on one
+  GPU, where a waiting gate can starve the sender): the receiver's graph starts with its bounded
+  gate, and the sender publishes the residual with SM stores instead of a copy-engine download.
+  Measured at K = 28 (RTX PRO 4000 + RTX 5080, INFERNIX_SPLIT_TIMING): over the second half of the
+  20-turn conversation benchmark (6,319 rounds) the gate's rounds took 23.18 ms against 23.29 (the
+  RTX PRO 4000's graph 13.32 against 13.54 ms, the handoff and acceptance after the graphs about
+  0.28 ms with the event), on the CLI code prompt 24.5-24.6 against 25.2 ms (85.9-86.2 against
+  83.8 tok/s); the replies were byte-identical. In either mode a gated
   round whose PLE segment precedes the head reads its n-gram rows right after that segment's
   launch, so the next segment's bound never waits on the host and the PLE segment's layer 1 waits
   less (with the event handoff the rows used to be read after the head's work was enqueued, and
@@ -2528,7 +2534,35 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   drafting and commit. Measured at K = 24 on the CLI code prompt (MTP, 368 rounds): period
   25.6 ms = 22.8 ms launch to sync (graphs 11.0 ms on the RTX PRO 4000, 11.5 ms on the RTX 5080)
   + 2.4 ms drafting + 0.3 ms commit, so launches and handoffs between the graphs take about 0.3 ms
-  of a round, the bound on what the gate handoff could save.
+  of a round, the bound on what the gate handoff could save. Since multi-GPU wave 5 the knob also
+  runs on one GPU (the split's reference) and adds, per verified width, the rounds, the draft steps
+  run before them, the drafting and the launch-to-sync time per segment; each host transition
+  between rounds (`Mark`: synchronization, commit, cache update, decode, draft launched and
+  synchronized, launch, first segment launched, launched) as a mean; and on the head, from events,
+  the drafter's catch-up, its idle gap before the draft graph and the draft graph.
+  Measured at K = 28 over the second half of the 20-turn conversation benchmark (6,319 rounds,
+  event handoff): period 23.29 ms = 21.35 ms launch to sync (graphs 13.54 ms on the RTX PRO 4000,
+  7.53 ms on the RTX 5080, 0.28 ms handoff, acceptance and synchronization) + 1.64 ms drafting +
+  0.27 ms commit; between rounds the host spends 0.44 ms besides the draft (commit 0.12, cache
+  update 0.15, draft launch 0.09, first launch 0.05 ms) and the RTX 5080 idles 0.15 ms between the
+  catch-up (0.13 ms) and the draft graph (1.42 ms for 1.8 steps). So a split adds no fixed cost
+  beyond the handoff's 0.3 ms: the earlier "4-5 ms per round independent of K" was the RTX PRO
+  4000's slower layers (its 28 layers took 9.5 ms in a one-column round, the RTX 5080's 20 layers
+  and the head 5.3 ms). By verified width, with the drafting before the round and the commit:
+  W = 1 (24.9 % of rounds) 17.05 ms, W = 2 (36.9 %) 21.16, W = 3 (28.5 %) 27.73, W = 4 (8.5 %)
+  32.90, W = 5 (1.2 %) 42.34 ms; a draft step costs 0.82 ms. Against a plain round without
+  drafting (15.75 ms) a round of K drafts costs 1.33, 1.77, 2.11 and 2.71 plain rounds for
+  K = 1..4, 0.33-0.43 per draft, about the 0.38 fitted on the RTX 5090 (`kWidthCost`, kept). One
+  column more costs 4.4-6.2 ms of the 23 ms round, and a token is worth about 12 ms there (1.93
+  tokens per round), so verifying a draft pays from about 0.43 acceptance, near the 0.5 draft-head
+  probability below which a one-row round stops verifying (`kDraftMinLogprob`, kept).
+  `INFERNIX_WIDTH_COST=X` (a measurement knob) replaces `kWidthCost`.
+  Tried and not kept (multi-GPU wave 5): leaving a commit's cache update to the next round's
+  decode, run while the head drafts (the head's table upload and promotions on a stream of their
+  own, which its compute stream waited for before its next round), cut the commit from 0.28 to
+  0.13 ms and the drafter's idle gap from 0.15 to 0.04 ms, but launch to sync grew by 0.09 ms:
+  rounds of 22.20 against 22.27 ms, 81.7 against 81.4 tok/s over the conversation's second half,
+  the same replies, within the runs' spread for an update path every entry point had to settle.
   A split's segments apply their link's policy (`derive_link_policy`): on a slow link (below
   8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment's CPU port takes up to 32 jobs per
   layer call besides keeping only misses / 19 on the link, and the warm start seeds every frame
@@ -2537,10 +2571,11 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   segment whose frames cover its layers' experts holds them all; without a saved state, none yet
   or `--expert-state off`, every key of its layers, expert-major). During requests it promotes
   only a trickle (`PromotionPolicy::Trickle`, `trickles`, `trickle_budget`): each round at most
-  one expert per layer in a window of `trickle_bytes` / record stride consecutive layers (6 ms of
-  its link: six experts at 3.1 GB/s; `INFERNIX_TRICKLE_PROMOTIONS=N` overrides, `0` promotes
-  nothing), a window that moves on after every round that had a budget, so every layer gets its
-  turn. The copies wait in the residency (`ExpertResidency::set_trickle`) until the segment's share
+  one expert per layer in a window of `trickle_bytes` / record stride consecutive layers (13 ms of
+  its link since multi-GPU wave 5, 14 experts at 3.1 GB/s, 6 ms before;
+  `INFERNIX_TRICKLE_PROMOTIONS=N` overrides, `0` promotes nothing), a window that moves on after
+  every round that had a budget, so every layer gets its turn. The copies wait in the residency
+  (`ExpertResidency::set_trickle`) until the segment's share
   of the next round is enqueued (`launch_round`: `issue_deferred`), so they cross its link while
   the later segments compute, never ahead of its own staged misses; no new ones start while the
   last are deferred or copying (`loads_pending`), and any other call that needs them issued (an
@@ -2559,6 +2594,25 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   72.8 tok/s, within the runs' spread (the RTX 5080 started those runs with 5-14% fewer frames,
   a chunk placed in system memory); under the power-saver plan, where CPU-served misses cost more,
   the same build gave 70.7 tok/s at K = 24 with the trickle and 62.1 without.
+  Multi-GPU wave 5 sized the trickle at K = 28 (second half of the 20-turn conversation; the RTX
+  PRO 4000's hit since the start): none 65.2 tok/s (75.2%; rounds 26.1 ms, its graph 16.4 ms),
+  6 per round 81.4 (90.8%; 22.3 and 12.6 ms), 14 per round 82.4 and 82.2 in two runs (92.1%),
+  28 per round 81.5 (92.7%). On the code-agent conversation with `--ngram-draft-tokens 7`
+  (8-column copy rounds of ~70 ms, whose later segment leaves the link idle ~26 ms): 6 per round
+  100.4 tok/s over all turns (106.7 over the second half), 14 per round 103.6 and 102.5 (107.0 and
+  106.0), 28 per round 103.4 (106.1). The gain is in the first turns after the switch from the
+  saved state's topics to code (58.9 and 89.4 tok/s with 6, 74.1 and 114.7 with 14): a late
+  8-column round barely changes, its misses being the frames' capacity (7,222 for 14,336 experts),
+  so the trickle mostly sets how fast the cache follows a new topic. At K = 24: 81.0 tok/s with 6,
+  80.6 with 14 (hit 94.3% against 95.4%, the RTX PRO 4000's graph 10.62 against 10.59 ms; the RTX
+  5080 had 45 fewer frames in that run). Every reply was identical, so 13 ms (14 experts) became
+  the default. Rejected: sizing each round's count from the link's measured idle window (timing
+  events recorded around the segment's share, `INFERNIX_TRICKLE_PROMOTIONS=auto`): with it the
+  gated handoff waited up to its 1 s bound behind the RTX PRO 4000's round although its graph took
+  25-46 ms, and requests failed or ended after one or two tokens (inference: the timing event
+  recorded last before the segment's flush left its launches unsubmitted under WDDM); fixed counts
+  of 14 and 28 did not. Promoting every token on the RTX 5080 (a measurement knob, interval 1
+  instead of 4) tripled its promotions for a hit of 77.0% against 76.9% and no faster decode.
   An unsplit Program keeps the dynamic policy on every link. Each segment's frames come from its
   own device's sizing (on one device, its layer share of that device's). `testing::
   delay_next_round` holds the first segment's next round (a host function on its stream) to test
@@ -2603,6 +2657,12 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   `infernix-serve --devices 0,1 --layer-split 24` on a six-turn chat (11.2K-11.5K-token prompts
   from turn 3): the turns after the 11.2K-token one resumed 99.2-99.4 % of their prompt from
   generation-opener snapshots with a 0.43-0.44 s TTFT, against 15.5 s for that turn.
+- **Layer split** (multi-GPU WP16, WP23). A split's prompts walk layer-major on every segment, each
+  segment streaming its own layers' experts once per span, and with two segments the second computes
+  the first one's MoE during its part of the span (the MoE offload), so the first segment's slow
+  link carries ~10 KiB per token per layer instead of every non-resident expert (§19.3.8, "F4 on a
+  layer split"). `test_split_prefill_real --walk-modes` checks the bits against
+  the unsplit run and chunk-major.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
@@ -3214,7 +3274,21 @@ As built, which differs from §11.2 where noted:
 - **Graphs.** The K-step chain is one CUDA graph per batch size and the catch-up one per
   (batch, width), as for verification.
 - **N-gram proposals** stay available beside MTP: a longer copy proposal replaces a round's MTP
-  drafts.
+  drafts. A round whose every drafting row verifies a copy runs no MTP draft steps (multi-GPU
+  wave 5): the drafter then only writes an unwritten pending cell, and the round stages its rows'
+  n-gram rows itself. The steps' K/V writes were speculative cells inside the verified window,
+  which the commit's catch-up rewrites, so the drafter's state and every token are unchanged.
+  Measured on the code-agent conversation (`bench_code_agent.py`: 10 files of the engine, each
+  pasted and rewritten whole with a change, then rewritten again with a fix, thinking off; 20 turns,
+  43K tokens final) on an RTX PRO 4000 + RTX 5080 split at K = 28: MTP alone 92.8 tok/s over the
+  second half (90.6 over all turns, 84 % of rounds at 5 columns), MTP with
+  `--ngram-draft-tokens 7` 105.7 (99.5), byte-identical replies; 76 % of the rounds verified
+  8-column copies (74 ms each, 97-99 % accepted) and skipped the draft steps' 2.2 ms.
+  Against the build before that change (gate handoff on both): 100.7 tok/s over the second half
+  (95.4 aggregate), whose 8-column copy rounds still ran 2.1 draft steps (4.1 ms, a 73.6 ms
+  period against 69.6), and 106.7 (100.4) after it, with the same replies. On the 20-turn
+  conversation benchmark (prose and pasted engine files, ~50K tokens) the copies gave 80.8 against
+  81.4 tok/s over the second half, within the runs' spread, with the same replies.
 
 **First results** (dense8m, INT8 KV, C = 1, greedy, cold-cache CLI, K = 3, text head). Greedy
 token ids equal plain decode on both prompts (300 and 200 tokens); `resident_moe_experts` and
@@ -5105,7 +5179,7 @@ Today the five kernels cost, per forward (A): `norm_kernel` 1.36 µs, `gates_ker
 
 | Kernel (T ≤ 16) | Grid | Steps | Output |
 |---|---|---|---|
-| K1a `hc_down_partials`, [324 or 320, 10240] | 4 K slices (one per stream, K = 2560) × 41 row groups of 8 rows = 164 CTAs × 8 warps; a row per warp, 10 chunks per lane | Weights first (20 KB per CTA); PDL wait; stage R[s, pass columns] and the norm weight; block-reduce each column's sum of squares in fixed order to inv[s, t]; write Rn = R·inv·(1 + w) in **FP32** to shared memory (80 KB per 8-column pass: 1 CTA per SM, 164 ≤ 170); K1 with `Fp32Shared` | FP32 `partial[s][row][t]` (4 × 324 × T × 4 B) in workspace; row group 0 also writes inv[s][t] |
+| K1a `hc_down_partials`, [324 or 320, 10240] | 4 K slices (one per stream, K = 2560) × 41 row groups of 8 rows = 164 CTAs × 8 warps; a row per warp, 10 chunks per lane | Weights first (20 KB per CTA); PDL wait; stage R[s, pass columns] and the norm weight; block-reduce each column's sum of squares in fixed order to inv[s, t]; write Rn = R·inv·(1 + w) in **FP32** to shared memory (80 KB per 8-column pass: 1 CTA per SM, 164 ≤ 170; on GB203 resident grids and two rows per warp, §19.3.21); K1 with `Fp32Shared` | FP32 `partial[s][row][t]` (4 × 324 × T × 4 B) in workspace; row group 0 also writes inv[s][t] |
 | K1b `hc_gates_up_collapse`, [10240, 320] | 160 CTAs × 16 warps; a CTA owns 16 d, a warp one d with `StreamQuad<2560>` rows (d, H+d, 2H+d, 3H+d) | Weights first; PDL wait; read all partials (5.2 KB × T per CTA); z = Σ_s partial[s] in order s = 0..3; m = SiLU(z/S) in FP32 shared memory; CTA 0 writes inject[s, t] = 2σ(z[rank+s]/S) when requested; K1 over W_up rows | The butterfly gathers a column's 4 streams into one lane, which forms Rn from R and inv in FP32 and writes x[d, t] = bf16((1/S)·Σ_s σ(u_s)·Rn_s) |
 
 - **Deviation from §8.3**, which takes the stream sums of squares from the previous kernel's
@@ -7674,6 +7748,157 @@ the drive's knee) remains open.
 - **Toggle.** A temporary environment variable (`INFERNIX_TMP_WALK_OFF`) gave the A/B in one
   binary; it was removed before the commit.
 
+#### F4 on a layer split (multi-GPU WP16 and WP23, 2026-10-11)
+
+A split first refused the walk (`walk_span_end` returned at once), so its prompts ran chunk-major
+and the RTX PRO 4000's segment (K = 28: 14,336 experts, ~7,200 frames, a 3.1 GB/s PCIe 3.0 x4 link)
+streamed its ~8,500 non-resident experts (~22 GiB, ~7 s) for every 4,096-token call: a 63K-token
+prompt prefilled at 565 tok/s, the RTX 5080 waiting for most of it.
+
+- **WP16, the walk on every segment** (`prefill_walk.cpp`). `walk_span_end` lends every segment's
+  stream lease with its walk area (the span is as long as every area allows); `walk_begin` uploads
+  each chunk's io image to every segment's area (the n-gram rows to the PLE segment only, as
+  `upload_io`), and rebases the MTP cells onto the head's copy and the image columns onto the first
+  segment's; `walk_pass` runs layer l on `layer_segment(l)`, and after a segment's last layer of
+  chunk c the boundary's `BulkHandoff` moves the chunk's residual columns into the next segment's
+  walk residual, ordered on both streams with no host wait. `walk_enqueue` groups each step's layers
+  by segment (`SegmentWork`, the segment's wide arena; on one GPU the segments' kernels never
+  overlap) and submits each group, since the next segment's stream waits for its crossings. The
+  span's end runs each segment's route download, stream end and `after_round`. A segment whose
+  lendable frames do not hold the walk area beside full ring halves (the 16 GB card at a long
+  context, `--devices 0,0`) squeezes the halves (a layer's experts beyond its half are staged per
+  chunk) rather than giving up the walk. `walk_report` logs each span (debug): its chunks and tokens,
+  each segment's time on its GPU from its first to its last pass, and the wall time.
+- **WP23, the MoE offload** (two segments; `INFERNIX_SPLIT_MOE_OFFLOAD=0` turns it off). During the
+  first segment's part of a span the second computes its MoE: `Forward::layer_front` runs layer l
+  up to the MoE input, the router and the routing (its ids copied to the route log, as
+  `moe_dispatch` writes them); the four tensors (x, ids, weights, shared gate: ~5 KiB per column)
+  are copied into one of eight staging slots and sent as one run by the first segment's side stream
+  (`DeviceSegment::side`) through `moe_out` into the chunk's columns of the second segment's walk
+  residual (unused until the crossing), received on its side stream; `Forward::moe_remote` on the
+  second segment runs `moe()`'s steps after the routing: the dispatch, the routed experts with every
+  expert non-resident (read from the shared pinned banks through its ring by an `ExpertStream` over
+  the first segment's layers), the shared expert from a copy of the layer's projections (the first
+  segment's 28 layers' parents, ~146 MB, in one pinned image made at load and uploaded into the
+  second segment's walk area at each span's start) and the combine; `moe_back` returns y (5 KiB per
+  column), received on the first segment's side stream, and `Forward::layer_back` injects it. The
+  first segment's lease then holds no ring (`stream_chunk` without `ring_wanted`), only the wide
+  arena, the walk area and the offload's results and staging, and a span of one call is walked too
+  (the 4,096-token suffix of an agent turn). The second segment's ring holds halves of 512 records
+  (every expert of a first-segment layer). At the end of the first part every chunk's residual
+  crosses at once (`walk_offload_cross`) and the second segment's own stream starts.
+- **One copy engine, in submission order.** Both GPUs report one asynchronous copy engine under WDDM
+  (`cudaDevAttrAsyncEngineCount` 1, also on the RTX 5080), and Nsight Systems shows each device's
+  copies running in the order they were enqueued, whatever their stream: a copy enqueued before its
+  input is ready holds every later copy of its device (a result uploaded right after its experts
+  were enqueued kept the RTX PRO 4000's link idle while they ran; the second segment's 1.35 GB ring
+  copy of a layer held the crossings for ~50 ms). The first part of a span was therefore neither
+  link- nor compute-bound (16K tokens: the RTX PRO 4000's copy engine busy 53 %, its kernels 42 %).
+  The offload now enqueues each device's copies in the order they can run:
+  - a chunk's result is uploaded after the next chunks' inputs were downloaded (`kResultLag` = 2,
+    at most n - 2 in a span of n chunks, so it has arrived when the copy engine reaches it and before
+    its back needs it), through `BulkHandoff::send` and `receive` (`transfer` in two halves that the
+    caller orders);
+  - the second segment's ring copies of first-segment layer l + 2 are listed once layer l's last
+    result has been sent (`ExpertStream::set_paced`, runs of at most 64 MiB) and enqueued in shares
+    after each chunk's crossings (`pump`; `before_experts` enqueues what is left);
+  - the backs wait as long as they can (just before the chunk's next front), the inputs ring holds 16
+    pieces of 16 MiB and the results ring 8, and the inputs cross as one run instead of five;
+  - the shared expert runs on the second segment, halving what the first segment's link carries
+    (its q8 projections do not depend on the SM count, so they give the same bits on either GPU even
+    without `INFERNIX_NUMERICS_SMS`);
+  - the walk's steps (about one call's work each) no longer synchronize every segment: a step's
+    last backs move to the next step, whose fronts they precede, and a split's step waits for the
+    previous step's end (`DeviceSegment::walk_steps`), so the devices run one step while the host
+    enqueues the next (multi-GPU WP20's "no per-call synchronize of all segments"; +0.6 % at 16K
+    and 61K tokens).
+
+  `infernix_bench -p` (prefill only, `--devices 0,1 --layer-split 28`, int8 KV, chunk 4096, MTP,
+  context sized to the prompt):
+
+  | Build (each row adds to the one above) | 16,384 tokens | 61,440 tokens |
+  |---|---:|---:|
+  | Shared expert on the RTX 5080, eight staging slots, backs as late as possible, one run per input crossing, larger rings | 2,861 tok/s | 4,035 tok/s |
+  | Steps without a full synchronize | 2,877 | 4,058 |
+  | Results one chunk late | 3,275 | |
+  | Results two chunks late (`kResultLag`) | 3,406 | |
+  | Paced ring copies | 3,640 (3,621-3,646 in three runs) | 4,425 |
+  | (Results three chunks late instead) | 2,987-3,031 | 4,413 |
+
+  At 16K tokens (Nsight Systems) the first part of the span went from 4.2 s to 2.3 s, its kernels
+  busy 75 % of it; the second segment's own part (1.6 s) is compute-bound.
+- **Same bits.** The front, `moe_remote` and the back run `layer()`'s kernels on the same inputs;
+  only placement and the order of independent work change (a chunk's front reads its own residual
+  and the layer's state after the earlier chunks' fronts, nothing of another chunk's back).
+  `test_split_prefill_real --walk-modes` compares, for 4,196 (one call and a tail), 12,388 (three
+  calls and a 100-token tail) and 73,828-token prompts (two spans) each with 8 generated tokens, the
+  unsplit Engine against the split with the offload, without it, and chunk-major: ids equal, logits
+  lines equal or, where a walk computes fewer, covered by the other run's, on `--devices 0,0` and on
+  `0,1` with `INFERNIX_NUMERICS_SMS=70`. The default suite (`--devices 0,0`, K = 1, 2, 24, 47)
+  accepts the same coverage, since the split walks a single 4,096-token call that the unsplit run
+  computes chunk-major. `infernix_handoff_test` checks `send`/`receive` bit-exact with each quarter
+  received after the next was sent, and that a piece sent again before it was received throws.
+- **Span ends and the prefix cache's taps.** `INFERNIX_SPLIT_WALK`: `1` (the default) ends a span
+  at every tap, as one GPU does, so a split takes the unsplit Program's snapshots
+  (`test_prefix_cache_real --devices 0,0 --layer-split 24` compares reused tokens request by
+  request); `2` ends a split's span at exact taps only (`walk_tap_due`, `prefix_tap_due(...,
+  exact_only)`): the history ladder's flexible taps, which ask for a call boundary rather than a
+  split, are realized where the span ends (`prefix_after_prefill_call` realizes every tap at or
+  before the boundary) or, when the span reaches the prompt's end, not at all, so a request diverging
+  inside a long prompt resumes from an earlier snapshot than on one GPU (the prefix test's tap and
+  pressure resumes reused 0 tokens instead of 1,024 and 3,584); `0` runs chunk-major. Every tap costs the 63K-token step below 1.5 s
+  (four spans instead of one); a conversation's paste that crosses a ladder tap is two spans.
+- **Measured** (`bench_context_steps.py --step 50000`, one 63,487-token step in a 262K window, K = 28,
+  RTX PRO 4000 + RTX 5080, production flags; TTFT):
+
+  | Build | Spans | TTFT | Prefill | First segment | Second segment |
+  |---|---|---:|---:|---:|---:|
+  | Chunk-major (before WP16) | 16 calls | 112.5 s | 565 tok/s | link-bound | |
+  | WP16 walk, every tap | 4 (taps at 32K, 48K, 56K) | 43.1 s | 1,472 tok/s | 8.3-11.2 s per span | 1.0-2.8 s |
+  | WP16 walk, exact taps only | 1 | 24.1 s | 2,631 tok/s | 18.7 s | 5.2 s |
+  | + MoE offload as first built, every tap | 4 | 27.0 s | 2,349 tok/s | 20.2 s in all | 5.9 s |
+  | + MoE offload as first built, exact taps only | 1 | 23.0 s | 2,756 tok/s | 17.2 s | 5.2 s |
+  | Offload with the shared expert and the copy order above, every tap (default) | 4 | 20.7 s | 3,061 tok/s | 13.8 s in all | 6.0 s |
+  | The same, exact taps only | 1 | 19.2 s | 3,300 tok/s | 13.4 s | 5.1 s |
+
+  A segment's time runs from the span's start to its last pass, so the first segment's includes the
+  host's staging of the chunks' n-gram rows before the walk starts: ~4.5 s of NVMe reads for these
+  63K tokens of new text (407,782 block reads), as on one GPU. Without the offload the first segment
+  needs ~8.1 s of link per span whatever its length (9,125 experts, 23.5 GiB); with it the link
+  carries ~10 KiB per token and layer. On the 20-turn conversation (`bench_conversation.py`, ~50K
+  tokens at the end, prefix cache on) the four paste turns' TTFT, in s:
+
+  | Build | Turn 3 (11K new) | Turn 7 (16K) | Turn 11 (7.5K) | Turn 15 (13K) |
+  |---|---:|---:|---:|---:|
+  | Chunk-major (before WP16) | 18.4 | 28.4 | 12.0 | 25.6 |
+  | WP16 walk, exact taps | 9.6 | 12.9 | 11.3 | 9.8 |
+  | + MoE offload as first built, exact taps | 5.3 | 6.8 | 4.4 | 6.0 |
+  | This change, every tap (default) | 3.9 | 6.6 | 3.5 | 6.2 |
+  | This change, exact taps only | 3.9 | 4.9 | 3.5 | 4.3 |
+  | RTX 5080 alone | 7.9 | 10.6 | 5.6 | 10.5 |
+
+  Turns 7 and 15 cross a history ladder tap, so every tap walks them as two spans of two calls: a
+  span that short leaves the offload's pipeline shallow (each result is uploaded as soon as it is
+  sent), +1.6 and +1.9 s. Every reply is byte-identical to the chunk-major run's in every row;
+  second-half decode 82.6 tok/s (80.3 before the walk). A first run of the default build measured
+  7.3 s on turn 3: its n-gram rows took 6.9 s of NVMe reads instead of 1.2 s (another program's disk
+  traffic), as did an earlier every-tap run's turn 7 (13.7 s, 10.7 s of reads).
+- **Not done.**
+  - *Pipelining the spans (WP20).* The second segment's own part is compute-bound and now ~27 % of a
+    span (5.1 of 19.2 s at 63K); hiding it needs two spans in flight, with the offload two rings on
+    the RTX 5080 at once (1,025 frames for the first segment's layers, ~960 for its own) beside its
+    wide arena (821) and walk areas (537 for a 64K span): 3,346 frames against the 2,509 it can
+    lend. Smaller halves stage the rest of each layer's experts per chunk (~37 ms of link per chunk
+    and layer at 256 records), more than the overlap gains. Without the offload, sub-spans short
+    enough to pipeline make the first segment link-bound again (~8 s per span). A conversation's
+    pastes (2-4 calls) are one span each, where it cannot apply.
+  - *One enqueue thread per segment (WP20).* The host is not the bottleneck any more: the copies'
+    order, not their enqueue, held the devices.
+  - *Splitting the experts by residency (the spec's WP23: the first segment computes its resident
+    experts, the second the rest and returns unsummed outputs).* The unsummed outputs of a 4,096-token
+    chunk's non-resident half are ~100 MiB per layer back over the 3.1 GB/s link, against 20 MiB for
+    the combined result, and the second segment's ring would still copy half a layer per chunk.
+
 #### F5: QSA prompt attention on Tensor Cores
 
 - **Route.** Exactly the calls the FP32 kernel would run unsplit (`ops/qsa/qsa_prompt.{h,cu}`,
@@ -9014,6 +9239,87 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
   diverged from Gold (deterministically, three runs) and the prefix-cache real test's restored
   resume differed from the original turn at token 30. Synthetic-input equality is not evidence of
   bit-exactness for a different reduction order.
+
+### 19.3.21 Decode kernels on GB203: RTX 5080 and RTX PRO 4000 (2026-10-11)
+
+The layer split across two GPUs (`--devices 0,1 --layer-split K`, §16.4) runs on an RTX PRO 4000
+(70 SMs, 48 MB L2, 672 GB/s) and an RTX 5080 (84 SMs, 64 MB L2, 960 GB/s). Several decode kernels
+were sized for the RTX 5090's 170 SMs and need two or three waves there. Every change below is occupancy-only: it
+keeps each output's reduction order, so the bits do not change. The choices read the device's own
+SM count (`ops::device_multiprocessors()`, `src/ops/common/device_sms.h`) and ignore
+`INFERNIX_NUMERICS_SMS` (op development §4.2). The routes measured here serve parts of at most 96
+SMs (`gb203_class()`); larger parts keep the RTX 5090's routes, which this rig cannot measure.
+
+**Where decode time goes.** Nsight Systems on the K = 28 split (`infernix_bench`, int8 KV, MTP 4
+drafts, 48K context, 57 rounds of about 4.5 tokens). Kernel time per round:
+
+| Kernel | RTX PRO 4000 (layers 0-27) | RTX 5080 (layers 28-47, head, MTP) |
+|---|---:|---:|
+| `cpu_wait_kernel` (CPU-served misses) | 26.3 ms | 4.9 ms |
+| `stage_kernel` (staged misses, forked) | 10.0 ms | 11.5 ms |
+| narrow expert `gate_up` + `down` | 11.4 ms | 6.3 ms |
+| Q8 stream (GDN q/k/v/z, PLE, shared down) | 2.2 ms | 1.2 ms |
+| shared expert gate/up (`stream_pair`) | 2.2 ms | 0.9 ms |
+| HC mixer K1a + K1b | 3.2 ms | 1.6 ms |
+| Q8 SIMT out projection [2560, 6144] | 1.0 ms | 0.6 ms |
+| MTP drafter experts (`resident_moe`) | - | 0.8 ms |
+| proposal head + lm_head | - | 1.7 ms |
+
+In the same profile the GPUs are busy for 8 % (PRO) and 4 % (5080) of a 48K prompt's prefill
+span: prefill on the split waits on expert copies, not on its kernels, so its MMA tiles were not
+retuned.
+
+**Changes** (op benchmarks per card, cold L2, graph-captured, median µs; the decode widths are
+T = 1 and the T = 5 of an MTP verification with four drafts):
+
+| Op | Change | RTX PRO 4000 | RTX 5080 |
+|---|---|---|---|
+| `hyper_connection_mix` fused, inject mixer | K1a and K1b grids resident at once (each CTA loops over row groups or feature blocks and forms Rn or m once); two W_down rows per K1a warp | T = 1: 32.7 → 28.5; T = 5: 69.9 → 40.9 | T = 1: 20.7 → 18.6; T = 5: 43.5 → 27.1 |
+| `moe_experts` narrow route | the one-column kernels (two gate/up CTAs per SM) up to 8 columns instead of 4 | T = 5: 701 → 375; T = 8: 937 → 517 | T = 5: 507 → 262; T = 8: 656 → 358 |
+| Q8 [2560, 6144] (GDN/QSA out) | T ≤ 4 SIMT with 16-group stages, T = 5-8 register-streamed with x through L1 | T = 4: 41.5 → 36.4; T = 5: 46.4 → 38.4 | T = 4: 25.1 → 23.5; T = 5: 31.3 → 23.1 |
+| Q8 [16384, 2560] (GDN q/k/v/z) | T ≤ 4 SIMT with 16-group stages, T = 5-6 a 6-column register-streamed tile | T = 4: 85.7 → 79.8; T = 5: 92.1 → 85.5 | T = 4: 53.8 → 47.3; T = 5: 57.9 → 53.8 |
+| `linear_swiglu` shared expert | a build capped at 168 registers (three CTAs per SM) when the 160 CTAs exceed one wave of the 232-register build | T = 1: 18.8 → 14.2; T = 5: 35.1 → 29.0 | unchanged (one wave) |
+| `resident_moe_experts` (MTP drafter) | the staged FP32 activation padded by four floats after every 32: the warp's lanes no longer hit one shared-memory bank (32-way conflicts) | T = 1: 308 → 59 | T = 1: 218 → 35 |
+
+The `resident_moe` fix applies to every GPU. The 5090 keeps a row per K1a warp (its 164-CTA grid is
+one wave) and the BF16 codec too.
+
+**Bit identity.**
+- Op level: `--dump` of `infernix_hyper_connection_mix_bench`, `infernix_offloaded_moe_narrow_bench`,
+  `infernix_q8_linear_swiglu_bench --problem flash_next_shared` and `infernix_resident_moe_bench`
+  byte-equal to the d8383c7 build on both cards. A temporary sweep (op development §7) compared
+  134 Q8 decode candidates per card, the old production routes among them, byte for byte with the
+  new routes. The HC, offloaded-MoE (layer, CUDA, wide), Q8 A16 (column invariance), LinearSwiGLU
+  and resident-MoE tests pass on both cards.
+- End to end (real activations; §19.3.20 shows why synthetic equality is not enough): greedy ids
+  of the code prompt (256 tokens, plain and MTP) equal `ref-master` on the RTX 5080; per-step logits
+  hashes equal the d8383c7 build on both cards, plain and MTP; `forward_real_test` logits (int8 KV,
+  chunk 64) are byte-equal to the reference on the RTX 5080 and to d8383c7 on the RTX PRO 4000
+  (perplexity 3.6792); a six-turn chat on `--devices 0,1 --layer-split 28` at
+  `INFERNIX_NUMERICS_SMS=70` replies byte for byte as the unsplit `--device 0` run.
+
+**End to end** (`infernix-serve --devices 0,1 --layer-split 28`, production flags, d8383c7 against
+this build in one session; the 20-turn `bench_conversation.py` to 49.5K tokens, whose replies are
+byte-identical in all six runs):
+- Second-half decode mean, in ABBA order: 81.4 and 81.3 tok/s for d8383c7, 85.8 and 85.2 for this
+  build (+5 %); the 1-s peak rises from 120.7 to 127.7. An earlier pair gave 81.8 against 81.8,
+  with turns 11-14 of the new run slowed by another job's file copies on the host; its first half
+  was 81.8 → 86.7. TTFT is unchanged.
+- One 50K prefill step (`bench_context_steps.py --step 50000 --max-total 55000`, 63,487 new
+  tokens): 570.0 → 570.8 tok/s, as expected for a link-bound prefill; the decode after it
+  63.5 → 65.3 tok/s.
+
+**Not adopted.**
+- PDL on the two HC kernels: at most 0.6 µs at T = 1 with weights in L2, slower at T = 4 on the
+  RTX 5080 (18.9 → 20.2 µs), nothing cold.
+- Narrow experts with the staged slice split into four `cp.async` groups so the first pass starts on
+  the first quarter: slower at T = 1 on the RTX 5080 (111 → 130 µs cold).
+- The capped shared-expert build everywhere: slower on the RTX 5080 (T = 5: 23.1 → 25.1 µs).
+- A T = 5 SIMT tile for [2560, 6144] (R4 T5 G16): 1.9 µs faster than the streamed route on the RTX
+  PRO 4000, 2 µs slower on the RTX 5080; one route serves both.
+- Prefill MMA tiles: every tile accumulates in the same order, so a retune would be bit-exact, but
+  the big 4096-column grids are 8-59 waves deep on either card, and prefill kernels are not the
+  bound (above).
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

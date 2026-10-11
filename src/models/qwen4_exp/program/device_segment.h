@@ -140,6 +140,32 @@ struct SegmentEvent {
     cudaEvent_t event = nullptr;
 };
 
+// Streams beside the compute stream for a layer split's MoE offload (ProgramImpl::walk_offload_layers),
+// so neither compute stream waits for a device's link: `stream` receives the other segment's copies
+// and records `events`, one per chunk of a layer walk's span; on the sending segment `out` sends its
+// staged MoE inputs, `staged[k]` (compute) and `sent[k]` (out) order the reuse of staging slot k.
+// Destroyed after their work.
+struct SideStream {
+    SideStream() = default;
+    SideStream(const SideStream&)            = delete;
+    SideStream& operator=(const SideStream&) = delete;
+    ~SideStream() {
+        for (cudaStream_t s : {stream, out}) {
+            if (s != nullptr) { (void)cudaStreamSynchronize(s); }
+        }
+        for (const auto* list : {&events, &staged, &sent}) {
+            for (auto event : *list) {
+                if (event != nullptr) { cudaEventDestroy(event); }
+            }
+        }
+        for (cudaStream_t s : {stream, out}) {
+            if (s != nullptr) { cudaStreamDestroy(s); }
+        }
+    }
+    cudaStream_t stream = nullptr, out = nullptr;
+    std::vector<cudaEvent_t> events, staged, sent;
+};
+
 // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.
 struct OverlapResources {
     ~OverlapResources() {
@@ -246,8 +272,36 @@ struct DeviceSegment {
     BulkHandoff* bulk_out = nullptr;
     SegmentEvent compute_done;
     DeviceBuffer handoff_stats;
-    // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming).
+    // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming);
+    // on the head also around the drafter's catch-up and draft graph.
     SegmentEvent timing_begin, timing_end;
+    SegmentEvent catch_begin, catch_end, draft_begin, draft_end;
+    // A split's layer walk: recorded before the segment's first pass of a span and after its last,
+    // for the span's debug report (ProgramImpl::walk_report).
+    SegmentEvent walk_first, walk_last;
+    // A split's walk steps end on these in turn (ProgramImpl::walk_step): a step waits for the
+    // previous one's, so the device runs one step while the host enqueues the next.
+    std::array<SegmentEvent, 2> walk_steps;
+
+    // ---- a layer split's MoE offload in the layer walk (multi-GPU WP23; ProgramImpl::walk_offload_layers):
+    // the side stream receiving copies from the other segment, the boundary's two bulk crossings
+    // (on the sending segment: its MoE inputs out, the results back), and on the segment that runs
+    // the previous segment's MoE: an expert stream over that segment's layers (records from the
+    // shared pinned banks, through this segment's ring), a frame table with no expert resident
+    // (device I32 [E] of -1) and its host form per layer, its layers' scales here, and its layers'
+    // shared experts: their projections' parents in one pinned image (remote_shared_host, uploaded
+    // into each span's walk area after the io images), remote_shared per layer {gate_up, down}
+    // pointing into the image and remote_shared_bound the same rebased into the span's area. ----
+    SideStream side;
+    BulkHandoff* moe_out  = nullptr;
+    BulkHandoff* moe_back = nullptr;
+    std::unique_ptr<execution::ExpertStream> remote_stream;
+    DeviceBuffer remote_frames, remote_scales;
+    std::vector<std::int32_t> remote_table;
+    std::vector<const std::uint8_t*> remote_records;
+    std::unique_ptr<PinnedHostBuffer> remote_shared_host;
+    std::size_t remote_shared_bytes = 0;
+    std::vector<execution::LinearParameters> remote_shared, remote_shared_bound;
 
     // ---- the Forward and its CUDA graph families ----
     std::unique_ptr<execution::Forward> forward;

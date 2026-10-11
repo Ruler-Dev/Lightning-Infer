@@ -302,10 +302,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
             static_cast<std::uint64_t>(static_cast<double>(ledger.expert_ram) / (1.0 + demand.lock_overhead));
     }
 
-    // A layer split's handoffs (decode and verification rounds): Auto is the event handoff until the
-    // gate's soak passes, so the gate stays opt-in.
-    program_options.handoff            = options.split_handoff == SplitHandoff::Gate ? SplitHandoff::Gate
-                                                                                    : SplitHandoff::Event;
+    // A layer split's handoffs (decode and verification rounds): Auto is the gate handoff when the
+    // segments are on two different GPUs, where the receiving GPU's graph is launched at once and
+    // waits on the GPU (RTX PRO 4000 + RTX 5080 at K = 28: rounds 0.1 ms shorter over the 20-turn
+    // conversation, 23.18 against 23.29 ms, 0.6 ms on the CLI code prompt, same tokens), and the
+    // event handoff on one GPU, where a waiting gate could starve the sender.
+    const bool two_gpus = devices.size() > 1 && devices[0]->device != devices[1]->device;
+    program_options.handoff = options.split_handoff == SplitHandoff::Gate ||
+                                      (options.split_handoff == SplitHandoff::Auto && two_gpus)
+                                  ? SplitHandoff::Gate
+                                  : SplitHandoff::Event;
     program_options.handoff_timeout_ms = options.handoff_timeout_ms;
     program_options.logits_hash        = models::qwen4_exp::testing::logits_hash();
 

@@ -840,9 +840,11 @@ Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32
 
 `infernix_q8_linear_swiglu_bench` measures the public Q8 LinearSwiGLU profiles:
 `--problem companion` is `[12288,2048] -> [6144,T]`; `--problem dflash2` is
-`[34816,5120] -> [17408,T]`. Every timed call uses production dispatch and writes only the fused
+`[34816,5120] -> [17408,T]`; `--problem flash_next_shared` is Qwen3.8-Flash-Next's shared expert,
+`[1280,2560] -> [640,T]`. Every timed call uses production dispatch and writes only the fused
 output. Workspace is queried for the requested interval before timing. Private candidate forcing
-and the former composed control are removed from this retained tool.
+and the former composed control are removed from this retained tool. `--dump PATH` writes every
+point's output in sweep order, so two builds can be compared byte for byte.
 
 `--execution eager` (default) times the complete public call; `--execution graph` captures that
 call and times one replay. Every sample follows a 256 MiB L2 flush. CSV records execution mode,
@@ -858,6 +860,34 @@ cmake --build build -j --target infernix_q8_linear_swiglu_bench
   --csv-out profiles/bench/q8_linear_swiglu.csv
 ./build/bench/infernix_q8_linear_swiglu_bench \
   --problem dflash2 --profile --t-sweep 128
+```
+
+## Qwen3.8-Flash-Next decode Op benchmarks
+
+Three model-free benchmarks cover decode-width Ops of Qwen3.8-Flash-Next that no other benchmark
+reaches. Each times graph-captured public calls with `--cache cold` (a 256 MiB L2 eviction read
+before every sample), `warm` (the operands left in L2) or `both`, and `--dump PATH` writes every
+point's outputs in sweep order so two builds can be compared byte for byte. On a multi-GPU host run
+them per card (`CUDA_VISIBLE_DEVICES`): some launch decompositions follow the device's SM count.
+
+- `infernix_hyper_connection_mix_bench`: `hyper_connection_mix` with Q8 weights at S = 4,
+  H = 2560, rank 320; `--variant inject` (W_down [324,10240], the block mixers), `final`
+  ([320,10240]) or `both`; `--tokens` (T <= 16 is the fused route); `--graph-calls N` times N
+  calls in one graph and reports per call.
+- `infernix_offloaded_moe_narrow_bench`: `moe_experts` at decode and verification widths
+  (`--tokens` 1..8) on the fork route, every record resident in its own device frame (512 experts,
+  top-10, skewed popularity), so it times the narrow gate/up and down kernels. It reports the
+  distinct experts, their record bytes and the achieved rate; cold is the decode case.
+- `infernix_resident_moe_bench`: `resident_moe_experts` at the MTP drafter's geometry (512 Q4
+  experts, top-10, H = 2560, I = 640) over random distinct experts per column.
+
+```bash
+cmake --build build -j --target infernix_hyper_connection_mix_bench infernix_offloaded_moe_narrow_bench \
+  infernix_resident_moe_bench
+CUDA_VISIBLE_DEVICES=1 ./build/bench/infernix_hyper_connection_mix_bench --tokens 1,4,5,8 --cache cold \
+  --repeat 200 --dump hc.bin
+CUDA_VISIBLE_DEVICES=1 ./build/bench/infernix_offloaded_moe_narrow_bench --tokens 1,2,4,5,8 --cache both
+CUDA_VISIBLE_DEVICES=1 ./build/bench/infernix_resident_moe_bench --tokens 1,2,4 --cache cold
 ```
 
 ## Q4 LinearSwiGLU Op benchmark

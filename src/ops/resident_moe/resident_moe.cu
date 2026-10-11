@@ -2,6 +2,11 @@
 // each warp streams whole weight rows in 16-byte chunks against the entry's activation staged in
 // shared memory as FP32, applies each chunk's FP16 group scale once, and reduces by a fixed
 // butterfly, so an output's bits depend only on the shapes, never on the batch or placement.
+//
+// The staged activation is padded by four floats after every 32 (padded()): lane l reads chunk l's
+// activations, one 32- or 16-float run per lane, and without the padding every lane of a warp would
+// address the same shared-memory bank (a 32-way conflict on each read). With it the 16-byte reads of
+// eight consecutive lanes fall in distinct banks.
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
@@ -25,22 +30,29 @@ constexpr int kDownRowsPerCta = kWarps * 4;
 constexpr int kMaxHidden      = 4096;
 constexpr int kMaxIntermediate = 2048;
 
+// Shared-memory index of activation element i: four padding floats after every 32.
+__host__ __device__ constexpr int padded(int i) { return i + 4 * (i >> 5); }
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("resident_moe_experts: ") + message); }
 }
 
 // Row-split codecs: one 16-byte chunk holds Q4's 32 or Q8's 16 consecutive codes of one group.
+// x is the chunk's activations in shared memory, 16-byte aligned and contiguous.
 struct Q4 {
     static constexpr int kCodes = 32, kGroup = 64;
     __device__ static float chunk_dot(uint4 w, const float* x) {
         const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+        const auto* x4               = reinterpret_cast<const float4*>(x);
         float dot = 0.0F;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            const float4 a = x4[2 * i], b = x4[2 * i + 1];
+            const float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int u = static_cast<int>((words[i] >> (4 * j)) & 0xFU);
-                dot = fmaf(static_cast<float>(u >= 8 ? u - 16 : u), x[8 * i + j], dot);
+                dot = fmaf(static_cast<float>(u >= 8 ? u - 16 : u), xv[j], dot);
             }
         }
         return dot;
@@ -50,13 +62,21 @@ struct Q4 {
 struct Q8 {
     static constexpr int kCodes = 16, kGroup = 32;
     __device__ static float chunk_dot(uint4 w, const float* x) {
-        const auto* c = reinterpret_cast<const std::int8_t*>(&w);
-        float dot     = 0.0F;
+        const auto* c  = reinterpret_cast<const std::int8_t*>(&w);
+        const auto* x4 = reinterpret_cast<const float4*>(x);
+        float dot      = 0.0F;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) { dot = fmaf(static_cast<float>(c[i]), x[i], dot); }
+        for (int q = 0; q < 4; ++q) {
+            const float4 v    = x4[q];
+            const float xv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { dot = fmaf(static_cast<float>(c[4 * q + i]), xv[i], dot); }
+        }
         return dot;
     }
 };
+static_assert(Q4::kCodes <= 32 && Q8::kCodes <= 32 && 32 % Q4::kCodes == 0 && 32 % Q8::kCodes == 0,
+              "a chunk's activations lie in one padded run of 32");
 
 struct Bank {
     const std::uint8_t* codes;
@@ -64,7 +84,8 @@ struct Bank {
     int padded_k;
 };
 
-// Dot product of row `row` of a bank with the FP32 vector x (K = padded_k), reduced over the warp.
+// Dot product of row `row` of a bank with the FP32 vector x (K = padded_k, staged at padded()
+// indices), reduced over the warp.
 template <class Codec>
 __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int lane) {
     const int chunks       = bank.padded_k / Codec::kCodes;
@@ -75,7 +96,7 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
     for (int c = lane; c < chunks; c += 32) {
         const uint4 w     = __ldcs(chunks_row + c);
         const float scale = __half2float(__ldg(scale_row + c * Codec::kCodes / Codec::kGroup));
-        sum               = fmaf(Codec::chunk_dot(w, x + c * Codec::kCodes), scale, sum);
+        sum               = fmaf(Codec::chunk_dot(w, x + padded(c * Codec::kCodes)), scale, sum);
     }
     for (int offset = 16; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset); }
     return sum;
@@ -85,12 +106,12 @@ template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
                    int intermediate, Bank bank, float* __restrict__ h) {
-    __shared__ float xs[kMaxHidden];
+    __shared__ __align__(16) float xs[padded(kMaxHidden)];
     const int entry = static_cast<int>(blockIdx.y);
     const int t     = entry / top_k;
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        xs[i] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
+        xs[padded(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
@@ -108,11 +129,11 @@ template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int hidden, int intermediate,
                 Bank bank, bf16* __restrict__ out) {
-    __shared__ float hs[kMaxIntermediate];
+    __shared__ __align__(16) float hs[padded(kMaxIntermediate)];
     const int entry = static_cast<int>(blockIdx.y);
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        hs[i] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
+        hs[padded(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);

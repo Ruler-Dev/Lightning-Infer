@@ -473,9 +473,9 @@ struct ProgramOptions {
     // Changes no result; each such call waits for its logits.
     std::filesystem::path logits_hash;
     // A layer split (more than one segment): how decode and verification rounds hand the residual
-    // across a boundary (EngineOptions::split_handoff, Auto taken as Event; Gate needs the segments
-    // on different GPUs) and the bound of a gated handoff's wait, past which the round fails with a
-    // RecoverableExecutionError.
+    // across a boundary (EngineOptions::split_handoff: Auto is Gate on two different GPUs and Event
+    // on one; Gate needs the segments on different GPUs) and the bound of a gated handoff's wait,
+    // past which the round fails with a RecoverableExecutionError.
     SplitHandoff handoff            = SplitHandoff::Event;
     std::uint32_t handoff_timeout_ms = kDefaultHandoffTimeoutMs;
 };

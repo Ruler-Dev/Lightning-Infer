@@ -252,6 +252,31 @@ struct MtpCall {
     const VisionInput* vision = nullptr;
 };
 
+// A layer's MoE that another device computes (a layer split's prefill, multi-GPU WP23):
+// layer_front runs the layer up to the MoE's input and its routing on this device; the other
+// device's Forward runs moe_remote over the same tensors (the dispatch, the routed experts, the
+// shared expert and the combine); layer_back adds the result. The same kernels see the same inputs
+// as in layer(), so the residual is layer()'s bit for bit.
+struct MoeFront {
+    Tensor x;                // BF16 [H, T]: the MoE input
+    ops::MoeRouting routing; // ids I32 [k, T], weights FP32 [k, T], shared_gate FP32 [T]
+};
+
+// Another segment's layer as moe_remote reads it: no expert is resident here (frames: device I32
+// [E] of -1), records come from the shared pinned bank at host_records or from `stream`'s ring
+// (its layer `stream_layer`; the caller releases it), scales are this device's copy of the
+// layer's, and the shared expert's projections are copies of the layer's in this device's memory.
+struct RemoteMoe {
+    const std::int32_t* frames = nullptr;
+    const std::uint8_t* host_records = nullptr;
+    std::uint64_t record_stride = 0;
+    const ops::offloaded_moe::ExpertScales* scales = nullptr;
+    const LinearParameters* shared_gate_up = nullptr;
+    const LinearParameters* shared_down    = nullptr;
+    ExpertStream* stream       = nullptr;
+    std::uint32_t stream_layer = 0;
+};
+
 // Optional observation of every block, for reference comparison. The vectors are indexed by
 // decoder layer; a segment writes its own layers' entries only.
 struct ForwardTap {
@@ -298,6 +323,21 @@ public:
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+
+    // A layer whose MoE another device computes (MoeFront): layer_front is layer() up to the MoE's
+    // input (with `inject`, FP32 [S, T] outside the workspace, as layer()'s), then the router and
+    // the routing (copied to the route log); `front`'s tensors live in the workspace until this
+    // Forward's next begin_call, so the caller copies them out on this device's stream before it.
+    // layer_back adds `y` (BF16 [H, T], the other device's moe_remote result) through `inject`.
+    // Both after begin_call, as layer().
+    void layer_front(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& inject,
+                     MoeFront& front);
+    void layer_back(std::uint32_t layer, Tensor& residual, const Tensor& inject, const Tensor& y);
+    // The routed experts, the shared expert and the combine of another segment's layer over a
+    // front's tensors (in this device's memory): moe()'s steps after the routing, in its order.
+    // Resets the workspace (no call may be in progress on this Forward); returns y (BF16 [H, T]) in
+    // it, valid until the next reset.
+    [[nodiscard]] Tensor moe_remote(const RemoteMoe& layer, const Tensor& x, const ops::MoeRouting& routing);
 
     // The call's residual (BF16 [S*H, T]) in the workspace: run()'s first allocation after
     // begin_call, so its address is the same in every call (capturable).

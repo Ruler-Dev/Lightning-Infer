@@ -4,7 +4,10 @@
 // reference device. Every call and round that computes logits writes the FNV-1a of the head's FP32
 // logits (ProgramOptions::logits_hash, through testing::set_logits_hash), so the comparison covers
 // each prefill call's logits, the first token, forced tokens' logits and every decode or
-// verification round's logits, besides the generated ids.
+// verification round's logits, besides the generated ids. A layer walk computes no logits before
+// its span's last chunk, and the split walks even a single call (the MoE offload), so a prompt's
+// lines may be fewer than the unsplit run's: each is then found, in order, among them, the last
+// ones equal.
 //
 // Cases, per K: raw-token prompts of 1, 255, 256 and 4113 tokens (two prefill calls at the default
 // --prefill-chunk 4096: 4096 + 17), each generating one token; the 255-token prompt generating
@@ -21,6 +24,17 @@
 // delays one round's first segment past the gate's bound (testing::delay_next_round): that request
 // fails with a recoverable handoff timeout and the next one gives the reference's bits.
 //
+// --walk-modes runs each split three times: walking its long prompts layer-major on both segments
+// with the first segment's MoE on the second (multi-GPU WP16 and WP23, the default),
+// walking without that MoE offload (INFERNIX_SPLIT_MOE_OFFLOAD=0), and chunk-major
+// (INFERNIX_SPLIT_WALK=0); it compares each with the unsplit run and with the default one: equal
+// ids, and each run's logits lines either equal (the same calls computed logits) or, where a layer
+// walk computed fewer (no logits before a span's last chunk), every line of the walking run found
+// in order among the other's, the last ones equal. --prompt-decode N lets every prompt
+// generate N tokens (default 1), so its decode rounds read every layer's state after the prompt.
+// E.g. --prompts 12388,73828 --context 81920 --walk-modes --prompt-decode 8: 3 x 4096 + 100 tokens
+// (one span, then a narrow call) and 18 x 4096 + 100 (two spans: 16 calls at kWalkMaxTokens, 2).
+//
 // Two GPUs: --devices 0,1 --reference 0 with INFERNIX_NUMERICS_SMS set to the smaller GPU's SM
 // count (the same launch decompositions on both). Skips (77) unless INFERNIX_QWEN4_ARTIFACT names
 // a Qwen4Exp artifact. Each Engine pins the expert banks (about 64 GiB of Host RAM); they run one
@@ -29,7 +43,7 @@
 //   INFERNIX_QWEN4_ARTIFACT=a.infernix [INFERNIX_QWEN4_NGRAM=a.ngram]
 //   infernix_qwen4_exp_split_prefill_real_test [--devices A,B] [--reference D] [--splits K,...]
 //       [--prompts N,...] [--decode N] [--chunk N] [--context N] [--plain] [--no-forced] [--no-cancel]
-//       [--long] [--pair] [--handoff event|gate] [--timeout] [--work DIR]
+//       [--long] [--pair] [--handoff event|gate] [--timeout] [--walk-modes] [--prompt-decode N] [--work DIR]
 
 #include "models/qwen4_exp/program/program.h"
 #include "infernix/engine.h"
@@ -72,6 +86,8 @@ struct Options {
     bool gate             = false;
     bool timeout          = false;
     bool pair             = false;
+    bool walk_modes       = false;
+    std::uint32_t prompt_decode = 1;
     fs::path work         = fs::temp_directory_path() / "infernix_split_prefill";
 };
 
@@ -124,6 +140,11 @@ Options parse(int argc, char** argv) {
             o.cancel = false;
         } else if (arg == "--long") {
             o.long_prompt = true;
+        } else if (arg == "--walk-modes") {
+            o.walk_modes = true;
+        } else if (arg == "--prompt-decode") {
+            o.prompt_decode = static_cast<std::uint32_t>(std::stoul(value()));
+            if (o.prompt_decode == 0) { throw std::invalid_argument("--prompt-decode needs N > 0"); }
         } else if (arg == "--work") {
             o.work = value();
         } else {
@@ -248,7 +269,8 @@ Run run_engine(const Options& o, const char* artifact, const char* ngram, const 
         };
         for (const std::uint32_t n : o.prompts) {
             const auto started = std::chrono::steady_clock::now();
-            run.prompts[n]     = request(std::vector<infernix::TokenId>(tokens.begin(), tokens.begin() + n), 1);
+            run.prompts[n] =
+                request(std::vector<infernix::TokenId>(tokens.begin(), tokens.begin() + n), o.prompt_decode);
             std::printf("  %u-token prompt: %zu call(s), %.1f s%s\n", n, run.prompts[n].lines.size(),
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
                         run.prompts[n].error.empty() ? "" : (", failed: " + run.prompts[n].error).c_str());
@@ -361,6 +383,31 @@ bool lines_cover(const std::vector<std::string>& reference, const std::vector<st
     return true;
 }
 
+// The logits of two runs of one request agree: their lines are equal, or the run with fewer lines (a
+// layer walk computes no logits before a span's last chunk) is covered by the other's.
+bool same_logits(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    if (a.size() == b.size()) { return !a.empty() && a == b; }
+    return a.size() < b.size() ? lines_cover(a, b) : lines_cover(b, a);
+}
+
+void set_variable(const char* name, const char* value) {
+#if defined(_WIN32)
+    ::_putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
+
+// The layer walk's diagnostics of a run (debug level): span reports and each lease's streamed experts.
+void print_walks(const std::vector<std::string>& diagnostics) {
+    for (const std::string& line : diagnostics) {
+        if (line.find("layer walk span") != std::string::npos || line.find("prefill expert stream") != std::string::npos ||
+            line.find("prefill stream lease") != std::string::npos) {
+            std::printf("  [walk] %s\n", line.c_str());
+        }
+    }
+}
+
 // The page counts the segments' "KV pool grew to N pages" reports name.
 std::vector<std::string> growth_reports(const std::vector<std::string>& diagnostics) {
     std::vector<std::string> out;
@@ -412,26 +459,63 @@ int main(int argc, char** argv) {
             run_engine(o, artifact, ngram, {reference_device}, std::nullopt, o.work / "reference.hash", tokens);
         if (tokens.size() < longest) { throw std::logic_error("the corpus is shorter than the longest prompt"); }
         for (const auto& [n, outcome] : reference.prompts) {
-            check(outcome.error.empty() && outcome.ids.size() == 1 && !outcome.lines.empty(),
-                  "reference: the " + std::to_string(n) + "-token prompt gives one token and its calls' logits");
+            check(outcome.error.empty() && outcome.ids.size() == o.prompt_decode && !outcome.lines.empty(),
+                  "reference: the " + std::to_string(n) + "-token prompt gives " + std::to_string(o.prompt_decode) +
+                      " token(s) and its calls' logits");
         }
 
+        if (o.walk_modes) { print_walks(reference.diagnostics); }
+        // (K, mode): 0 the default (layer walk with the MoE offload), 1 the walk without it, 2 chunk-major.
+        std::vector<std::pair<std::uint32_t, int>> runs;
         for (const std::uint32_t k : o.splits) {
+            runs.emplace_back(k, 0);
+            if (o.walk_modes) {
+                runs.emplace_back(k, 1);
+                runs.emplace_back(k, 2);
+            }
+        }
+        const char* const mode_names[] = {" (layer walk, MoE offload)", " (layer walk)", " (chunk-major)"};
+        const char* const mode_files[] = {"", "-walk", "-chunk"};
+        std::map<std::uint32_t, Run> walked; // per K, the default run (--walk-modes)
+        for (const auto& [k, mode] : runs) {
+            const bool walking     = mode == 0;
             const std::string name = "--devices " + std::to_string(o.devices[0]) + "," + std::to_string(o.devices[1]) +
-                                     " --layer-split " + std::to_string(k);
+                                     " --layer-split " + std::to_string(k) + (o.walk_modes ? mode_names[mode] : "");
             std::printf("%s\n", name.c_str());
+            set_variable("INFERNIX_SPLIT_WALK", mode == 2 ? "0" : "");
+            set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", mode == 1 ? "0" : "");
             const Run split = run_engine(o, artifact, ngram, o.devices, k,
-                                         o.work / ("split-" + std::to_string(k) + ".hash"), tokens);
+                                         o.work / ("split-" + std::to_string(k) + mode_files[mode] + ".hash"), tokens);
+            set_variable("INFERNIX_SPLIT_WALK", "");
+            set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", "");
+            if (o.walk_modes) { print_walks(split.diagnostics); }
             for (const std::uint32_t n : o.prompts) {
                 const Outcome& want = reference.prompts.at(n);
                 const Outcome& got  = split.prompts.at(n);
-                check(got.error.empty() && got.ids == want.ids,
-                      name + ": the " + std::to_string(n) + "-token prompt's first token equals the unsplit run's" +
+                check(got.error.empty() && got.ids == want.ids && !want.ids.empty(),
+                      name + ": the " + std::to_string(n) + "-token prompt's " + std::to_string(want.ids.size()) +
+                          " generated token(s) equal the unsplit run's" +
                           (got.error.empty() ? "" : " (failed: " + got.error + ")"));
-                check(got.lines == want.lines,
-                      name + ": the " + std::to_string(n) + "-token prompt's " + std::to_string(want.lines.size()) +
-                          " call(s) have the unsplit run's logits (last: " + first_line(got) + " vs " +
-                          first_line(want) + ")");
+                if (o.walk_modes) {
+                    check(same_logits(want.lines, got.lines),
+                          name + ": the " + std::to_string(n) + "-token prompt's calls and rounds have the unsplit " +
+                              "run's logits (" + std::to_string(got.lines.size()) + " lines vs " +
+                              std::to_string(want.lines.size()) + ", last: " + first_line(got) + " vs " +
+                              first_line(want) + ")");
+                    if (!walking && walked.count(k) != 0) {
+                        const Outcome& walk = walked.at(k).prompts.at(n);
+                        check(got.ids == walk.ids && same_logits(walk.lines, got.lines),
+                              name + ": the " + std::to_string(n) + "-token prompt gives the default run's ids and " +
+                                  "logits (" + std::to_string(walk.lines.size()) + " lines vs " +
+                                  std::to_string(got.lines.size()) + ")");
+                    }
+                } else {
+                    // The split walks a single call too (the MoE offload), so it may compute fewer lines.
+                    check(same_logits(want.lines, got.lines),
+                          name + ": the " + std::to_string(n) + "-token prompt's " + std::to_string(want.lines.size()) +
+                              " call(s) have the unsplit run's logits (" + std::to_string(got.lines.size()) +
+                              " lines, last: " + first_line(got) + " vs " + first_line(want) + ")");
+                }
             }
             if (o.forced) {
                 const Outcome& want = *reference.forced;
@@ -515,6 +599,7 @@ int main(int argc, char** argv) {
                       name + ": the KV pool grew in lockstep on every segment with KV (" +
                           std::to_string(grown.size()) + " reports)");
             }
+            if (walking && o.walk_modes) { walked.emplace(k, split); }
         }
     } catch (const std::exception& error) {
         std::printf("FAIL: %s\n", error.what());

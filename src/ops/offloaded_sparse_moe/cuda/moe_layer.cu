@@ -15,6 +15,7 @@
 #include "core/per_device.h"
 
 #include "ops/common/canonical_math.h"
+#include "ops/common/device_sms.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
@@ -306,9 +307,17 @@ __global__ void __launch_bounds__(kThreads)
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
-constexpr int kNarrowPassColumns = 4; // calls of at most this many columns use the one-column kernels
 constexpr int kStageChunk = 16384;
 constexpr int kMaxPassJobs = 512;
+
+// Calls of at most narrow_pass_columns() columns use the one-column kernels, which fit two gate/up
+// CTAs per SM and take one pass per job column over the staged weights; wider narrow calls use the
+// eight-column kernels (one gate/up CTA per SM). On the RTX 5090 the bound is 4, MTP verification of
+// up to three drafts (design §19.2, "Decode-round bundle"). On GB203 the one-column kernels win at
+// every narrow width (5 columns, all records resident: 701 -> 374 us on the RTX PRO 4000, 507 ->
+// 242 us on the RTX 5080, offloaded_moe_narrow_bench), so they serve every narrow call there. Both
+// kernels compute each expert in exact integer arithmetic, so the choice never changes a bit.
+int narrow_pass_columns() { return gb203_class() ? moe::kMaxColumns : 4; }
 
 // Resolves the record of every job in [job_base, job_base + pass_jobs) and copies the pass's
 // non-resident records that are not CPU-served (its misses) to their destinations: the n-th miss in
@@ -1361,7 +1370,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        if (x.ne[1] <= kNarrowPassColumns) {
+        if (x.ne[1] <= narrow_pass_columns()) {
             launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
                                   outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
             launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
@@ -1390,7 +1399,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
         // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
         // staged weights.
-        if (x.ne[1] <= kNarrowPassColumns) {
+        if (x.ne[1] <= narrow_pass_columns()) {
             launch_expert_pass<1>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base,
                                   jobs, h_blocks, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         } else {

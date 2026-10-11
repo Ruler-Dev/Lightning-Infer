@@ -268,7 +268,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--devices A,B` | Qwen3.8-Flash-Next layer split across two GPUs: the first layers on `A`, which also runs the engine, the remaining layers, the output head and the MTP drafter on `B`; `A,A` splits on one GPU (a test mode). One ordinal is the same as `--device N`; the two flags cannot be combined ([layer split](#layer-split)) | one device |
 | `--layer-split K\|auto\|@FILE` | where the split falls: after layer `K` (at least 1 and below the layer count), chosen at startup, or read from a plan file; requires two devices | `auto` with two devices |
 | `--layer-split-report` | report the split planner's table of candidate `K` at startup; requires two devices | off |
-| `--split-handoff auto\|event\|gate` | how decode and verification rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (no host step between the GPUs, but that kernel spins); `auto` is `event`; requires two devices, and `gate` two different GPUs | `auto` |
+| `--split-handoff auto\|event\|gate` | how decode and verification rounds pass the hidden state between the GPUs: `event` copies it through pinned memory behind a cross-device event wait; `gate` publishes it with a word that a bounded kernel on the next GPU polls (no host step between the GPUs, but that kernel spins); `auto` is `gate` on two different GPUs (measured faster, same output) and `event` on one; requires two devices, and `gate` two different GPUs | `auto` |
 | `--handoff-timeout-ms N` | bound of a `gate` handoff's wait, `1..1500`; a wait that runs out fails the round with a recoverable error instead of reaching Windows' 2 s GPU timeout; requires two devices | `1000` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
@@ -388,13 +388,27 @@ Prefill, forced tokens (an injected thinking-close control) and decoding run acr
 plain decode rounds and, with `--spec mtp` or n-gram drafts, the drafter on `B` and verification
 rounds. Their logits and greedy output are the unsplit run's bit for bit when both GPUs use the
 same launch decompositions (`--devices A,A`, or two different GPUs with
-[`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls run
-chunk by chunk on `A`, then on `B` (each GPU streams its own layers' experts per chunk, so long
-prompts prefill slower than on one GPU, most on a slow `A` link). A round runs `A`'s layers, then
-`B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` (the default) orders `B`
-after `A` with a cross-device event; `gate` lets `B` start at once and wait on the GPU, bounded
-by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a recoverable
-error and the engine keeps serving).
+[`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls of
+256 tokens or more run as a layer walk on both GPUs: `A` runs each of its layers over every call of
+a span (up to 64K tokens), then the span's hidden state crosses to `B`, which runs its layers the
+same way, so each GPU streams its layers' non-resident experts once per span instead of once per
+call. `B` also computes `A`'s MoE during `A`'s part of the span (the MoE offload): per layer `A`
+sends the MoE input and the routing (5 KiB per token), `B` runs the routed experts and the shared
+expert and sends the combined output back (5 KiB per token), so `A` streams no expert over its link
+and a single call is walked too; `B` streams `A`'s experts over its own link. A span ends at the
+prefix cache's snapshots, as on one GPU, so a split takes the same snapshots. Narrower calls (an
+opener's few tokens) run on `A`, then on `B`. The bits are those of the call-by-call prefill.
+Measurement knobs, the same outputs: `INFERNIX_SPLIT_MOE_OFFLOAD=0` keeps `A`'s experts on `A`
+(which then streams them, once per span), `INFERNIX_SPLIT_WALK=2` ends a span at exact snapshots
+only (a client breakpoint, the end of the system block, the generation opener; the history ladder's
+snapshots inside a long prompt are taken where the span ends, or not at all),
+`INFERNIX_SPLIT_WALK=0` runs every call on `A`, then on `B`. A round runs `A`'s layers, then `B`'s,
+each GPU replaying its own CUDA graphs: `--split-handoff event` orders `B` after `A` with a
+cross-device event; `gate` (the default on two different GPUs) lets `B` start at once and wait on
+the GPU, bounded by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a
+recoverable error and the engine keeps serving). On an RTX PRO 4000 + RTX 5080 split at `K = 28` the
+gate made rounds 0.1 ms shorter over the 20-turn conversation benchmark (23.18 against 23.29 ms) and
+0.6 ms on the CLI code prompt, with the same tokens; `--devices A,A` uses the event handoff.
 
 Each GPU's expert cache follows its own PCIe link. A GPU on a slow link (below 8 GB/s, such as
 PCIe 3.0 x4) sends most misses to the CPU (it hands the CPU more of them, at most 32 per layer
@@ -402,9 +416,12 @@ call) and fills every frame at startup, not half: from the saved expert state (t
 cached experts, then the other experts it used, most used first, then the experts it never used),
 or without one every expert of its layers in turn, so a GPU with room for all its layers' experts
 holds them all. While requests run it promotes only a trickle: at most one expert per layer for a
-few layers per round (6 ms of its link, six experts at 3.1 GB/s), copied once its layers of the
+few layers per round (13 ms of its link, 14 experts at 3.1 GB/s), copied once its layers of the
 next round are done, while the other GPU computes; so its cache follows a conversation's topics
-without its link slowing its own layers. The frames a long prompt borrows for its wide calls get
+without its link slowing its own layers. On an RTX PRO 4000 + RTX 5080 split at `K = 28` the
+20-turn conversation decoded at 82.4 tok/s over its second half with this trickle, 81.4 with the
+earlier 6 ms and 65.2 with none; on a code-agent conversation the first turns after the switch to
+code ran at 74.1 and 114.7 tok/s against 58.9 and 89.4 with 6 ms, with the same replies. The frames a long prompt borrows for its wide calls get
 their experts back afterwards. A faster GPU keeps the dynamic cache of a single GPU. The startup
 line of each segment names its link and policy. `INFERNIX_TRICKLE_PROMOTIONS=N` (a measurement
 knob) sets the trickle's experts per round; `0` promotes nothing during requests.
@@ -425,9 +442,14 @@ with one ordinal runs exactly as `--device A`. `--devices A,A` runs both segment
 with its own context, one after the other (their work never overlaps on the GPU), with the event
 handoff only: a test mode for exactness. `INFERNIX_SPLIT_SYNC=1` (a debugging aid) synchronizes
 both GPUs before the host restages a call's or round's inputs. `INFERNIX_SPLIT_TIMING=1` (a
-measurement knob) logs at each request's end, at debug level, where its decode rounds' time went:
-the mean round period, the time from launch to synchronization and each GPU's graph time within
-it, and the host's drafting and commit.
+measurement knob, also on one GPU as the split's reference) logs at each request's end, at debug
+level, where its decode rounds' time went: the mean round period, the time from launch to
+synchronization and each GPU's graph time within it, and the host's drafting and commit; then the
+same per verified width (with the draft steps run before the round, from which a verified
+column's cost follows), the host's steps between rounds (synchronization, commit, cache update,
+drafting, launches) and the drafter's catch-up, idle gap and draft graph on the head GPU.
+`INFERNIX_WIDTH_COST=X` (a measurement knob, `0..4`) replaces the one-row draft policy's cost of a
+draft in plain rounds (0.38); it changes how many columns rounds verify, never a token.
 
 `INFERNIX_LOGITS_HASH=FILE` (a check for this exactness, for both the CLI and the HTTP server)
 appends one line per call or round that computes logits to `FILE`: its kind (`prefill`, `forced`,

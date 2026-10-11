@@ -108,7 +108,8 @@ enum class VisionOffload : std::uint8_t { Auto, On, Off };
 // How a layer split's decode and verify rounds pass the residual stream from one device to the
 // next (--split-handoff). Event: a copy through pinned memory behind a cross-device event wait, no
 // spinning kernel. Gate: a word published with the copy that a bounded kernel on the next device
-// polls, lower latency but a kernel that spins on that GPU. Auto selects Event.
+// polls, lower latency but a kernel that spins on that GPU. Auto selects Gate on two different
+// GPUs and Event on one.
 enum class SplitHandoff : std::uint8_t { Auto, Event, Gate };
 
 [[nodiscard]] constexpr const char* split_handoff_name(SplitHandoff handoff) noexcept {

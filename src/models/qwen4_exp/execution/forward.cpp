@@ -353,6 +353,118 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     }
 }
 
+void Forward::layer_front(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& inject,
+                          MoeFront& front) {
+    if (!segment_.layers.contains(layer)) {
+        throw std::out_of_range("Qwen4Exp forward: layer " + std::to_string(layer) +
+                                " is outside the segment's range");
+    }
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0];
+    const auto& block    = parameters_.layers[layer];
+    const auto& m        = config_.moe;
+    const std::int32_t E = dim(m.experts), K = dim(m.top_k);
+    wait_layer(batch, layer);
+    try {
+        // No scope: the front's tensors stay allocated until the next begin_call.
+        if (block.ple) { ple(*block.ple, residual, batch); }
+        // layer()'s steps up to the MoE, with the caller's inject (layer() reuses one for both mixes).
+        Tensor xa = mix(block.attn_hc, residual, &inject);
+        const std::uint32_t compact = config_.compact_layer_indices[layer];
+        Tensor y;
+        if (config_.layer_types[layer] == MixerKind::Gdn) {
+            y = gdn(std::get<GdnParameters>(block.mixer), xa, compact - segment_.gdn_base, batch);
+        } else {
+            const std::uint32_t local = compact - segment_.attention_base;
+            const AttentionCall call{.layer            = kv_.layers.at(local),
+                                     .tails            = state_.qsa_tails.at(local),
+                                     .key_records      = Tensor{},
+                                     .update_tails     = batch.verify == nullptr,
+                                     .positions        = batch.positions,
+                                     .rope_positions   = batch.rope_positions,
+                                     .block_start_rope = batch.block_start_rope,
+                                     .slots            = batch.slots,
+                                     .table_rows       = batch.table_rows,
+                                     .batch            = batch.batch,
+                                     .width            = batch.width};
+            y = attention(std::get<AttentionParameters>(block.mixer), xa, call);
+        }
+        ops::hyper_connection_inject(y, inject, residual, s);
+        front.x = mix(block.mlp_hc, residual, &inject);
+        // moe()'s router and routing, and its route log.
+        Tensor logits        = work_.alloc(DType::FP32, {E + 1, T});
+        const Tensor* rows[] = {&block.moe.router, &block.moe.shared_score};
+        ops::projection_fp32(front.x, rows, logits, s);
+        front.routing = ops::MoeRouting{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
+                                        work_.alloc(DType::FP32, {T})};
+        ops::moe_route(logits, K, front.routing, s);
+        if (experts_.route_log != nullptr) {
+            if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
+                throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
+            }
+            // moe_dispatch writes the routed ids to the log unchanged.
+            CUDA_CHECK(cudaMemcpyAsync(experts_.route_log + (layer - segment_.layers.begin) * experts_.route_stride,
+                                       front.routing.ids.data, front.routing.ids.bytes(), cudaMemcpyDeviceToDevice, s));
+        }
+    } catch (const std::exception& error) {
+        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    }
+}
+
+void Forward::layer_back(std::uint32_t layer, Tensor& residual, const Tensor& inject, const Tensor& y) {
+    if (!segment_.layers.contains(layer)) {
+        throw std::out_of_range("Qwen4Exp forward: layer " + std::to_string(layer) +
+                                " is outside the segment's range");
+    }
+    ops::hyper_connection_inject(y, inject, residual, device_.stream);
+}
+
+Tensor Forward::moe_remote(const RemoteMoe& layer, const Tensor& x, const ops::MoeRouting& routing) {
+    const cudaStream_t s = device_.stream;
+    const auto& m        = config_.moe;
+    const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
+    if (layer.frames == nullptr || layer.scales == nullptr || layer.host_records == nullptr ||
+        layer.shared_gate_up == nullptr || layer.shared_down == nullptr ||
+        (experts_.frame_stride != 0 && experts_.frame_stride != layer.record_stride)) {
+        throw std::invalid_argument("Qwen4Exp MoE: a remote layer needs its frames, scales, records and shared expert");
+    }
+    work_.reset();
+    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+    ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+    ops::MoeExpertSource source{.frame_base    = experts_.frame_base,
+                                .frames        = layer.frames,
+                                .host_records  = layer.host_records,
+                                .record_stride = layer.record_stride,
+                                .scales        = layer.scales,
+                                .staging_base  = experts_.staging_base,
+                                .staging_slots = experts_.staging_slots};
+    source.error = experts_.error;
+    // A prefill chunk's staging overlaps its compute (moe() for an eager call).
+    if (experts_.overlap_stream != nullptr) {
+        source.overlap_stream = experts_.overlap_stream;
+        for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
+    }
+    ExpertStream* const streaming = layer.stream != nullptr && layer.stream->active() ? layer.stream : nullptr;
+    if (streaming != nullptr) {
+        streaming->before_experts(layer.stream_layer, s);
+        source.prefetched    = streaming->slots(layer.stream_layer);
+        source.prefetch_base = streaming->base();
+    }
+    Tensor outputs              = work_.alloc(DType::BF16, {H, K * T});
+    const std::int32_t max_jobs = std::min(E, K * T);
+    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T));
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
+    Tensor product = work_.alloc(DType::BF16, {dim(m.shared_intermediate), T});
+    shared_swiglu(x, *layer.shared_gate_up, product, work_, s);
+    Tensor shared = work_.alloc(DType::BF16, {H, T});
+    project(product, *layer.shared_down, shared, work_, s);
+    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+    Tensor y = work_.alloc(DType::BF16, {H, T});
+    ops::moe_combine(outputs, routing, shared, y, s);
+    return y;
+}
+
 void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
     if (!segment_.finish) { throw std::logic_error("Qwen4Exp forward: the segment does not finish the call"); }
     const cudaStream_t s = device_.stream;

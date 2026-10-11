@@ -28,9 +28,10 @@
 // A layer split (multi-GPU WP15): --devices A,B --layer-split K runs every scenario on the unsplit
 // Engine of device --reference (default A), then on the split Engine, and compares them: every
 // sequential request's ids, reused tokens, readout bits and per-call logits hashes
-// (INFERNIX_LOGITS_HASH lines; an unsplit layer walk computes no logits before its span's last chunk,
-// so the unsplit lines need only appear, in order, among the split's), and the concurrent scenarios'
-// ids. The Host tier files are crossed: the split Engine 2 loads the file the unsplit Engine 1 saved,
+// (INFERNIX_LOGITS_HASH lines; a layer walk computes no logits before its span's last chunk, and the
+// two Programs walk different calls: the split walks on both GPUs, with the MoE offload even single
+// calls, so the run with fewer lines need only appear, in order, among the other's), and the
+// concurrent scenarios' ids. The Host tier files are crossed: the split Engine 2 loads the file the unsplit Engine 1 saved,
 // and an unsplit Engine loads the split Engine 1's; each resumes turn 2 with the unsplit turn 2's ids.
 // Two GPUs need INFERNIX_NUMERICS_SMS at the smaller GPU's SM count.
 //
@@ -588,7 +589,7 @@ int load_crossed(const char* artifact, const char* ngram, const Placement& where
 }
 
 // Every reference line is the other run's same call's, bit for bit, in order, and the last lines
-// agree (an unsplit layer walk computes no logits before a span's last chunk).
+// agree (a layer walk computes no logits before a span's last chunk).
 bool lines_cover(const std::vector<std::string>& reference, const std::vector<std::string>& other) {
     if (reference.size() == other.size()) { return reference == other; }
     if (reference.empty() || other.empty() || reference.back() != other.back()) { return false; }
@@ -601,6 +602,11 @@ bool lines_cover(const std::vector<std::string>& reference, const std::vector<st
     return true;
 }
 
+// The runs' lines agree: the one with fewer lines (more of its calls in layer walks) is covered by the other's.
+bool same_logits(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    return a.size() <= b.size() ? lines_cover(a, b) : lines_cover(b, a);
+}
+
 int compare(const std::vector<Outcome>& reference, const std::vector<Outcome>& split, const std::string& what) {
     int failures = check(reference.size() == split.size(), what + ": both runs made the same requests (" +
                                                                std::to_string(reference.size()) + " and " +
@@ -610,7 +616,7 @@ int compare(const std::vector<Outcome>& reference, const std::vector<Outcome>& s
         const Outcome& r = reference[i];
         const Outcome& s = split[i];
         const bool same  = r.name == s.name && r.ids == s.ids && r.reused == s.reused && r.readout == s.readout &&
-                          (r.concurrent || lines_cover(r.lines, s.lines));
+                          (r.concurrent || same_logits(r.lines, s.lines));
         if (same) {
             ++equal;
             lines += r.lines.size();
@@ -620,7 +626,7 @@ int compare(const std::vector<Outcome>& reference, const std::vector<Outcome>& s
         if (r.ids != s.ids) { why += " ids: " + first_difference(r.ids, s.ids) + ";"; }
         if (r.reused != s.reused) { why += " reused " + std::to_string(r.reused) + " vs " + std::to_string(s.reused) + ";"; }
         if (r.readout != s.readout) { why += " readout bits differ;"; }
-        if (!r.concurrent && !lines_cover(r.lines, s.lines)) {
+        if (!r.concurrent && !same_logits(r.lines, s.lines)) {
             why += " logits hashes: " + std::to_string(r.lines.size()) + " vs " + std::to_string(s.lines.size()) +
                    " lines (last " + (r.lines.empty() ? "none" : r.lines.back()) + " vs " +
                    (s.lines.empty() ? "none" : s.lines.back()) + ");";
@@ -630,7 +636,7 @@ int compare(const std::vector<Outcome>& reference, const std::vector<Outcome>& s
     failures += check(equal == reference.size() && reference.size() == split.size(),
                       what + ": " + std::to_string(equal) + " of " + std::to_string(reference.size()) +
                           " requests equal the unsplit run's (ids, reused tokens, readout bits; " + std::to_string(lines) +
-                          " unsplit logits hashes found among the split's)");
+                          " unsplit logits hashes, those of the run with fewer found among the other's)");
     return failures;
 }
 

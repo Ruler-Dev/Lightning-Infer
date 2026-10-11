@@ -14,15 +14,17 @@
 //   - The timeout: a gate bounded at 50 ms whose word is never published stores its error value,
 //     copies nothing and records its wait, without trapping: the same stream then runs a
 //     published round correctly, and a gate released from the host (release) passes.
-//   - BulkHandoff of 80 MiB through the default 4 x 16 MiB ring is bit-exact with stream waits and
-//     with host waits; transfer() returns while the sender's stream is still held by a kernel
-//     (it does not block the host); and the pieces overlap: the transfer hides at least a quarter
-//     of the faster side's time against a download and an upload of the same bytes on their own
-//     (checked when both devices have two copy engines and the sides are within 2x of each other,
-//     as on one device; always reported).
+//   - BulkHandoff of 80 MiB through the default 4 x 16 MiB ring is bit-exact with stream waits, with
+//     host waits, and sent and received in quarters, each received after the next was sent
+//     (send/receive, as the MoE offload orders them); transfer() returns while the sender's stream
+//     is still held by a kernel (it does not block the host); and the pieces overlap: the transfer
+//     hides at least a quarter of the faster side's time against a download and an upload of the
+//     same bytes on their own (checked when both devices have two copy engines and the sides are
+//     within 2x of each other, as on one device; always reported).
 //   - Invalid arguments throw: payloads over the capacity, gate sizes that are not 16-byte
 //     multiples, a bound without an error word, record_sent and wait_sent on a capturing stream,
-//     empty rings and channels, a device that does not exist.
+//     empty rings and channels, a bulk piece sent again before it was received, a device that does
+//     not exist.
 // Two GPUs, in both directions: the Gate and Event rounds (--rounds / 10 each) and the bulk
 // transfer across the devices (bit-exact; its overlap is reported when one link is much slower);
 // then one-way latency histograms (p50, p90, p99, max) of Event and
@@ -561,6 +563,26 @@ void check_bulk(int sender, int receiver) {
     consumer.synchronize();
     verify("a transfer behind a held sender");
 
+    // send() and receive() as a layer split's MoE offload orders them: four quarters, each received
+    // after the next one was sent (two quarters' pieces fill the ring).
+    {
+        constexpr std::size_t kQuarter = kBytes / 4;
+        std::vector<std::vector<BulkHandoff::Piece>> sent;
+        const auto receive = [&](std::size_t q) {
+            bulk.receive(sent[q], static_cast<std::byte*>(destination.get()) + q * kQuarter, consumer.get());
+        };
+        for (std::size_t q = 0; q < 4; ++q) {
+            sent.push_back(bulk.send(static_cast<const std::byte*>(source.get()) + q * kQuarter, kQuarter, producer.get()));
+            if (q > 0) { receive(q - 1); }
+        }
+        receive(3);
+        producer.flush();
+        consumer.flush();
+        producer.synchronize();
+        consumer.synchronize();
+        verify("sends received one quarter late");
+    }
+
     // Overlap: the ring against a download and an upload of the same bytes on their own, best of
     // three each. Without overlap the ring takes their sum; ideally it hides all but one piece of
     // the faster side. Hiding a quarter of the faster side's time is checked when the two sides are
@@ -649,6 +671,14 @@ void check_arguments(int count) {
         BulkHandoff ring(0, 0, 1 << 20, 2);
         expect(throws<std::invalid_argument>([&] { ring.transfer(buffer.get(), buffer.get(), 16, nullptr, nullptr); }),
                "a bulk transfer on the legacy default stream throws");
+        // A piece sent again before it was received: the ring of two comes back to the first.
+        const auto first  = ring.send(buffer.get(), 16, stream.get());
+        const auto second = ring.send(buffer.get(), 16, stream.get());
+        expect(throws<std::logic_error>([&] { (void)ring.send(buffer.get(), 16, stream.get()); }),
+               "sending into a piece not yet received throws");
+        ring.receive(first, static_cast<std::byte*>(buffer.get()) + kCapacity, stream.get());
+        ring.receive(second, static_cast<std::byte*>(buffer.get()) + kCapacity, stream.get());
+        stream.synchronize();
     }
     // The Event mode's host steps outside a capture only.
     const DeviceGuard guard(0);
