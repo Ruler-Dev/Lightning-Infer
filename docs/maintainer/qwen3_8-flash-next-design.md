@@ -7803,7 +7803,9 @@ prompt prefilled at 565 tok/s, the RTX 5080 waiting for most of it.
     result has been sent (`ExpertStream::set_paced`, runs of at most 64 MiB) and enqueued in shares
     after each chunk's crossings (`pump`; `before_experts` enqueues what is left);
   - the backs wait as long as they can (just before the chunk's next front), the inputs ring holds 16
-    pieces of 16 MiB and the results ring 8, and the inputs cross as one run instead of five;
+    pieces of 16 MiB and the results ring 8, and the inputs cross as one run instead of five (the
+    piece counts are minimums: a piece is sent again only after it was received, so the results ring
+    holds `kResultLag` + 1 results of the chunk, 9 pieces at `--prefill-chunk 8192`);
   - the shared expert runs on the second segment, halving what the first segment's link carries
     (its q8 projections do not depend on the SM count, so they give the same bits on either GPU even
     without `INFERNIX_NUMERICS_SMS`);

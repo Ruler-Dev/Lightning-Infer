@@ -93,7 +93,8 @@ namespace {
 // sent them, while the compute stream fronts the next chunks.
 constexpr std::size_t kOffloadSlots = 8;
 // The crossings' pinned rings, of 16 MiB pieces: the inputs (~20 MiB per 4,096-token chunk) can run
-// ahead of the second segment by several chunks; the results ride kResultLag + 1 chunks deep.
+// ahead of the second segment by several chunks; the results ride kResultLag + 1 chunks deep. These
+// are the least piece counts: a wider chunk takes more (prepare_moe_offload).
 constexpr std::size_t kCrossingPiece  = 16ULL << 20;
 constexpr std::uint32_t kInputPieces  = 16;
 constexpr std::uint32_t kResultPieces = 8;
@@ -144,9 +145,21 @@ execution::ForwardBatch ProgramImpl::walk_batch(const DeviceSegment& seg, std::s
 void ProgramImpl::prepare_moe_offload() {
     DeviceSegment& a = *segments_[0];
     DeviceSegment& b = *segments_[1];
-    moe_bulk_.push_back(std::make_unique<BulkHandoff>(a.device->device, b.device->device, kCrossingPiece, kInputPieces));
+    // A ring piece is sent again only after it was received (BulkHandoff::send), so each ring holds
+    // what is in flight at the widest chunk: one chunk's inputs (received once they were sent) and
+    // kResultLag + 1 results (one sent while the kResultLag before it wait for their uploads). The
+    // least counts hold the 4,096-token chunk's with room; from 6,656 tokens a result (5 KiB per
+    // column) takes three pieces, and kResultLag + 1 of them outgrow kResultPieces.
+    const auto columns   = static_cast<std::size_t>(chunk_);
+    const auto pieces_of = [](std::size_t bytes) {
+        return static_cast<std::uint32_t>((bytes + kCrossingPiece - 1) / kCrossingPiece);
+    };
+    const std::uint32_t per_result    = pieces_of(2ULL * c_.hidden_size * columns);
+    const std::uint32_t input_pieces  = std::max(kInputPieces, pieces_of(offload_input_bytes(columns)));
+    const std::uint32_t result_pieces = std::max(kResultPieces, static_cast<std::uint32_t>(kResultLag + 1) * per_result);
+    moe_bulk_.push_back(std::make_unique<BulkHandoff>(a.device->device, b.device->device, kCrossingPiece, input_pieces));
     a.moe_out = moe_bulk_.back().get();
-    moe_bulk_.push_back(std::make_unique<BulkHandoff>(b.device->device, a.device->device, kCrossingPiece, kResultPieces));
+    moe_bulk_.push_back(std::make_unique<BulkHandoff>(b.device->device, a.device->device, kCrossingPiece, result_pieces));
     a.moe_back = moe_bulk_.back().get();
     for (DeviceSegment* seg : {&a, &b}) {
         const DeviceGuard on(seg->device->device);

@@ -40,6 +40,18 @@ set_tests_properties(infernix_qwen4_exp_split_prefill_two_gpu_real_test PROPERTI
   LABELS "gpu;real"
   TIMEOUT 3600
   ENVIRONMENT "INFERNIX_NUMERICS_SMS=70")
+# Two GPUs at --prefill-chunk 8192 and K = 28: a span of four 8,192-token calls (then a narrow one)
+# walked with the MoE offload, whose results ring then needs more than its 8 least pieces (three
+# results of three pieces in flight).
+add_test(NAME infernix_qwen4_exp_split_wide_chunk_two_gpu_real_test
+  COMMAND infernix_qwen4_exp_split_prefill_real_test --devices 0,1 --reference 0 --splits 28 --chunk 8192
+          --prompts 32868 --context 40960 --prompt-decode 8 --no-forced --no-cancel --decode 0)
+set_tests_properties(infernix_qwen4_exp_split_wide_chunk_two_gpu_real_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 3600
+  ENVIRONMENT "INFERNIX_NUMERICS_SMS=70")
 # Two GPUs with the gate handoff, and a round delayed past the gate's bound: that request fails with
 # a recoverable handoff timeout and the next one gives the unsplit run's bits.
 add_test(NAME infernix_qwen4_exp_split_gate_two_gpu_real_test
