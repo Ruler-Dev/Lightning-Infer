@@ -169,6 +169,7 @@ BulkHandoff::BulkHandoff(int sender_device, int receiver_device, std::size_t pie
     filled_.assign(pieces, nullptr);
     consumed_.assign(pieces, nullptr);
     used_.assign(pieces, 0);
+    sent_.assign(pieces, 0);
     try {
         for (std::uint32_t i = 0; i < pieces; ++i) {
             filled_[i]   = create_event(sender_device);   // recorded on the sender's stream
@@ -219,11 +220,36 @@ void BulkHandoff::transfer(const void* device_src, void* device_dst, std::size_t
 
 void BulkHandoff::set_host_wait(bool host_wait) noexcept { host_wait_ = host_wait; }
 
+std::vector<BulkHandoff::Piece> BulkHandoff::send(const void* device_src, std::size_t bytes,
+                                                  cudaStream_t sender_stream) {
+    if (device_src == nullptr || sender_stream == nullptr || host_wait_) {
+        throw std::invalid_argument("BulkHandoff::send needs a source, the sender's stream and no host waits");
+    }
+    const auto* src = static_cast<const std::byte*>(device_src);
+    std::vector<Piece> out;
+    for (std::size_t offset = 0; offset < bytes; offset += piece_bytes_) {
+        const Piece p{next_, offset, std::min(piece_bytes_, bytes - offset)};
+        next_ = (next_ + 1) % pieces_;
+        fill(p, src, sender_stream);
+        out.push_back(p);
+    }
+    return out;
+}
+
+void BulkHandoff::receive(const std::vector<Piece>& pieces, void* device_dst, cudaStream_t receiver_stream) {
+    if (device_dst == nullptr || receiver_stream == nullptr) {
+        throw std::invalid_argument("BulkHandoff::receive needs a destination and the receiver's stream");
+    }
+    for (const Piece& p : pieces) { deliver(p, static_cast<std::byte*>(device_dst), receiver_stream); }
+}
+
 std::byte* BulkHandoff::piece(std::uint32_t slot) const noexcept {
     return static_cast<std::byte*>(ring_.data()) + static_cast<std::size_t>(slot) * piece_bytes_;
 }
 
 void BulkHandoff::fill(const Piece& p, const std::byte* src, cudaStream_t sender_stream) {
+    if (sent_[p.slot] != 0) { throw std::logic_error("BulkHandoff: a piece was sent again before it was received"); }
+    sent_[p.slot]     = 1;
     const bool reused = used_[p.slot] != 0;
     if (reused && host_wait_) { CUDA_CHECK(cudaEventSynchronize(consumed_[p.slot])); }
     const DeviceGuard guard(sender_);
@@ -239,6 +265,7 @@ void BulkHandoff::deliver(const Piece& p, std::byte* dst, cudaStream_t receiver_
     CUDA_CHECK(cudaMemcpyAsync(dst + p.offset, piece(p.slot), p.bytes, cudaMemcpyHostToDevice, receiver_stream));
     CUDA_CHECK(cudaEventRecord(consumed_[p.slot], receiver_stream));
     used_[p.slot] = 1;
+    sent_[p.slot] = 0;
 }
 
 void BulkHandoff::destroy_events() noexcept {

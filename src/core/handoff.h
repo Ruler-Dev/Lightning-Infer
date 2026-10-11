@@ -125,12 +125,21 @@ public:
     // cross-device waits prove slow under WDDM.
     void set_host_wait(bool host_wait) noexcept;
 
-private:
     struct Piece {
         std::uint32_t slot = 0;
         std::size_t offset = 0;
         std::size_t bytes  = 0;
     };
+    // transfer() in two halves for a caller that orders the copy engines' work itself (on a GPU with
+    // one copy engine, copies run in the order they were enqueued, so an upload enqueued before its
+    // download has finished holds every later copy of its device): send() enqueues the downloads of
+    // `bytes` from `device_src` on `sender_stream` and returns the pieces, receive() their uploads to
+    // `device_dst` on `receiver_stream`. A piece must be received before the ring comes back to it
+    // (logic_error otherwise). No host waits.
+    [[nodiscard]] std::vector<Piece> send(const void* device_src, std::size_t bytes, cudaStream_t sender_stream);
+    void receive(const std::vector<Piece>& pieces, void* device_dst, cudaStream_t receiver_stream);
+
+private:
 
     [[nodiscard]] std::byte* piece(std::uint32_t slot) const noexcept;
     void fill(const Piece& p, const std::byte* src, cudaStream_t sender_stream);
@@ -145,6 +154,7 @@ private:
     std::vector<cudaEvent_t> filled_;   // sender's device
     std::vector<cudaEvent_t> consumed_; // receiver's device
     std::vector<std::uint8_t> used_;    // consumed_[slot] has been recorded
+    std::vector<std::uint8_t> sent_;    // the slot is filled and not received yet
     std::uint32_t next_ = 0;
     bool host_wait_     = false;
 };
