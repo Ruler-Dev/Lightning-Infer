@@ -7,6 +7,10 @@
 //    holds the record of global layer 24 + l, so promotions copy from banks[local];
 //  - its saved state is keyed by its 24 layers; it refuses a whole-model state and warm-starts from
 //    split_saved_state's part of one, loading the keys of its layers from the right banks;
+//  - a trickle (set_trickle, a slow link's segment): a round promotes only in its window of
+//    layers, which moves on after each round with a budget (not after one without); the copies wait
+//    (loads_pending, no promotion counted) until issue_deferred, or an eager call's before_round,
+//    issues them, and then hold the right records;
 //  - with two GPUs: a residency for device 1 constructed while device 0 is current reserves device
 //    1's whole memory as VMM address space (not device 0's), allocates its tables on device 1,
 //    promotes on device 1 under the segment's guard, and is destroyed with device 0 current without
@@ -258,6 +262,72 @@ void test_layer_subset(const Banks& banks, int device) {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+// One round routing routed()'s experts of every local layer, applied with `budget` per layer; the
+// round's start (before_round) is an eager call's (it issues deferred promotions).
+void trickle_round(ExpertResidency& residency, cudaStream_t stream, std::size_t budget) {
+    std::vector<std::int32_t> routes(residency.route_stride() * residency.layers(), -1);
+    for (std::uint32_t local = 0; local < residency.layers(); ++local) {
+        routes[local * residency.route_stride()]     = static_cast<std::int32_t>((3 * local) % kExperts);
+        routes[local * residency.route_stride() + 1] = static_cast<std::int32_t>((3 * local + 1) % kExperts);
+    }
+    CUDA_CHECK(cudaMemcpy(residency.route_log(), routes.data(), routes.size() * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice));
+    residency.before_round(stream);
+    residency.enqueue_route_download(stream, 1);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    residency.after_round(stream, 1, budget);
+}
+
+// Whether exactly the routed keys of local layers [0, layers) are resident, in frames that hold
+// their records.
+bool trickled(const ExpertResidency& residency, std::uint32_t layers) {
+    bool ok = true;
+    for (std::uint32_t local = 0; local < kOwned; ++local) {
+        for (std::uint32_t expert = 0; expert < kExperts; ++expert) {
+            const std::int32_t frame = residency.host_table()[local * kExperts + expert];
+            ok = ok && (frame >= 0) == (local < layers && routed(local, expert));
+            if (frame >= 0) { ok = ok && frame_holds(residency, frame, kFirst + local, expert); }
+        }
+    }
+    return ok;
+}
+
+void test_trickle(const Banks& banks, int device) {
+    const TextConfig c = model();
+    constexpr std::uint32_t kWindow = 5;
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    {
+        ExpertResidency residency(c, banks.layers(kFirst, kLayers), kStride, kColumns, device);
+        LedgerSource ledger(residency);
+        (void)residency.resize(64, stream, ledger);
+        residency.set_trickle(kWindow, true);
+        trickle_round(residency, stream, kExperts);
+        expect(residency.loads_pending() && residency.stats().promotions == 0,
+               "trickle: the round's promotions are deferred, none issued");
+        residency.issue_deferred(stream);
+        expect(residency.stats().promotions == 2ULL * kWindow, "trickle: only the window's layers promote");
+        CUDA_CHECK(cudaDeviceSynchronize());
+        expect(!residency.loads_pending(), "trickle: nothing pending once the copies landed");
+        residency.before_round(stream); // publishes them
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        expect(trickled(residency, kWindow), "trickle: the first window's routed keys are resident");
+        // A round without a budget promotes nothing and keeps the window where it is.
+        trickle_round(residency, stream, 0);
+        expect(!residency.loads_pending() && residency.stats().promotions == 2ULL * kWindow,
+               "trickle: a round without a budget promotes nothing");
+        trickle_round(residency, stream, kExperts);
+        expect(residency.stats().promotions == 2ULL * kWindow, "trickle: the next window's copies wait too");
+        residency.before_round(stream); // an eager call's start issues them
+        expect(residency.stats().promotions == 4ULL * kWindow, "trickle: an eager call's before_round issues them");
+        CUDA_CHECK(cudaDeviceSynchronize());
+        residency.before_round(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        expect(trickled(residency, 2 * kWindow), "trickle: the window moved on to the next layers");
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 void test_other_device(const Banks& banks, int count) {
     if (count < 2) { return; }
     CUDA_CHECK(cudaSetDevice(0));
@@ -323,6 +393,7 @@ int main() {
         CUDA_CHECK(cudaSetDevice(0));
         const Banks banks;
         test_layer_subset(banks, 0);
+        test_trickle(banks, 0);
         test_other_device(banks, count);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

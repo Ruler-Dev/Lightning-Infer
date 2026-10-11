@@ -188,10 +188,12 @@ struct DeviceSegment {
     // The link's rate and the choices that follow it (derive_link_policy), set by
     // ProgramImpl::measure_link. The reference link's policy until then, and when nothing could be
     // probed (link_measured false). The Program applies the PCIe divisor, the promotion interval and
-    // the CPU split's widest call; a layer split's segments also their promotion policy (none during
-    // requests on a slow link), seed share and CPU jobs (ProgramImpl::promotes_in_rounds).
+    // the CPU split's widest call; a layer split's segments also their promotion policy (a trickle
+    // on a slow link), seed share and CPU jobs (ProgramImpl::promotes_in_rounds, trickles).
     LinkPolicy policy;
     bool link_measured = false;
+    // A trickle's promotions per round (ProgramImpl::trickle_promotions); 0 for other policies.
+    std::uint32_t trickle = 0;
     // The CPU expert service's port that serves this segment's layers: 0 for an unsplit Program.
     int cpu_port = 0;
     // Tokens toward the next steady-state decode promotion (ProgramImpl::decode_budget).
@@ -244,6 +246,8 @@ struct DeviceSegment {
     BulkHandoff* bulk_out = nullptr;
     SegmentEvent compute_done;
     DeviceBuffer handoff_stats;
+    // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming).
+    SegmentEvent timing_begin, timing_end;
 
     // ---- the Forward and its CUDA graph families ----
     std::unique_ptr<execution::Forward> forward;

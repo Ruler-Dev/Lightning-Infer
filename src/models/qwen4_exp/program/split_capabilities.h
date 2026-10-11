@@ -14,8 +14,10 @@ inline constexpr bool kSplitExecution = true;
 // Decode, MTP draft and verify rounds across the segments (one graph family per segment, the
 // residual through each boundary's HandoffChannel in the event or the gate mode).
 inline constexpr bool kSplitDecode = true;
-// The hybrid prefix cache across the segments: restores, captures and its persistent file.
-inline constexpr bool kSplitPrefixCache = false;
+// The hybrid prefix cache across the segments: restores, captures and its persistent file (each
+// segment copies its own KV planes and state on its own streams; records and files keep the whole
+// model's layout, so they are interchangeable with an unsplit run's).
+inline constexpr bool kSplitPrefixCache = true;
 // Vision input.
 inline constexpr bool kSplitVision = false;
 // The SSD expert tier (the experts not in Host RAM are read from the artifact on use).

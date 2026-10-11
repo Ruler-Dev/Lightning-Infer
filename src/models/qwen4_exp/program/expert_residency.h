@@ -67,6 +67,7 @@ public:
         std::uint64_t lent_frames    = 0; // frames lent now
         std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
         std::uint64_t seeded         = 0; // experts loaded by the warm start
+        std::uint64_t refilled       = 0; // experts lending evicted, loaded back at a give-back
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
     };
@@ -145,6 +146,28 @@ public:
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);
+    // A cache that promotes little or nothing during requests (a layer split's segment on a slow
+    // link) loads the experts its lending evicted back at each give-back
+    // (CacheController::give_back), so a prompt's wide calls do not leave its frames empty for the
+    // rest of the session.
+    void set_refill_lent(bool refill) noexcept { refill_lent_ = refill; }
+    // A trickle (a layer split's segment on a slow link, design §16.4 "Layer split"): each round's
+    // promotions are limited to a window of `layers` consecutive layers (at most per_layer_budget
+    // each), which moves on by `layers` after every round that had a budget, so every layer gets its
+    // turn; 0 (the default) budgets every layer. With `defer`, after_round's promotion copies wait in
+    // the residency until issue_deferred, which the Program calls once the segment's share of the
+    // next round is enqueued: they then cross the link while the later segments compute, not ahead
+    // of the segment's own staged misses. Any other call that needs the copies issued (lend, resize,
+    // give_back, warm_start, an eager call's before_round, the next after_round) issues them first.
+    void set_trickle(std::uint32_t layers, bool defer) noexcept {
+        window_ = layers;
+        defer_  = defer;
+    }
+    // Enqueues the deferred promotion copies on the copy stream, after the work queued on `after`
+    // (the compute stream, behind the round's table upload). Nothing when none is deferred.
+    void issue_deferred(cudaStream_t after);
+    // Whether promotion copies are deferred or still copying (a trickle starts no more meanwhile).
+    [[nodiscard]] bool loads_pending() const;
 
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
     // Before the first round and before warm_start. The tier keys the whole model, so a residency
@@ -210,8 +233,9 @@ private:
     void release_reservations();
     // Publishes the promotions whose copies have completed.
     void publish_landed();
-    // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
-    void issue_loads(cudaStream_t compute);
+    // Issues commands_' promotion copies on the copy stream, after the table update on `compute`;
+    // with `defer`, holds them for issue_deferred instead.
+    void issue_loads(cudaStream_t compute, bool defer = false);
     // Tier mode: VRAM evictions among commands_ (T3/T5), and Queue pins of the controller's queue.
     void report_evictions();
     void sync_queue_pins();
@@ -264,11 +288,18 @@ private:
     };
     std::vector<Batch> in_flight_;
     std::vector<cudaEvent_t> spare_events_;
+    // Copies `loads` on the copy stream after the work queued on `after`, an event per kLoadsPerEvent.
+    void enqueue_loads(std::span<const Batch::Load> loads, cudaStream_t after);
+    std::vector<Batch::Load> deferred_; // promotions held for issue_deferred (set_trickle)
+    std::uint32_t window_       = 0;    // set_trickle: layers per round's promotion window (0: all)
+    std::uint32_t window_start_ = 0;    // the window's first layer this round
+    bool defer_                 = false;
     // Promotions per completion event (~6 ms of link at x8): a large promotion publishes in steps.
     static constexpr std::size_t kLoadsPerEvent = 64;
     Stats stats_;
 
     HostExpertTier* tier_ = nullptr;
+    bool refill_lent_     = false;
     expert_cache::LfruPolicy::Admissible admissible_;
     DeviceBuffer records_device_;       // tier: const uint8_t* [layers][experts]
     PinnedHostBuffer records_host_{1};

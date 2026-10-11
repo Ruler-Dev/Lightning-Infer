@@ -4,13 +4,14 @@
 // (docs/maintainer/qwen3_8-flash-next-design.md §19.3.12: bandwidth-dependent choices follow the
 // machine), derived from the link's measured rate (or ProgramOptions::link_bytes_per_second,
 // INFERNIX_LINK_GBPS). Each split segment measures its own device's link, so one process can run an
-// x16 card with today's dynamic cache beside an x4 card that serves its misses from the CPU and
-// fills its frames only while idle.
+// x16 card with today's dynamic cache beside an x4 card that serves most misses from the CPU and
+// trickles a few promotions per round over its link.
 //
 // The Program takes its link-scaled constants from derive_link_policy (the PCIe share of decode
 // misses, the steady-state promotion interval and the prefill CPU split's widest call), whose
-// expressions are the ones it computed itself before. The promotion policy, warm-start seed share
-// and CPU jobs it picks for a slow link are new and not applied yet.
+// expressions are the ones it computed itself before. A layer split's segments also apply the
+// promotion policy, warm-start seed share and CPU jobs it picks (an unsplit Program keeps the
+// dynamic cache on every link).
 //
 // Pure host data, no CUDA.
 
@@ -26,17 +27,23 @@ namespace infernix::models::qwen4_exp {
 // The rate at which the link-dependent constants were fitted (RTX 5090 at PCIe 5.0 x8).
 inline constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
 // Below this rate (PCIe 3.0 x4, or 4.0 x4 behind a chipset) a promoted 2.64 MiB expert costs about
-// 0.9 ms of link time, more than a CPU-served miss (80-125 us on DDR4): such a segment stops
-// promoting during requests, fills every frame at a warm start and gives the CPU more jobs.
+// 0.9 ms of link time, more than a CPU-served miss (80-125 us on DDR4): such a segment fills every
+// frame at a warm start, gives the CPU more jobs and promotes only a trickle per round, at a point
+// where its link is idle (after its layers of the next round, while the next segment runs).
 inline constexpr double kSlowLinkBytesPerSecond = 8e9;
 inline constexpr std::uint32_t kSlowLinkCpuJobs = 32;
+// A slow link's promotion bytes per round: the link time of kSlowLinkTrickleSeconds (6 ms: about
+// six 2.64 MiB experts at 3.1 GB/s), well inside the time a decode round's later segments keep it
+// idle (about 14-16 ms on an RTX PRO 4000 + RTX 5080 split at K = 20-24).
+inline constexpr double kSlowLinkTrickleSeconds = 6e-3;
 
 // When a segment's expert cache promotes misses into frames.
 //   Dynamic:  today's LFRU: every miss-driven promotion the decode budget allows, scaled by
 //             fill_scale while the frames fill;
 //   Frozen:   never (the warm start's set stays);
-//   IdleOnly: never while requests run; between them at most idle_refill_promotions per tick;
-//   Trickle:  at most trickle_bytes per round.
+//   IdleOnly: never while requests run (between them at most idle_refill_promotions per tick: not
+//             implemented, so the Program treats it as Frozen);
+//   Trickle:  at most trickle_bytes per round (the slow link's policy).
 enum class PromotionPolicy : std::uint8_t { Dynamic, Frozen, IdleOnly, Trickle };
 
 // The defaults are the reference link's policy.
@@ -63,7 +70,8 @@ struct LinkPolicyInputs {
 
 // The policy of a link of `rate` bytes per second; a rate that is not positive and finite (nothing
 // measured) yields the reference link's, as the single-GPU Program keeps the reference rate then.
-// rate < 8e9: IdleOnly, seed 1.0 and at least 32 CPU jobs (0, CPU-served misses disabled, stays 0).
+// rate < 8e9: Trickle (rate * 6 ms per round), seed 1.0 and at least 32 CPU jobs (0, CPU-served
+// misses disabled, stays 0).
 [[nodiscard]] inline LinkPolicy derive_link_policy(double rate,
                                                    const LinkPolicyInputs& in) noexcept {
     if (!(rate > 0.0) || !std::isfinite(rate)) { rate = kReferenceLinkBytesPerSecond; }
@@ -95,8 +103,9 @@ struct LinkPolicyInputs {
     // Fill-phase promotions per layer and token: one on the reference link or faster.
     p.fill_scale = std::min(1.0, rate / kReference);
     if (rate < kSlowLinkBytesPerSecond) {
-        p.promotions = PromotionPolicy::IdleOnly;
-        p.seed_share = 1.0;
+        p.promotions    = PromotionPolicy::Trickle;
+        p.trickle_bytes = static_cast<std::uint64_t>(rate * kSlowLinkTrickleSeconds);
+        p.seed_share    = 1.0;
         p.cpu_jobs   = in.cpu_expert_jobs > 0 ? std::max(in.cpu_expert_jobs, kSlowLinkCpuJobs) : 0;
     } else {
         p.promotions = PromotionPolicy::Dynamic;

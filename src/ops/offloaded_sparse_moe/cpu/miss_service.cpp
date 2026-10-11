@@ -151,6 +151,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options shared,
         return p;
     };
     ports_.resize(ports.size());
+    port_experts_ = std::make_unique<std::atomic<std::uint64_t>[]>(ports.size());
     try {
         for (std::size_t i = 0; i < ports.size(); ++i) {
             Port& port   = ports_[i];
@@ -334,6 +335,7 @@ void CpuMissService::serve() {
             *reinterpret_cast<volatile std::uint32_t*>(port.done) = sequence;
             served_.fetch_add(1, std::memory_order_relaxed);
             experts_.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+            port_experts_[p].fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
             last      = std::chrono::steady_clock::now();
             polls     = 0;
             deep_idle = false;

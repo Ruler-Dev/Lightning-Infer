@@ -106,16 +106,18 @@ void test_today() {
 void test_slow_link() {
     for (const double rate : {3.1e9, 7.4e9, std::nextafter(8e9, 0.0)}) {
         const LinkPolicy p = derive_link_policy(rate, {});
-        require(p.promotions == PromotionPolicy::IdleOnly && p.seed_share == 1.0 &&
+        require(p.promotions == PromotionPolicy::Trickle && p.seed_share == 1.0 &&
                     p.cpu_jobs == 32,
-                "a slow link refills only while idle, seeds every frame and gives the CPU 32 jobs" +
+                "a slow link trickles promotions, seeds every frame and gives the CPU 32 jobs" +
                     gbps(rate));
-        require(p.idle_refill_promotions == 32 && p.trickle_bytes == 0,
-                "the idle refill bound" + gbps(rate));
+        require(p.trickle_bytes == static_cast<std::uint64_t>(rate * kSlowLinkTrickleSeconds) &&
+                    p.idle_refill_promotions == 32,
+                "the trickle is 6 ms of the link per round" + gbps(rate));
     }
     for (const double rate : {8e9, 27.5e9, 28.4e9, 64e9}) {
         const LinkPolicy p = derive_link_policy(rate, {});
-        require(p.promotions == PromotionPolicy::Dynamic && p.seed_share == 0.5 && p.cpu_jobs == 16,
+        require(p.promotions == PromotionPolicy::Dynamic && p.seed_share == 0.5 && p.cpu_jobs == 16 &&
+                    p.trickle_bytes == 0,
                 "from 8 GB/s the dynamic cache as today" + gbps(rate));
     }
     // The CPU job count: the given one on a fast link; at least 32 on a slow one; none stays none.
@@ -163,7 +165,7 @@ void test_reference() {
     const LinkPolicy crawl = derive_link_policy(1.0, {});
     require(crawl.pcie_divisor == std::numeric_limits<std::int32_t>::max() &&
                 crawl.promotion_interval == 8 && crawl.split_columns == 4096 &&
-                crawl.promotions == PromotionPolicy::IdleOnly,
+                crawl.promotions == PromotionPolicy::Trickle && crawl.trickle_bytes == 0,
             "a 1 B/s link saturates every constant");
 }
 

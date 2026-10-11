@@ -4,15 +4,23 @@
 // lane state and pinned Host slab pool (docs/maintainer/qwen3_8-flash-next-design.md §19.3.1). The
 // index decides; this class holds what its opaque ids name and moves the bytes its decisions imply.
 //
-// - A block id owns one Device page lease: a cached full block, or a snapshot's Device tail. Lanes
-//   map cached pages into their block tables without a lease of their own; the index's path pins
-//   keep a mapped page's node (and so its lease) alive while any lane maps it.
+// - A block id owns one Device page lease of the head's pool: a cached full block, or a snapshot's
+//   Device tail. Lanes map cached pages into their block tables without a lease of their own; the
+//   index's path pins keep a mapped page's node (and so its lease) alive while any lane maps it.
 // - Snapshots are Host-born: an image (and a tail page, when the frontier is not a block boundary)
 //   is copied straight from a lane to reserved Host slabs, then published. Optional packed Device
 //   slots hold images on the Device when the index has slots.
 // - Host writes run on the transfer stream after a producer event; restores run on the restore
 //   stream in forward order, one event per decoder layer and one for the MTP group, so a lane's
 //   first call waits for each layer's state just before that layer reads it.
+//
+// A layer split's Program has one segment per device (PrefixSegment; an unsplit Program has one):
+// each segment holds its layers' KV planes over the head pool's page indices and its layers' state
+// groups, so each has its own transfer and restore streams on its device and copies only its planes
+// and groups. A layer's event comes from the stream of the segment that runs the layer, which is the
+// one that waits for it. Page records, state images and persisted files keep the whole model's order
+// (global_kv_plane), so they are the same bytes however the model is split. A capture is published
+// once every segment's copies have landed.
 
 #include "core/arena.h"
 #include "core/host_kv_arena.h"
@@ -97,6 +105,18 @@ struct PrefixCacheConfig {
     std::uint32_t device_snapshot_slots = 0;
 };
 
+// One device segment of the Program as the cache copies it, in layer order (LaneStateImage's
+// segments): its device, and its KV planes over the head pool's page indices (none without KV
+// layers) with their page group; its first KV layer is the model's attention_base-th attention
+// layer's, and on the head (`mtp`) its last is the MTP block's.
+struct PrefixSegment {
+    int device                   = 0;
+    const DeviceKVPagePool* pool = nullptr;
+    KvPageGeometry pages;
+    std::uint32_t attention_base = 0;
+    bool mtp                     = false;
+};
+
 // One admission's restore: Host pages into new pages, an image into a lane, then the events a
 // lane's first call waits on (one per decoder layer, then the MTP group).
 struct RestoreTicket {
@@ -105,8 +125,10 @@ struct RestoreTicket {
 
 class PrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
 public:
-    PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool, const KvPageGeometry& pages,
-                const LaneStateImage& lanes, std::uint64_t host_bytes);
+    // `leases` is the head's pool, which hands out every page; `pages` the whole model's page group
+    // (the page records' layout); `segments` the Program's segments in layer order.
+    PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& leases, const KvPageGeometry& pages,
+                std::span<const PrefixSegment> segments, const LaneStateImage& lanes, std::uint64_t host_bytes);
     ~PrefixCache() override;
 
     PrefixCache(const PrefixCache&)            = delete;
@@ -120,6 +142,7 @@ public:
     [[nodiscard]] const PrefixHostLayout& host_layout() const noexcept { return host_; }
     [[nodiscard]] bool host_tier() const noexcept { return host_.slabs != 0; }
     [[nodiscard]] std::uint64_t pinned_bytes() const noexcept;
+    [[nodiscard]] std::size_t segments() const noexcept { return segments_.size(); }
 
     // ---- blocks ------------------------------------------------------------------------------
     // Inserts a committed full block whose page is `lease`. When the index keeps it (a new node,
@@ -142,9 +165,10 @@ public:
 
     // ---- Host-born captures ------------------------------------------------------------------
     // Copies lane `lane`'s state image (and, with a tail, the partial page `tail_page`) to reserved
-    // Host slabs after `producer` reaches the current point, in forward order, and publishes the
-    // snapshot when the copy lands (poll). The lane's next writes to a layer's state, and to that
-    // layer's planes of `tail_page`, wait on that layer's event (capture_events).
+    // Host slabs after each segment's `producers` stream (one per segment) reaches the current
+    // point, in forward order, and publishes the snapshot when every segment's copy lands (poll).
+    // The lane's next writes to a layer's state, and to that layer's planes of `tail_page`, wait on
+    // that layer's event (capture_events).
     struct Capture {
         std::uint64_t id = 0; // the caller's name for capture_result
         runtime::prefix_cache::NodeRef anchor;
@@ -158,12 +182,16 @@ public:
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
-    [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
-    // The capture's copy-out events in layer order (decoder layers, then MTP): each is recorded once
-    // that layer's state (and its planes of the tail page) has been read. Empty once it has landed.
+    [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, std::span<const cudaStream_t> producers);
+    // The capture's copy-out events in layer order (decoder layers, then MTP): each is recorded, on
+    // the stream of the segment that runs the layer, once that layer's state (and its planes of the
+    // tail page) has been read. Empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> capture_events(std::uint64_t id) const noexcept;
-    // Copies every Device-only node of `nodes` to a Host slab, after `producer`'s queued work.
-    void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, cudaStream_t producer);
+    // Orders each segment's `consumers` stream after its own part of a capture still in flight.
+    void order_after_capture(std::uint64_t id, std::span<const cudaStream_t> consumers) const;
+    // Copies every Device-only node of `nodes` to a Host slab, each segment its planes after its
+    // `producers` stream's queued work.
+    void write_blocks(std::span<const runtime::prefix_cache::NodeRef> nodes, std::span<const cudaStream_t> producers);
     // Publishes landed captures and writes and retires landed restores. Non-blocking.
     void poll();
     // Waits for every capture, write and restore in flight and publishes them.
@@ -173,7 +201,7 @@ public:
     }
     // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
     // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the
-    // copy is first in the transfer stream, at most an image's copy time. Returns whether it waited.
+    // copy is first in the transfer streams, at most an image's copy time. Returns whether it waited.
     [[nodiscard]] bool await_extended_endpoint(std::span<const runtime::prefix_cache::NodeRef> path,
                                                std::span<const TokenId> tokens);
     // The publication of a landed capture (absent while it is in flight); forget it when done.
@@ -181,7 +209,8 @@ public:
     void forget_capture(std::uint64_t id) noexcept;
 
     // ---- restores (one admission staged at a time) --------------------------------------------
-    void open_restore(cudaStream_t producer);
+    // Each segment's restore stream starts after its `producers` stream's queued work.
+    void open_restore(std::span<const cudaStream_t> producers);
     // A Host-only block into a new cache page (the lease moves into the cache; node Filling).
     void restore_block(runtime::prefix_cache::NodeRef node, DeviceKVPageLease&& destination);
     // A block's Host page into a lane's private page (a copy-on-write anchor), the block pinned
@@ -191,14 +220,15 @@ public:
     void restore_tail_page(runtime::prefix_cache::SnapshotRef snapshot, DeviceKVPageHandle destination);
     // A snapshot's Host image into a lane.
     void restore_image(runtime::prefix_cache::SnapshotRef snapshot, std::uint32_t lane);
-    // Enqueues the batch per decoder layer (that layer's page planes or state parts), then the MTP
-    // group, recording one event after each. Returns the ticket the lane's calls wait with.
+    // Enqueues the batch per decoder layer (that layer's page planes or state parts, on the restore
+    // stream of the segment that runs it), then the MTP group, recording one event after each.
+    // Returns the ticket the lane's calls wait with.
     [[nodiscard]] RestoreTicket submit_restore();
     [[nodiscard]] bool restore_open() const noexcept { return restore_.open; }
     // The batch's events in layer order (decoder layers, then MTP); empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> restore_events(RestoreTicket ticket) const noexcept;
-    // Orders `consumer` after every copy of a landing batch.
-    void order_after_restore(RestoreTicket ticket, cudaStream_t consumer) const;
+    // Orders each segment's `consumers` stream after its copies of a landing batch.
+    void order_after_restore(RestoreTicket ticket, std::span<const cudaStream_t> consumers) const;
     // Waits on the host for a landing batch (and every batch before it) and retires what landed.
     void await_restore(RestoreTicket ticket);
     void abort_restore() noexcept;
@@ -223,6 +253,17 @@ public:
     void drop_snapshot_device_image(runtime::prefix_cache::SnapshotRef snapshot) noexcept override;
 
 private:
+    // A segment's copies: its planes' places in the page records, its streams on its device, its
+    // spare events (an event belongs to the device it was created on) and its last state group,
+    // whose event lands after every copy the segment enqueued before it.
+    struct Segment {
+        PrefixSegment spec;
+        HostKVPageLayout host;
+        cudaStream_t transfer = nullptr;
+        cudaStream_t restore  = nullptr;
+        std::vector<cudaEvent_t> spare;
+        std::uint32_t last_group = 0;
+    };
     struct PendingCapture {
         Capture capture;
         runtime::prefix_cache::HostImageReservation image;
@@ -230,7 +271,7 @@ private:
     };
     struct PendingWrite {
         std::vector<runtime::prefix_cache::NodeRef> nodes;
-        cudaEvent_t done = nullptr;
+        std::vector<cudaEvent_t> done; // per segment; null where a segment has no KV planes
     };
     struct PageCopy {
         DeviceKVPageHandle page;
@@ -252,20 +293,31 @@ private:
     [[nodiscard]] std::uint32_t allocate_block_id(DeviceKVPageLease&& lease);
     [[nodiscard]] std::byte* slab(std::uint32_t id) const noexcept;
     [[nodiscard]] std::uint32_t slab_group(std::uint32_t id) const noexcept { return id / host_.slabs_per_chunk; }
-    [[nodiscard]] cudaEvent_t take_event();
-    void recycle(cudaEvent_t event) noexcept;
+    // With the segment's device current.
+    [[nodiscard]] cudaEvent_t take_event(std::uint32_t segment);
+    void recycle(std::uint32_t segment, cudaEvent_t event) noexcept;
+    // Recycles (and clears) per-group events: each to the segment of its group.
+    void recycle_groups(std::vector<cudaEvent_t>& events) noexcept;
+    // Whether every segment's last event of per-group `events` has completed.
+    [[nodiscard]] bool landed(std::span<const cudaEvent_t> events) const;
+    void synchronize(std::span<const cudaEvent_t> events) const;
+    // Orders `consumers[s]` after segment s's last event of per-group `events`.
+    void order_after(std::span<const cudaEvent_t> events, std::span<const cudaStream_t> consumers) const;
+    // Throws unless `streams` names one stream per segment.
+    void check_streams(std::span<const cudaStream_t> streams) const;
+    // The segment KV layer that holds group `group`'s planes (the group's decoder layer, or the MTP
+    // block's for the MTP group); absent when the group has none. `attention` counts the model's
+    // attention layers before the group.
+    [[nodiscard]] std::optional<std::uint32_t> group_kv_layer(std::uint32_t group, std::uint32_t attention) const;
     void finish_restore(RestoreBatch& batch) noexcept;
-    void copy_pages_from_host(std::span<const PageCopy> copies, std::size_t plane_begin, std::size_t plane_end,
-                              cudaStream_t stream) const;
 
     runtime::prefix_cache::TapPlannerConfig taps_;
-    DeviceKVPagePool* pool_ = nullptr;
+    DeviceKVPagePool* leases_ = nullptr;
     KvPageGeometry geometry_;
     const LaneStateImage* lanes_ = nullptr;
     PrefixHostLayout host_;
     std::vector<PinnedHostBuffer> chunks_;
-    cudaStream_t transfer_ = nullptr;
-    cudaStream_t restore_stream_ = nullptr;
+    std::vector<Segment> segments_;
     std::vector<std::optional<DeviceKVPageLease>> blocks_;
     std::vector<std::uint32_t> free_blocks_;
     std::vector<std::int32_t> node_mtp_next_;      // by node index
@@ -276,7 +328,6 @@ private:
     RestoreBatch restore_;
     std::deque<RestoreBatch> landing_;
     std::uint64_t next_ticket_ = 1;
-    std::vector<cudaEvent_t> spare_events_;
     PrefixCacheCounters counters_;
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
 };

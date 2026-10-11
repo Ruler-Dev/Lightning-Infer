@@ -604,7 +604,7 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
     return std::nullopt;
 }
 
-std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
     std::uint32_t evicted = 0;
     for (std::uint32_t f = first; f < first + count; ++f) {
@@ -613,6 +613,7 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
         policy_.evict(key);
         make_absent(key, out);
         frames_.release_now(f);
+        if (refill) { lent_keys_.push_back(key); }
         ++evicted;
     }
     frames_.lend(first, count);
@@ -623,16 +624,38 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
+        if (refill) { lent_keys_.push_back(v); }
         ++evicted;
     }
     return evicted;
 }
 
-void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+std::uint32_t CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
+                                         bool refill) {
     frames_.give_back(first, count);
     std::vector<std::uint32_t> none;
     policy_.set_capacity(policy_.capacity() + count, none);
     drain_queue(out);
+    if (!refill) { return 0; }
+    // The evicted experts back into free frames, in eviction order; a key that came back meanwhile
+    // (a landed miss, a queued load) leaves the list.
+    std::uint32_t loaded = 0;
+    std::vector<std::uint32_t> waiting;
+    for (const std::uint32_t key : lent_keys_) {
+        if (table_[key].state != ResidencyState::kAbsent || is_queued_[key] != 0 || policy_.resident(key)) { continue; }
+        std::optional<std::uint32_t> frame;
+        if (policy_.resident_count() < policy_.capacity()) { frame = frames_.acquire(); }
+        if (!frame) {
+            waiting.push_back(key);
+            continue;
+        }
+        const std::uint32_t one[] = {key};
+        policy_.seed(one, {});
+        load(key, *frame, out);
+        ++loaded;
+    }
+    lent_keys_ = std::move(waiting);
+    return loaded;
 }
 
 } // namespace infernix::models::qwen4_exp::expert_cache

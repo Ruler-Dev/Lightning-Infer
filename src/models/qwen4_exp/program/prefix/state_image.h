@@ -13,6 +13,7 @@
 // the Host the packed byte o lives at segments[o / segment_bytes] + o % segment_bytes (the slabs of
 // the prefix cache's pinned pool, not contiguous); a packed Device slot holds the same layout.
 
+#include "core/host_kv_arena.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
@@ -125,16 +126,23 @@ void write_state_image_header(const StateImageLayout& layout, const StateImageHe
 [[nodiscard]] std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& layout,
                                                                       const std::byte* image_begin);
 
-// Where the Program keeps every lane's state (program_impl.h).
+// Where one device segment of the Program keeps every lane's state for its decoder layers
+// (program_impl.h; an unsplit Program has one segment over every layer). Its GDN pool, tails and
+// exact window hold its own layers from 0: its first GDN layer is the model's gdn_base-th, its first
+// attention layer the attention_base-th, and on the head the MTP block's KV layer follows its
+// attention layers.
 struct LaneStateBuffers {
+    std::uint32_t layer_begin = 0, layer_end = 0; // its decoder layers [begin, end)
+    std::uint32_t gdn_base = 0, attention_base = 0;
+    bool head = false; // the last segment: it holds the MTP group
     const LinearAttentionStatePool* gdn = nullptr;
     std::uint32_t lanes                 = 0;
-    std::byte* ple                      = nullptr; // lane l at ple + l * spec.ple_bytes
-    // Tail slab of KV layer k (attention layers, then MTP) and lane l at
-    // tails + (k * lanes + l) * spec.qsa_tail_bytes.
+    std::byte* ple                      = nullptr; // with the PLE layer: lane l at ple + l * spec.ple_bytes
+    // Tail slab of the segment's KV layer k (its attention layers, then MTP's on the head) and lane l
+    // at tails + (k * lanes + l) * spec.qsa_tail_bytes.
     std::byte* tails     = nullptr;
-    std::byte* mtp_saved = nullptr; // lane l at mtp_saved + l * spec.mtp_saved_bytes
-    // The exact window (vector-quantized storages): KvWindowGeometry's planes at `window`.
+    std::byte* mtp_saved = nullptr; // on the head: lane l at mtp_saved + l * spec.mtp_saved_bytes
+    // The exact window (vector-quantized storages): KvWindowGeometry's planes of its KV layers.
     std::byte* window = nullptr;
     KvWindowGeometry window_geometry;
 };
@@ -151,14 +159,22 @@ struct HostImageConst {
 };
 
 // Copies between a lane's state, packed Device slots and Host images. Every copy is enqueued on the
-// caller's stream; the caller orders it against the compute stream and records any events.
+// caller's stream; the caller orders it against the compute stream and records any events. The
+// image keeps the whole model's layout however the Program's segments hold the state: group g
+// (decoder layer g) is the bytes of the segment that runs layer g, the MTP group the head's, so a
+// group copy runs on that segment's device (group_segment). The whole-lane forms read every
+// segment's buffers on one stream: for one segment, or segments that share one device.
 class LaneStateImage {
 public:
-    // Checks the buffers against the layout's sizes.
-    LaneStateImage(const StateImageLayout& layout, const LaneStateBuffers& buffers);
+    // Checks the buffers against the layout's sizes: one segment per entry, in layer order, over
+    // every decoder layer, the last one the head.
+    LaneStateImage(const StateImageLayout& layout, std::span<const LaneStateBuffers> segments);
 
     [[nodiscard]] const StateImageLayout& layout() const noexcept { return *layout_; }
-    // The lane's Device bytes of a part (none for the header).
+    [[nodiscard]] std::uint32_t segments() const noexcept { return static_cast<std::uint32_t>(segments_.size()); }
+    // The segment that holds group `group`'s bytes (decoder layer `group`, or the MTP group: the head).
+    [[nodiscard]] std::uint32_t group_segment(std::uint32_t group) const;
+    // The lane's Device bytes of a part (none for the header), on the segment that holds them.
     [[nodiscard]] std::byte* device_part(const StateImagePart& part, std::uint32_t lane) const;
 
     // Capture: every part but the header, or one group's parts.
@@ -174,11 +190,20 @@ public:
                                 cudaStream_t stream) const;
 
 private:
+    // A segment's buffers with its GDN and attention layer counts.
+    struct Segment {
+        LaneStateBuffers buffers;
+        std::uint32_t gdn_count = 0, attention_count = 0;
+    };
+
+    // The segment holding the part's bytes.
+    [[nodiscard]] const Segment& part_segment(const StateImagePart& part) const;
     void check_lane(std::uint32_t lane) const;
     void check_image(std::size_t segments, std::size_t segment_bytes) const;
 
     const StateImageLayout* layout_ = nullptr;
-    LaneStateBuffers buffers_;
+    std::vector<Segment> segments_;
+    std::uint32_t lanes_ = 0;
 };
 
 // The Program's KV page group: for every KV layer (the attention layers, then MTP's), K data, K
@@ -213,5 +238,13 @@ struct PlaneRange {
 [[nodiscard]] std::size_t global_kv_plane(const KvPageGeometry& segment, std::uint32_t attention_base,
                                           std::uint32_t global_attention_layers, std::size_t segment_plane,
                                           bool segment_has_mtp);
+
+// Where a segment's page group lies in the whole model's page record `model` (plan_host_kv_page_layout
+// of kv_page_geometry(config, storage, mtp)): the segment's geometry, each of its planes at its
+// global plane's offset (global_kv_plane), the whole record's stride. A segment's pool copies its
+// planes of a page straight into and out of the whole model's record with it.
+[[nodiscard]] HostKVPageLayout segment_host_page_layout(const HostKVPageLayout& model, const KvPageGeometry& segment,
+                                                        std::uint32_t attention_base,
+                                                        std::uint32_t global_attention_layers, bool segment_has_mtp);
 
 } // namespace infernix::models::qwen4_exp::prefix

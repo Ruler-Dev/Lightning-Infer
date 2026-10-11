@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -80,6 +81,11 @@ public:
     // Totals over every port.
     [[nodiscard]] std::uint64_t served_requests() const noexcept { return served_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t served_experts() const noexcept { return experts_.load(std::memory_order_relaxed); }
+    // The experts served for port `port`'s calls (0 for a port out of range).
+    [[nodiscard]] std::uint64_t served_experts(int port) const noexcept {
+        return port >= 0 && port < port_count() ? port_experts_[static_cast<std::size_t>(port)].load(std::memory_order_relaxed)
+                                                : 0;
+    }
     // Why the service thread stopped serving; empty while it serves. The device's wait for an
     // answer then times out (kErrorHostSilent) on every later call, so the caller treats a failed
     // service as fatal and reports this cause.
@@ -110,6 +116,7 @@ private:
     int jobs_ = 0; // the most jobs a port's request may carry
     std::atomic<bool> stop_{false};
     std::atomic<std::uint64_t> served_{0}, experts_{0};
+    std::unique_ptr<std::atomic<std::uint64_t>[]> port_experts_; // per port, beside experts_
     mutable std::mutex failure_mutex_;
     std::string failure_;
     std::thread thread_;

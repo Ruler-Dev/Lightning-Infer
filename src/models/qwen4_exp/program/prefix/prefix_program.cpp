@@ -36,28 +36,49 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 
 // ---- construction ------------------------------------------------------------------------------------
 
+// The image, the records and the files keep the whole model's layout; each segment contributes its
+// layers' state, its KV planes (over the head pool's page indices) and its compute stream (phase 2 of
+// the layer split's cache, multi-GPU WP15). The unsplit Program's one segment holds everything.
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
     prefix_.image_layout = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
-    prefix_.lane_image   = std::make_unique<prefix::LaneStateImage>(
-        prefix_.image_layout,
-        prefix::LaneStateBuffers{.gdn       = whole().gdn.get(),
-                                 .lanes     = lanes,
-                                 .ple       = static_cast<std::byte*>(ple().ple_backing.p),
-                                 .tails     = static_cast<std::byte*>(whole().tails_backing.p),
-                                 .mtp_saved = mtp_ ? static_cast<std::byte*>(head().mtp_saved.p) : nullptr,
-                                 .window    = static_cast<std::byte*>(whole().window_backing.p),
-                                 .window_geometry = whole().window_geometry});
+    std::vector<prefix::LaneStateBuffers> buffers;
+    std::vector<prefix::PrefixSegment> parts;
+    for (const auto& segment : segments_) {
+        DeviceSegment& seg = *segment;
+        buffers.push_back(prefix::LaneStateBuffers{
+            .layer_begin     = seg.spec.layers.begin,
+            .layer_end       = seg.spec.layers.end,
+            .gdn_base        = seg.spec.gdn_base,
+            .attention_base  = seg.spec.attention_base,
+            .head            = seg.spec.head,
+            .gdn             = seg.gdn.get(),
+            .lanes           = lanes,
+            .ple             = seg.spec.ple ? static_cast<std::byte*>(seg.ple_backing.p) : nullptr,
+            .tails           = static_cast<std::byte*>(seg.tails_backing.p),
+            .mtp_saved       = seg.spec.mtp ? static_cast<std::byte*>(seg.mtp_saved.p) : nullptr,
+            .window          = static_cast<std::byte*>(seg.window_backing.p),
+            .window_geometry = seg.window_geometry});
+        parts.push_back(prefix::PrefixSegment{.device         = seg.device->device,
+                                              .pool           = seg.pool.get(),
+                                              .pages          = seg.kv_geometry,
+                                              .attention_base = seg.spec.attention_base,
+                                              .mtp            = seg.spec.mtp});
+        prefix_.compute.push_back(seg.device->stream);
+    }
+    prefix_.lane_image = std::make_unique<prefix::LaneStateImage>(prefix_.image_layout, buffers);
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;
     config.kv_pages   = kv_pages_;
-    prefix_.cache     = std::make_unique<prefix::PrefixCache>(config, *head().pool, whole().kv_geometry,
-                                                              *prefix_.lane_image, options_.prefix_host_bytes);
+    prefix_.cache     = std::make_unique<prefix::PrefixCache>(
+        config, *head().pool, prefix::kv_page_geometry(c_, options_.kv_cache, mtp_), parts, *prefix_.lane_image,
+        options_.prefix_host_bytes);
     if (mtp_) {
         // The MR3 flush cell's inputs: token, cell, slot and table row.
         // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
+        const DeviceGuard on(head().device->device);
         prefix_.flush_host   = PinnedHostBuffer(kFlushWords * sizeof(std::int32_t));
         prefix_.flush_device = DeviceBuffer(kFlushWords * sizeof(std::int32_t));
         CUDA_CHECK(cudaEventCreateWithFlags(&prefix_.flush_uploaded, cudaEventDisableTiming));
@@ -125,6 +146,7 @@ void ProgramImpl::pc_make_room(std::uint32_t pages) {
 // MR3: one kv-only MTP cell for the pending position (cell state_tokens - 1 from the saved residual
 // and token history[state_tokens]), the cell the next round's step 0 or catch-up would write.
 void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
+    const SegmentWork on_head(*this, head()); // the drafter runs on the head
     const cudaStream_t stream = head().device->stream;
     CUDA_CHECK(cudaEventSynchronize(prefix_.flush_uploaded)); // the previous flush has read the staging words
     auto* words      = static_cast<std::int32_t*>(prefix_.flush_host.data());
@@ -304,7 +326,7 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
             std::vector<DeviceKVPageLease> pages;
             pages.reserve(wanted);
             head().pool->materialize(*reservation, wanted, pages);
-            prefix_.cache->open_restore(whole().device->stream);
+            prefix_.cache->open_restore(prefix_.compute);
             for (const pc::NodeRef node : path) {
                 if (started == wanted) { break; }
                 const pc::NodeView view = index.node(node);
@@ -481,6 +503,20 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
     return true;
 }
 
+// A copy-on-write source page (a snapshot's Device tail, an anchor block) into a lane's private
+// page: every segment its own planes, on its compute stream, by the head pool's page indices.
+void ProgramImpl::copy_cache_page(DeviceKVPageHandle source, DeviceKVPageHandle destination) {
+    const DeviceKVPageHandle pages[] = {source, destination};
+    const std::vector<std::int32_t> indices =
+        KVExecutionTablePool::indices_of(std::span<const DeviceKVPageHandle>(pages));
+    for (const auto& segment : segments_) {
+        DeviceSegment& seg = *segment;
+        if (!seg.pool) { continue; } // no KV layers
+        const SegmentWork on(*this, seg);
+        seg.pool->copy_page_index(indices[0], indices[1], seg.device->stream);
+    }
+}
+
 // Pins what a selection reads (its matched path up to the anchor and the snapshot) before room is
 // made for it, so making room cannot evict them.
 void ProgramImpl::prefix_pin(const PrefixSelection& s) {
@@ -504,11 +540,9 @@ void ProgramImpl::prefix_unpin(const PrefixSelection& s) noexcept {
 void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& s,
                                   DeviceKVPageReservation& reservation, std::uint32_t pages) {
     pc::PrefixCacheIndex& cache = prefix_.cache->index();
-    const cudaStream_t stream   = whole().device->stream;
-    // A copy-out of this lane's previous state must land before anything overwrites the slot.
-    for (const cudaEvent_t event : prefix_.cache->capture_events(lane.prefix.capture)) {
-        CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
-    }
+    // A copy-out of this lane's previous state must land before anything overwrites the slot: each
+    // segment's stream waits for its own part of it.
+    prefix_.cache->order_after_capture(lane.prefix.capture, prefix_.compute);
     const std::uint32_t k = s.frontier / kBlock;
     // The lane keeps the pins of the blocks it maps (prefix_pin took one on each up to the anchor).
     lane.prefix.path.assign(s.path.begin(), s.path.begin() + s.shared);
@@ -521,7 +555,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
                                              return cache.node(n).device != pc::CopyState::Resident;
                                          }));
     if (s.snapshot) {
-        if (restores) { prefix_.cache->open_restore(stream); }
+        if (restores) { prefix_.cache->open_restore(prefix_.compute); }
         for (const pc::NodeRef node : lane.prefix.path) {
             if (cache.node(node).device != pc::CopyState::Resident) {
                 prefix_.cache->restore_block(node, head().pool->materialize_one(reservation));
@@ -531,7 +565,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         if (s.cow == PrefixCow::Tail) {
             const pc::SnapshotView view = cache.snapshot(*s.snapshot);
             if (view.tail_device_copy == pc::CopyState::Resident) {
-                whole().pool->copy_page(prefix_.cache->page(view.tail_device), first_private, stream);
+                copy_cache_page(prefix_.cache->page(view.tail_device), first_private);
             } else {
                 prefix_.cache->restore_tail_page(*s.snapshot, first_private);
             }
@@ -539,7 +573,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
             const pc::NodeRef anchor = s.path[k - 1];
             const pc::NodeView view  = cache.node(anchor);
             if (view.device == pc::CopyState::Resident) {
-                whole().pool->copy_page(prefix_.cache->page(view.device_id), first_private, stream);
+                copy_cache_page(prefix_.cache->page(view.device_id), first_private);
             } else {
                 prefix_.cache->restore_node_page(anchor, first_private);
             }
@@ -564,12 +598,13 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     lane.prefix.resident_capture = 0;
     lane.prefix.lineage_capture  = 0;
     if (!s.snapshot) { reset_slot(index); }
-    // The block table: shared cache pages, then the private leases.
+    // The block table: shared cache pages, then the private leases (every segment's row, by the
+    // head pool's page indices).
     std::vector<DeviceKVPageHandle> handles;
     handles.reserve(pages);
     for (const pc::NodeRef node : lane.prefix.path) { handles.push_back(prefix_.cache->page(cache.node(node).device_id)); }
     for (const DeviceKVPageLease& lease : lane.pages) { handles.push_back(lease.handle()); }
-    whole().tables->publish(lane.row.handle(), 0, std::span<const DeviceKVPageHandle>(handles), stream);
+    publish_rows(lane, 0, std::span<const DeviceKVPageHandle>(handles));
     lane.state_tokens = s.frontier;
     if (s.snapshot) {
         // MR6: whether the drafter's cell F - 1 holds this prompt's continuation.
@@ -589,6 +624,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_.cache->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
         // Penalty counts restart with the request; the lane's state came from the snapshot.
+        const SegmentWork on_head(*this, head());
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(head().token_counts.p) +
                                        index * static_cast<std::size_t>(token_domain_),
                                    0, 4ULL * token_domain_, head().device->stream));
@@ -773,11 +809,13 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
         c.supersedes = *lane.prefix.resume;
     }
     const std::uint64_t id = c.id;
-    if (prefix_.cache->capture(index, std::move(c), whole().device->stream)) {
+    const bool own_tail    = c.tail_page.has_value() && !c.tail_lease.has_value();
+    if (prefix_.cache->capture(index, std::move(c), prefix_.compute)) {
         prefix_.cache->forget_capture(lane.prefix.capture);
         lane.prefix.capture         = id;
         lane.prefix.lineage_capture = id;
         lane.prefix.deepest         = F;
+        if (own_tail) { lane.prefix.tail_capture = id; }
     }
 }
 
@@ -836,8 +874,8 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
     } else if (!full_blocks) {
         ++prefix_.cache->counters().endpoint_skipped_mtp;
     }
-    // Blocks reach the Host after the endpoint (one transfer stream, FIFO).
-    prefix_.cache->write_blocks(lane.prefix.path, whole().device->stream);
+    // Blocks reach the Host after the endpoint (each segment's transfer stream, FIFO).
+    prefix_.cache->write_blocks(lane.prefix.path, prefix_.compute);
     // The lane's slot holds the image of its latest capture until the lane is reused, but only when
     // that capture is at the lane's frontier: when the endpoint was not captured (too close to the
     // deepest snapshot, unfinished MTP blocks), the latest capture is an earlier tap whose state the

@@ -217,62 +217,137 @@ std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& 
     return header;
 }
 
-LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBuffers& buffers)
-    : layout_(&layout), buffers_(buffers) {
+LaneStateImage::LaneStateImage(const StateImageLayout& layout, std::span<const LaneStateBuffers> segments)
+    : layout_(&layout) {
     const StateImageSpec& spec = layout.spec;
-    std::uint32_t gdn_layers = 0, attention_layers = 0;
-    for (const MixerKind kind : spec.layer_types) { ++(kind == MixerKind::Gdn ? gdn_layers : attention_layers); }
-    if (buffers.lanes == 0 || buffers.ple == nullptr || (attention_layers + (spec.mtp ? 1U : 0U) > 0 && buffers.tails == nullptr) ||
-        (spec.mtp && buffers.mtp_saved == nullptr)) {
+    const auto layers          = static_cast<std::uint32_t>(spec.layer_types.size());
+    if (segments.empty() || segments.front().lanes == 0) {
         throw std::invalid_argument("Qwen4Exp state image: lane buffers are missing");
     }
-    if (spec.window_bytes[0] != 0) {
-        const KvWindowGeometry& w = buffers.window_geometry;
-        bool same = buffers.window != nullptr && w.lanes >= buffers.lanes &&
-                    w.kv_layers == attention_layers + (spec.mtp ? 1U : 0U);
-        for (int p = 0; same && p < KvWindowGeometry::kPlanes; ++p) { same = w.lane_bytes(p) == spec.window_bytes[p]; }
-        if (!same) { throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout"); }
-    }
-    if (gdn_layers > 0) {
-        if (buffers.gdn == nullptr || buffers.gdn->layer_count() != gdn_layers ||
-            buffers.gdn->slot_count() < static_cast<std::int32_t>(buffers.lanes) ||
-            buffers.gdn->recurrent_slot(0, 0).bytes() != spec.gdn_recurrent_bytes ||
-            buffers.gdn->conv_slot(0, 0).bytes() != spec.gdn_conv_bytes) {
-            throw std::invalid_argument("Qwen4Exp state image: the GDN state pool does not match the layout");
+    lanes_                 = segments.front().lanes;
+    std::uint32_t next     = 0;
+    std::uint32_t gdn      = 0;
+    std::uint32_t attention = 0;
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        const LaneStateBuffers& b = segments[s];
+        if (b.layer_begin != next || b.layer_end <= b.layer_begin || b.layer_end > layers ||
+            b.head != (s + 1 == segments.size()) || b.gdn_base != gdn || b.attention_base != attention ||
+            b.lanes != lanes_) {
+            throw std::invalid_argument("Qwen4Exp state image: the segments do not cover the decoder layers in order");
         }
+        Segment segment{.buffers = b};
+        for (std::uint32_t l = b.layer_begin; l < b.layer_end; ++l) {
+            ++(spec.layer_types[l] == MixerKind::Gdn ? segment.gdn_count : segment.attention_count);
+        }
+        const bool ple                = spec.ple_layer >= b.layer_begin && spec.ple_layer < b.layer_end;
+        const bool mtp                = b.head && spec.mtp;
+        const std::uint32_t kv_layers = segment.attention_count + (mtp ? 1U : 0U);
+        if ((ple && b.ple == nullptr) || (kv_layers > 0 && b.tails == nullptr) || (mtp && b.mtp_saved == nullptr)) {
+            throw std::invalid_argument("Qwen4Exp state image: lane buffers are missing");
+        }
+        if (spec.window_bytes[0] != 0 && kv_layers > 0) {
+            const KvWindowGeometry& w = b.window_geometry;
+            bool same                 = b.window != nullptr && w.lanes >= lanes_ && w.kv_layers == kv_layers;
+            for (int p = 0; same && p < KvWindowGeometry::kPlanes; ++p) {
+                same = w.lane_bytes(p) == spec.window_bytes[p];
+            }
+            if (!same) {
+                throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout");
+            }
+        }
+        if (segment.gdn_count > 0) {
+            if (b.gdn == nullptr || b.gdn->layer_count() != segment.gdn_count ||
+                b.gdn->slot_count() < static_cast<std::int32_t>(lanes_) ||
+                b.gdn->recurrent_slot(0, 0).bytes() != spec.gdn_recurrent_bytes ||
+                b.gdn->conv_slot(0, 0).bytes() != spec.gdn_conv_bytes) {
+                throw std::invalid_argument("Qwen4Exp state image: the GDN state pool does not match the layout");
+            }
+        }
+        next = b.layer_end;
+        gdn += segment.gdn_count;
+        attention += segment.attention_count;
+        segments_.push_back(segment);
     }
+    if (next != layers) {
+        throw std::invalid_argument("Qwen4Exp state image: the segments do not cover the decoder layers in order");
+    }
+}
+
+std::uint32_t LaneStateImage::group_segment(std::uint32_t group) const {
+    if (group >= layout_->groups()) { throw std::out_of_range("Qwen4Exp state image: group out of range"); }
+    for (std::uint32_t s = 0; s + 1 < segments_.size(); ++s) {
+        if (group < segments_[s].buffers.layer_end) { return s; }
+    }
+    return static_cast<std::uint32_t>(segments_.size()) - 1U; // the head: its layers and the MTP group
+}
+
+const LaneStateImage::Segment& LaneStateImage::part_segment(const StateImagePart& part) const {
+    const auto holds = [&](auto&& contains) -> const Segment& {
+        for (const Segment& segment : segments_) {
+            if (contains(segment)) { return segment; }
+        }
+        throw std::out_of_range("Qwen4Exp state image: no segment holds the part");
+    };
+    const auto attention_of = [&](std::uint32_t index) -> const Segment& {
+        return holds([&](const Segment& s) {
+            return index >= s.buffers.attention_base && index < s.buffers.attention_base + s.attention_count;
+        });
+    };
+    switch (part.kind) {
+    case StateImagePart::Kind::Header: break;
+    case StateImagePart::Kind::Ple: return segments_[group_segment(layout_->spec.ple_layer)];
+    case StateImagePart::Kind::GdnRecurrent:
+    case StateImagePart::Kind::GdnConv:
+        return holds([&](const Segment& s) {
+            return part.index >= s.buffers.gdn_base && part.index < s.buffers.gdn_base + s.gdn_count;
+        });
+    case StateImagePart::Kind::QsaTail: return attention_of(part.index);
+    case StateImagePart::Kind::MtpSaved:
+    case StateImagePart::Kind::MtpTail: return segments_.back();
+    case StateImagePart::Kind::QsaWindow: {
+        // A KV layer past the model's attention layers is the MTP block's, on the head.
+        const std::uint32_t kv_layer = part.index / KvWindowGeometry::kPlanes;
+        const Segment& last          = segments_.back();
+        return kv_layer < last.buffers.attention_base + last.attention_count ? attention_of(kv_layer) : last;
+    }
+    }
+    throw std::logic_error("Qwen4Exp state image: the header has no Device bytes");
 }
 
 std::byte* LaneStateImage::device_part(const StateImagePart& part, std::uint32_t lane) const {
     check_lane(lane);
     const StateImageSpec& spec = layout_->spec;
-    std::uint32_t attention_layers = 0;
-    for (const MixerKind kind : spec.layer_types) { attention_layers += kind == MixerKind::Attention ? 1U : 0U; }
-    const auto slot = static_cast<std::int32_t>(lane);
+    const Segment& segment     = part_segment(part);
+    const LaneStateBuffers& b  = segment.buffers;
+    const auto slot            = static_cast<std::int32_t>(lane);
     switch (part.kind) {
     case StateImagePart::Kind::Header: break;
-    case StateImagePart::Kind::Ple: return buffers_.ple + static_cast<std::size_t>(lane) * spec.ple_bytes;
+    case StateImagePart::Kind::Ple: return b.ple + static_cast<std::size_t>(lane) * spec.ple_bytes;
     case StateImagePart::Kind::GdnRecurrent:
-        return static_cast<std::byte*>(buffers_.gdn->recurrent_slot(part.index, slot).data);
-    case StateImagePart::Kind::GdnConv: return static_cast<std::byte*>(buffers_.gdn->conv_slot(part.index, slot).data);
+        return static_cast<std::byte*>(b.gdn->recurrent_slot(part.index - b.gdn_base, slot).data);
+    case StateImagePart::Kind::GdnConv:
+        return static_cast<std::byte*>(b.gdn->conv_slot(part.index - b.gdn_base, slot).data);
     case StateImagePart::Kind::QsaTail:
-        return buffers_.tails + (static_cast<std::size_t>(part.index) * buffers_.lanes + lane) * spec.qsa_tail_bytes;
-    case StateImagePart::Kind::MtpSaved:
-        return buffers_.mtp_saved + static_cast<std::size_t>(lane) * spec.mtp_saved_bytes;
+        return b.tails +
+               (static_cast<std::size_t>(part.index - b.attention_base) * lanes_ + lane) * spec.qsa_tail_bytes;
+    case StateImagePart::Kind::MtpSaved: return b.mtp_saved + static_cast<std::size_t>(lane) * spec.mtp_saved_bytes;
     case StateImagePart::Kind::MtpTail:
-        return buffers_.tails + (static_cast<std::size_t>(attention_layers) * buffers_.lanes + lane) * spec.qsa_tail_bytes;
+        return b.tails + (static_cast<std::size_t>(segment.attention_count) * lanes_ + lane) * spec.qsa_tail_bytes;
     case StateImagePart::Kind::QsaWindow: {
-        const KvWindowGeometry& w = buffers_.window_geometry;
-        const int plane           = static_cast<int>(part.index % KvWindowGeometry::kPlanes);
-        return buffers_.window + w.plane_offset(part.index / KvWindowGeometry::kPlanes, plane) +
-               static_cast<std::size_t>(lane) * w.lane_bytes(plane);
+        const KvWindowGeometry& w    = b.window_geometry;
+        const int plane              = static_cast<int>(part.index % KvWindowGeometry::kPlanes);
+        const std::uint32_t kv_layer = part.index / KvWindowGeometry::kPlanes;
+        // The segment's KV layer: its attention layers from 0, then the MTP block's on the head.
+        const std::uint32_t local = kv_layer < b.attention_base + segment.attention_count ? kv_layer - b.attention_base
+                                                                                          : segment.attention_count;
+        return b.window + w.plane_offset(local, plane) + static_cast<std::size_t>(lane) * w.lane_bytes(plane);
     }
     }
     throw std::logic_error("Qwen4Exp state image: the header has no Device bytes");
 }
 
 void LaneStateImage::check_lane(std::uint32_t lane) const {
-    if (lane >= buffers_.lanes) { throw std::out_of_range("Qwen4Exp state image: lane out of range"); }
+    if (lane >= lanes_) { throw std::out_of_range("Qwen4Exp state image: lane out of range"); }
 }
 
 void LaneStateImage::check_image(std::size_t segments, std::size_t segment_bytes) const {
@@ -399,6 +474,27 @@ std::size_t global_kv_plane(const KvPageGeometry& segment, std::uint32_t attenti
     const auto local          = static_cast<std::uint32_t>(segment_plane / segment.planes_per_layer);
     const std::uint32_t layer = local < attention ? attention_base + local : global_attention_layers;
     return static_cast<std::size_t>(layer) * segment.planes_per_layer + segment_plane % segment.planes_per_layer;
+}
+
+HostKVPageLayout segment_host_page_layout(const HostKVPageLayout& model, const KvPageGeometry& segment,
+                                          std::uint32_t attention_base, std::uint32_t global_attention_layers,
+                                          bool segment_has_mtp) {
+    HostKVPageLayout out;
+    out.geometry    = segment.geometry;
+    out.page_stride = model.page_stride;
+    if (segment.geometry.page_tokens != model.geometry.page_tokens ||
+        segment.geometry.device_plane_order != model.geometry.device_plane_order) {
+        throw std::invalid_argument("Qwen4Exp KV geometry: the segment's pages differ from the model's");
+    }
+    for (std::size_t p = 0; p < segment.geometry.planes.size(); ++p) {
+        const std::size_t global =
+            global_kv_plane(segment, attention_base, global_attention_layers, p, segment_has_mtp);
+        if (global >= model.planes.size() || model.geometry.planes[global] != segment.geometry.planes[p]) {
+            throw std::invalid_argument("Qwen4Exp KV geometry: a segment's plane is not the model's");
+        }
+        out.planes.push_back(model.planes[global]);
+    }
+    return out;
 }
 
 } // namespace infernix::models::qwen4_exp::prefix

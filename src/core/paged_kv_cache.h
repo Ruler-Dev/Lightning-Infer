@@ -303,6 +303,24 @@ public:
                                 std::span<const DeviceKVPageHandle> destination,
                                 const HostKVPageLayout& layout, std::size_t plane_begin,
                                 std::size_t plane_end, cudaStream_t stream) const;
+    // copy_page and the plane-range record copies by physical page index, for a pool whose pages
+    // another pool of the same page count hands out (a layer split's segments each hold their own
+    // planes over the head pool's pages; KVExecutionTablePool::indices_of names them). Each index
+    // must lie below this pool's backed limit and a copy's destinations must be distinct; whether a
+    // page is live is the caller's ledger. `layout` places this pool's planes in each record: its
+    // geometry is this pool's, its plane offsets and stride may be a larger record's (a whole
+    // model's page record holding one segment's planes).
+    void copy_page_index(std::int32_t source, std::int32_t destination, cudaStream_t stream) const;
+    void copy_indices_to_host_records(std::span<const std::int32_t> source,
+                                      std::span<std::byte* const> records,
+                                      std::span<const std::uint32_t> record_groups,
+                                      const HostKVPageLayout& layout, std::size_t plane_begin,
+                                      std::size_t plane_end, cudaStream_t stream) const;
+    void copy_indices_from_host_records(std::span<const std::byte* const> records,
+                                        std::span<const std::uint32_t> record_groups,
+                                        std::span<const std::int32_t> destination,
+                                        const HostKVPageLayout& layout, std::size_t plane_begin,
+                                        std::size_t plane_end, cudaStream_t stream) const;
 
 private:
     friend class DeviceKVPageLease;
@@ -315,14 +333,23 @@ private:
                        std::int32_t first, std::size_t count, std::byte* host_base,
                        std::size_t host_pitch, const HostKVPageLayout& host,
                        cudaStream_t stream) const;
-    [[nodiscard]] static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
+    [[nodiscard]] static std::size_t host_record_run_end(std::span<const std::int32_t> pages,
                                                          std::span<const std::byte* const> records,
                                                          std::span<const std::uint32_t> groups,
                                                          std::size_t begin, std::size_t page_stride,
                                                          std::size_t max_pitch,
                                                          std::size_t& pitch) noexcept;
+    // The record copies over physical indices the public forms have checked.
+    void copy_records(cudaMemcpyKind kind, std::span<const std::int32_t> pages,
+                      std::span<const std::byte* const> records,
+                      std::span<const std::uint32_t> record_groups, const HostKVPageLayout& layout,
+                      std::size_t plane_begin, std::size_t plane_end, cudaStream_t stream) const;
+    void copy_page_planes(std::int32_t source, std::int32_t destination, cudaStream_t stream) const;
     void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
                                  const char* duplicate_message) const;
+    void validate_distinct_indices(std::span<const std::int32_t> pages,
+                                   const char* duplicate_message) const;
+    void check_backed_index(std::int32_t index) const;
     void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;
     void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;

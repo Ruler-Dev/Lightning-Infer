@@ -139,6 +139,9 @@ struct LanePrefix {
     // before the slot is rewritten), which belongs to another lineage.
     std::uint64_t lineage_capture  = 0;
     std::uint64_t resident_capture = 0;               // the endpoint the slot still holds
+    // The latest tap or boundary capture that copies one of the lane's own pages (its partial tail
+    // page, which the lane keeps): release orders the streams after it before the page is freed.
+    std::uint64_t tail_capture = 0;
     std::vector<runtime::prefix_cache::PlannedTap> taps;
     std::vector<runtime::prefix_cache::TapHint> hints;
     std::vector<runtime::prefix_cache::TapExclusion> exclusions; // Vision spans: no snapshot inside
@@ -621,9 +624,10 @@ public:
     // planes, io, workspace, staging and expert cache on its own device (under its DeviceGuard), one
     // CPU expert service with a port per segment, and joins consecutive segments' Forwards through a
     // HandoffChannel (decode and verification rounds, in the options' handoff mode) and a BulkHandoff
-    // (eager calls). It refuses what it cannot run yet (split_capabilities.h): the prefix cache and
-    // the SSD expert tier; and the gate handoff on a split whose segments share a GPU, where a
-    // waiting gate can keep the sender from running (design §16.4, layer split).
+    // (eager calls); the prefix cache copies each segment's planes and state on that segment's
+    // streams. It refuses what it cannot run yet (split_capabilities.h): the SSD expert tier; and the
+    // gate handoff on a split whose segments share a GPU, where a waiting gate can keep the sender
+    // from running (design §16.4, layer split).
     ProgramImpl(std::span<const execution::Parameters* const> parameters, std::span<DeviceContext* const> devices,
                 const SegmentMap& map, ProgramOptions options)
         : parameters_(first_parameters(parameters)), c_(parameters_.model.config().text),
@@ -632,9 +636,7 @@ public:
         check_segments(parameters, devices, map);
         const bool split = map.size() > 1;
         if (split) {
-            if (options_.prefix_cache && !kSplitPrefixCache) {
-                throw std::invalid_argument("Qwen4Exp: a layer split does not support the prefix cache yet");
-            }
+            static_assert(kSplitPrefixCache, "a layer split's prefix cache copies every segment's planes and state");
             if (parameters_.model.expert_store().has_value() && !kSplitExpertTier) {
                 throw std::invalid_argument(
                     "Qwen4Exp: a layer split needs every expert in Host RAM (it has no SSD expert tier yet)");
@@ -645,6 +647,7 @@ public:
             }
             handoff_ = options_.handoff == SplitHandoff::Gate ? HandoffMode::Gate : HandoffMode::Event;
             split_sync_ = split_sync_from_environment();
+            timing_.on  = split_timing_from_environment();
         }
         ple_segment_ = map.ple().index;
         const auto public_tokens = dim(parameters_.model.resources().public_token_count);
@@ -690,6 +693,14 @@ public:
             }
         }
 
+        if (timing_.on) {
+            timing_.graph_ms.assign(segments_.size(), 0.0);
+            for (const auto& segment : segments_) {
+                const DeviceGuard on(segment->device->device);
+                CUDA_CHECK(cudaEventCreate(&segment->timing_begin.event));
+                CUDA_CHECK(cudaEventCreate(&segment->timing_end.event));
+            }
+        }
         // Every segment's fixed allocations, checked against its plan and its device's free memory.
         std::vector<SegmentBuild> builds(segments_.size());
         for (std::size_t s = 0; s < segments_.size(); ++s) { build_segment(*segments_[s], builds[s]); }
@@ -732,6 +743,13 @@ public:
         for (const auto& segment : segments_) {
             const DeviceGuard on(segment->device->device);
             measure_link(*segment);
+            if (segment->residency) {
+                // A segment that promotes little or nothing during requests loads back what lending
+                // evicts; a trickle's promotions run in a window of layers, issued after its share of
+                // the next round (set_trickle).
+                segment->residency->set_refill_lent(!promotes_in_rounds(*segment) || trickles(*segment));
+                if (trickles(*segment)) { segment->residency->set_trickle(segment->trickle, true); }
+            }
         }
         apply_link_costs();
         if (decode_promotions_ != DecodePromotions::On) {
@@ -983,13 +1001,20 @@ public:
         report_lane_cost(lanes, record_stride);
     }
 
-    // A split's teardown: each segment is destroyed with its device current, after every lane has
-    // returned its pages and rows to the segments' pools and tables (an unsplit Program's members
-    // are destroyed in declaration order with its one device current).
+    // A split's teardown: each segment is destroyed with its device current, after the prefix cache
+    // (whose blocks hold pages of the head's pool and whose streams run on every segment's device) and
+    // every lane have returned their pages and rows to the segments' pools and tables (an unsplit
+    // Program's members are destroyed in declaration order with its one device current).
     ~ProgramImpl() {
         if (segments_.size() < 2) { return; }
         try {
             synchronize();
+        } catch (...) {}
+        prefix_.cache.reset();
+        prefix_.lane_image.reset();
+        try {
+            const DeviceGuard on(head().device->device);
+            prefix_.flush_device = DeviceBuffer{};
         } catch (...) {}
         for (Lane& lane : lanes_) {
             lane.pages.clear();
@@ -1287,9 +1312,9 @@ public:
     // The segments by role (SegmentMap): the first embeds; the PLE segment computes the PLE and its
     // n-gram gate; the head (the last) runs the final mixer, the head, sampling, acceptance and the
     // MTP drafter and allocates the KV pages. whole() is the one segment of an unsplit Program, which
-    // runs every layer: the paths a split does not run yet (the layer walk, the prefix cache, the
-    // SSD tier) reach the layers' state, KV, expert cache and Forward through it; on a split Program
-    // it throws std::logic_error, so such a path fails instead of running on segment 0 alone.
+    // runs every layer: the paths a split does not run yet (the layer walk, the SSD tier) reach the
+    // layers' state, KV, expert cache and Forward through it; on a split Program it throws
+    // std::logic_error, so such a path fails instead of running on segment 0 alone.
     DeviceSegment& first() noexcept { return *segments_.front(); }
     const DeviceSegment& first() const noexcept { return *segments_.front(); }
     DeviceSegment& head() noexcept { return *segments_.back(); }
@@ -1370,6 +1395,92 @@ public:
     }
     void before_restage() const {
         if (split_sync_) { synchronize(); }
+    }
+
+    // Measurement knob INFERNIX_SPLIT_TIMING=1 (a split only): where a decode or verification
+    // round's time goes, reported at each request's end (debug level) as means per round: the round
+    // period (launch to launch), the launch-to-synchronization wall time and within it each segment's
+    // graph on its GPU (timing events around its replay, after its handoff wait), and the host's
+    // drafting and commit (with the cache update) between rounds. Costs two event records per
+    // segment and round.
+    static bool split_timing_from_environment() {
+        const char* value = std::getenv("INFERNIX_SPLIT_TIMING");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) { return false; }
+        if (std::strcmp(value, "1") == 0) { return true; }
+        throw std::invalid_argument(std::string("INFERNIX_SPLIT_TIMING must be 0 or 1, not '") + value + "'");
+    }
+    struct SplitTiming {
+        bool on    = false;
+        bool armed = false; // the round in flight recorded its events
+        std::uint64_t rounds = 0, periods = 0;
+        double period_ms = 0, wall_ms = 0, draft_ms = 0, commit_ms = 0;
+        std::vector<double> graph_ms; // per segment
+        Clock::time_point launched{}, previous{};
+    };
+    SplitTiming timing_;
+    // Adds the host time of its scope to `total` (none when null).
+    struct HostSpan {
+        explicit HostSpan(double* total) : total_(total) {}
+        ~HostSpan() {
+            if (total_ != nullptr) {
+                *total_ += std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
+            }
+        }
+        HostSpan(const HostSpan&)            = delete;
+        HostSpan& operator=(const HostSpan&) = delete;
+
+    private:
+        double* total_;
+        Clock::time_point start_ = Clock::now();
+    };
+    void timing_launch() {
+        if (!timing_.on) { return; }
+        const auto now = Clock::now();
+        if (timing_.previous != Clock::time_point{}) {
+            timing_.period_ms += std::chrono::duration<double, std::milli>(now - timing_.previous).count();
+            ++timing_.periods;
+        }
+        timing_.previous = timing_.launched = now;
+        timing_.armed    = true;
+    }
+    // After the round's synchronization.
+    void timing_synchronized() {
+        if (!timing_.on || !timing_.armed) { return; }
+        timing_.armed = false;
+        timing_.wall_ms += std::chrono::duration<double, std::milli>(Clock::now() - timing_.launched).count();
+        for (std::size_t s = 0; s < segments_.size(); ++s) {
+            const DeviceSegment& seg = *segments_[s];
+            const DeviceGuard on(seg.device->device);
+            float ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, seg.timing_begin.event, seg.timing_end.event));
+            timing_.graph_ms[s] += ms;
+        }
+        ++timing_.rounds;
+    }
+    void report_split_timing() noexcept {
+        if (!timing_.on) { return; }
+        try {
+            if (timing_.rounds > 0) {
+                const auto n    = static_cast<double>(timing_.rounds);
+                const double p  = timing_.periods ? timing_.period_ms / static_cast<double>(timing_.periods) : 0.0;
+                const double w  = timing_.wall_ms / n, d = timing_.draft_ms / n, c = timing_.commit_ms / n;
+                std::string line = "split round timing (INFERNIX_SPLIT_TIMING), " + std::to_string(timing_.rounds) +
+                                   " rounds, mean ms: period " + std::to_string(p) + " = launch to sync " +
+                                   std::to_string(w) + " (";
+                for (std::size_t s = 0; s < segments_.size(); ++s) {
+                    line += (s ? ", " : "") + std::string("segment ") + std::to_string(s) + " graph " +
+                            std::to_string(timing_.graph_ms[s] / n);
+                }
+                line += ") + draft " + std::to_string(d) + " + commit " + std::to_string(c) + " + other " +
+                        std::to_string(p - w - d - c);
+                diagnostic(line, DiagnosticLevel::Debug);
+            }
+        } catch (...) {}
+        const bool on = timing_.on;
+        std::vector<double> graphs(segments_.size(), 0.0);
+        timing_          = SplitTiming{};
+        timing_.on       = on;
+        timing_.graph_ms = std::move(graphs);
     }
 
     // ---------------------------------------------------------------- admission
@@ -2212,6 +2323,7 @@ public:
         // wait reads every committed-token column (the anchor's) and all of a copy row's.
         std::array<std::int32_t, kMaximumConcurrency> staged{};
         if (mtp_) {
+            const HostSpan drafting(timing_.on ? &timing_.draft_ms : nullptr);
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
                 if (width == 1) { return; }
                 for (std::int32_t b = 0; b < batch; ++b) {
@@ -2268,6 +2380,7 @@ public:
             read_rows();
             release_gate.owner = nullptr;
         });
+        timing_synchronized();
         release_handoff.owner = nullptr; // every segment has synchronized
         hash_logits("decode", lanes[0], positions[0], 1, batch);
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
@@ -2330,6 +2443,7 @@ public:
         }
         const auto rows = ContractAccess::rows(pending);
         if (decisions.size() != rows.size()) { throw std::logic_error("Qwen4Exp: commit decisions are not row aligned"); }
+        const HostSpan committing(timing_.on ? &timing_.commit_ms : nullptr);
         // A verification round's commit runs on every segment; a plain round's (the drafter's
         // catch-up, a cancelled row's saved column) on the head.
         if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
@@ -2442,6 +2556,7 @@ public:
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
             report_handoff();
+            report_split_timing();
             prefix_finish(lanes_[index], index);
             release(index);
             out.status = runtime::ConsumeStatus::Consumed;
@@ -2556,6 +2671,7 @@ private:
     // round's cache warms per token as plain decode does.
     std::size_t decode_budget(DeviceSegment& seg, std::uint32_t tokens) {
         if (decode_promotions_ == DecodePromotions::Off || !promotes_in_rounds(seg)) { return 0; }
+        if (trickles(seg)) { return trickle_budget(seg); }
         // The fill phase: until this session promoted or landed as many experts as there are frames.
         // Seeded frames (a warm start) do not end it: promotions only follow misses, so a workload
         // the saved state matches promotes little anyway, while one it does not match replaces the
@@ -2575,6 +2691,7 @@ private:
     // within INFERNIX_DECODE_PROMOTIONS (none when off, none once the frames have filled with fill).
     std::size_t forced_budget(const DeviceSegment& seg) const {
         if (decode_promotions_ == DecodePromotions::Off || !promotes_in_rounds(seg)) { return 0; }
+        if (trickles(seg)) { return trickle_budget(seg); }
         const ExpertResidency::Stats& stats = seg.residency->stats();
         if (decode_promotions_ == DecodePromotions::Fill &&
             stats.promotions + stats.landed >= seg.residency->frames()) {
@@ -2591,14 +2708,52 @@ private:
         return seg.policy.promotion_interval;
     }
     // Whether a segment's cache promotes during requests (its rounds and calls). A layer split's
-    // segment follows its link's promotion policy (derive_link_policy): one on a slow link (PCIe
-    // 3.0 x4: a promoted expert costs more link time than a CPU-served miss) promotes nothing while
-    // requests run, not even while its frames fill, and its misses go to the CPU; its frames fill
-    // from the warm start (its seed share) and from landed misses. An unsplit Program keeps the
-    // dynamic policy on every link (multi-GPU WP19 extends the policies to it).
+    // segment follows its link's promotion policy (derive_link_policy): Dynamic as unsplit, or on a
+    // slow link (PCIe 3.0 x4: a promoted expert costs more link time than a CPU-served miss) a
+    // trickle (trickles), which promotes nothing with a count of 0; Frozen and IdleOnly promote
+    // nothing while requests run. An unsplit Program keeps the dynamic policy on every link
+    // (multi-GPU WP19 extends the policies to it).
     bool promotes_in_rounds(const DeviceSegment& seg) const noexcept {
         if (segments_.size() < 2) { return true; }
-        return seg.policy.promotions == PromotionPolicy::Dynamic;
+        return seg.policy.promotions == PromotionPolicy::Dynamic || (trickles(seg) && seg.trickle > 0);
+    }
+    // A layer split's segment on a slow link (PromotionPolicy::Trickle): its frames hold every
+    // expert they can from the warm start, most misses go to the CPU, and each round promotes at
+    // most one expert per layer in a window of seg.trickle layers (the policy's trickle_bytes in
+    // records, or INFERNIX_TRICKLE_PROMOTIONS) that rotates over its layers. The copies wait until
+    // the segment's share of the next round is enqueued (launch_round: issue_deferred), so they cross
+    // its link while the later segments compute, and no new ones start while the last are still
+    // deferred or copying: at most one round's worth is on the link. A trickle replaces the
+    // misses of a topic its seeded set does not cover (measured on the 20-turn conversation:
+    // without it the RTX PRO 4000's hit rate at K = 20-24 fell to 85-92 % over the second half).
+    bool trickles(const DeviceSegment& seg) const noexcept {
+        return segments_.size() > 1 && seg.policy.promotions == PromotionPolicy::Trickle;
+    }
+    // A trickle's per-layer budget (its window is the residency's, set_trickle): one, none while its
+    // previous promotions are still deferred or copying, none once its frames have filled under
+    // INFERNIX_DECODE_PROMOTIONS=fill.
+    std::size_t trickle_budget(const DeviceSegment& seg) const {
+        const ExpertResidency::Stats& stats = seg.residency->stats();
+        if (decode_promotions_ == DecodePromotions::Fill &&
+            stats.promotions + stats.landed >= seg.residency->frames()) {
+            return 0;
+        }
+        return seg.residency->loads_pending() ? 0 : kDecodePromotionsPerLayer;
+    }
+    // A trickle's promotions per round: trickle_bytes in whole records (at least one), or the
+    // measurement knob INFERNIX_TRICKLE_PROMOTIONS=<n> (0: none during requests, as before trickles).
+    static std::uint32_t trickle_promotions(const LinkPolicy& policy, std::uint64_t record_stride) {
+        if (const char* value = std::getenv("INFERNIX_TRICKLE_PROMOTIONS"); value != nullptr && *value != '\0') {
+            char* end             = nullptr;
+            const unsigned long n = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || n > 4096) {
+                throw std::invalid_argument(
+                    std::string("INFERNIX_TRICKLE_PROMOTIONS must be a count in [0, 4096], not '") + value + "'");
+            }
+            return static_cast<std::uint32_t>(n);
+        }
+        if (record_stride == 0) { return 1; }
+        return static_cast<std::uint32_t>(std::max<std::uint64_t>(1, policy.trickle_bytes / record_stride));
     }
 
     // Measurement knob INFERNIX_DECODE_PROMOTIONS: `on` (unset) promotes as above; `fill` only until
@@ -2649,6 +2804,9 @@ private:
                                        deferred_.live ? std::span<const std::uint8_t>(
                                                             live_.data(), static_cast<std::size_t>(deferred_.columns))
                                                       : std::span<const std::uint8_t>{});
+            // A split submits the table upload and promotions now, so they run during the head's
+            // drafting rather than just before the segment's next round (WDDM batches launches).
+            if (segments_.size() > 1) { seg.device->flush(); }
         }
         apply_vram_target(false);
     }
@@ -2832,51 +2990,74 @@ private:
 
     // The frames' warm start from the saved state; returns how many experts it loaded.
     // The saved state keys the whole model; a split's segments each load their part
-    // (expert_cache::split_saved_state).
+    // (expert_cache::split_saved_state). A split's segment that seeds every frame (a slow link's,
+    // which promotes only a trickle during requests) is seeded even without a saved state (none
+    // yet, or --expert-state off): every key of its layers, expert-major across them (extend_ranking
+    // of an empty state), so it starts with every expert its frames hold rather than filling them
+    // over thousands of rounds.
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
-        if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
-        if (!load.state) {
-            diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
+        if (!options_.expert_cache) { return 0; }
+        // A split's segment seeds its link policy's share (every frame on a slow link, whose cache
+        // promotes only a trickle during requests); INFERNIX_SEED_SHARE overrides both.
+        const auto share_of = [&](const DeviceSegment& seg) {
+            return segments_.size() > 1 && !seed_share_set() ? seg.policy.seed_share : seed_share();
+        };
+        const bool saved = !options_.expert_state.empty() && load.state.has_value();
+        const bool seeds = saved || (segments_.size() > 1 &&
+                                     std::any_of(segments_.begin(), segments_.end(),
+                                                 [&](const auto& segment) { return share_of(*segment) >= 1.0; }));
+        if (!saved && !options_.expert_state.empty()) {
+            diagnostic(seeds ? "expert cache: no saved state yet; the segments on a slow link start with every frame "
+                               "filled across their layers, the others empty, filling as requests arrive"
+                             : "expert cache: no saved state yet, so it starts empty and fills as requests arrive");
             diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
             expert_state_saved_ = std::chrono::steady_clock::now();
-            return 0;
         }
+        if (!seeds) { return 0; }
         const auto start     = std::chrono::steady_clock::now();
         std::uint32_t loaded = 0, frames = 0;
         for (const auto& segment : segments_) {
             DeviceSegment& seg = *segment;
             const DeviceGuard on(seg.device->device);
-            // A split's segment seeds its link policy's share (every frame on a slow link, whose
-            // cache does not promote during requests); INFERNIX_SEED_SHARE overrides both.
-            const double share =
-                segments_.size() > 1 && !seed_share_set() ? seg.policy.seed_share : seed_share();
+            const double share  = share_of(seg);
             const auto max_keys = static_cast<std::uint32_t>(share * seg.residency->frames());
+            frames += seg.residency->frames();
+            if (!saved && share < 1.0) { continue; }
             expert_cache::SavedState part;
-            const expert_cache::SavedState* state = &*load.state;
+            const expert_cache::SavedState* state = saved ? &*load.state : &part;
             if (segments_.size() > 1) {
-                part  = expert_cache::split_saved_state(*load.state, seg.spec.layers.begin, seg.spec.layers.end,
-                                                        c_.moe.experts);
+                if (saved) {
+                    part = expert_cache::split_saved_state(*load.state, seg.spec.layers.begin, seg.spec.layers.end,
+                                                           c_.moe.experts);
+                }
                 state = &part;
-                // A segment that seeds every frame (a slow link's, whose cache does not promote
-                // during requests) follows the ranking (the last session's residents, which fill
-                // only as many frames as that cache had) with every other key the session used,
-                // most used first, as the SSD tier's fill order does.
-                if (share >= 1.0) { extend_ranking(part); }
+                // A segment that seeds every frame follows the ranking (the last session's
+                // residents, which fill only as many frames as that cache had) with every other key
+                // the session used, most used first, as the SSD tier's fill order does, then the keys
+                // it never used, so its frames hold every expert of its layers when they can.
+                if (share >= 1.0) {
+                    extend_ranking(part, seg.spec.layers.end - seg.spec.layers.begin, c_.moe.experts);
+                }
             }
             loaded += seg.residency->warm_start(*state, kSeedCountCap, max_keys, seg.device->stream);
-            frames += seg.residency->frames();
         }
         synchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const double loaded_gib =
             static_cast<double>(loaded) * static_cast<double>(head().residency->frame_stride()) / (1ULL << 30);
         char line[256];
-        std::snprintf(line, sizeof(line),
-                      "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
-                      loaded, loaded_gib, seconds);
+        if (saved) {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: seeded %u experts across the slow-link segments' layers (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        }
         diagnostic(line);
         std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded, frames,
-                      options_.expert_state.string().c_str());
+                      saved ? options_.expert_state.string().c_str() : "every key, expert-major");
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = cache_stats().routed;
@@ -2979,21 +3160,31 @@ private:
         }
         return share;
     }
-    // Appends to `state`'s ranking every key it does not list whose count is nonzero, by count
-    // (descending; ties by key).
-    static void extend_ranking(expert_cache::SavedState& state) {
-        if (state.counts.empty()) { return; }
-        std::vector<std::uint8_t> listed(state.counts.size(), 0);
+    // Appends to `state`'s ranking (keys of `layers` x `experts`) every key it does not list whose
+    // count is nonzero, by count (descending; ties by key), then every other key (count zero, or no
+    // counts at all), expert-major across the layers (keys are layer * experts + expert), so frames
+    // too few for them all spread over the layers.
+    static void extend_ranking(expert_cache::SavedState& state, std::uint32_t layers, std::uint32_t experts) {
+        const std::size_t keys = static_cast<std::size_t>(layers) * experts;
+        if (keys == 0 || (!state.counts.empty() && state.counts.size() != keys)) { return; }
+        const auto count = [&](std::uint32_t key) { return state.counts.empty() ? 0U : state.counts[key]; };
+        std::vector<std::uint8_t> listed(keys, 0);
         for (const std::uint32_t key : state.ranked) {
             if (key < listed.size()) { listed[key] = 1; }
         }
         std::vector<std::uint32_t> used;
-        for (std::uint32_t key = 0; key < state.counts.size(); ++key) {
-            if (listed[key] == 0 && state.counts[key] != 0) { used.push_back(key); }
+        for (std::uint32_t key = 0; key < keys; ++key) {
+            if (listed[key] == 0 && count(key) != 0) { used.push_back(key); }
         }
         std::stable_sort(used.begin(), used.end(),
-                         [&](std::uint32_t a, std::uint32_t b) { return state.counts[a] > state.counts[b]; });
+                         [&](std::uint32_t a, std::uint32_t b) { return count(a) > count(b); });
         state.ranked.insert(state.ranked.end(), used.begin(), used.end());
+        for (std::uint32_t e = 0; e < experts; ++e) {
+            for (std::uint32_t l = 0; l < layers; ++l) {
+                const std::uint32_t key = l * experts + e;
+                if (listed[key] == 0 && count(key) == 0) { state.ranked.push_back(key); }
+            }
+        }
     }
     static bool seed_share_set() {
         const char* value = std::getenv("INFERNIX_SEED_SHARE");
@@ -3114,6 +3305,25 @@ private:
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_text.c_str());
             diagnostic(text, DiagnosticLevel::Debug);
+            // A split's segments one by one, since start (a request's share is the difference of
+            // two reports): how far each segment's frames cover its layers' experts, its hit rate
+            // and the misses its port handed the CPU.
+            for (std::size_t i = 0; segments_.size() > 1 && i < segments_.size(); ++i) {
+                const DeviceSegment& seg         = *segments_[i];
+                const ExpertResidency::Stats& ss = seg.residency->stats();
+                const std::uint32_t layers       = seg.spec.layers.end - seg.spec.layers.begin;
+                std::snprintf(text, sizeof(text),
+                              "expert cache, segment %u (layers %u-%u, GPU %d): %u frames for %u experts; since "
+                              "start %llu of %llu routed experts hit (%.1f%%), %llu promotions, %llu refilled after "
+                              "lending, %llu misses CPU-served",
+                              seg.spec.index, seg.spec.layers.begin, seg.spec.layers.end - 1, seg.device->device,
+                              seg.residency->frames(), layers * c_.moe.experts,
+                              static_cast<unsigned long long>(ss.hits), static_cast<unsigned long long>(ss.routed),
+                              ss.routed ? 100.0 * static_cast<double>(ss.hits) / static_cast<double>(ss.routed) : 0.0,
+                              static_cast<unsigned long long>(ss.promotions), static_cast<unsigned long long>(ss.refilled),
+                              static_cast<unsigned long long>(cpu_service_ ? cpu_service_->served_experts(seg.cpu_port) : 0));
+                diagnostic(text, DiagnosticLevel::Debug);
+            }
             if (tier_) {
                 // The tier's counters as of the last round boundary.
                 const auto& t = tier_->stats();
@@ -3365,7 +3575,18 @@ private:
             head().tables->publish(lane.row.handle(), logical_begin, pages, head().device->stream);
         }
         if (lane.mirror_rows.empty()) { return; }
-        const std::vector<std::int32_t> indices = KVExecutionTablePool::indices_of(pages);
+        publish_mirrors(lane, logical_begin, KVExecutionTablePool::indices_of(pages));
+    }
+    // The same for pages the lane maps without leasing them (the prefix cache's blocks).
+    void publish_rows(const Lane& lane, std::uint32_t logical_begin, std::span<const DeviceKVPageHandle> pages) {
+        {
+            const SegmentWork on(*this, head());
+            head().tables->publish(lane.row.handle(), logical_begin, pages, head().device->stream);
+        }
+        if (lane.mirror_rows.empty()) { return; }
+        publish_mirrors(lane, logical_begin, KVExecutionTablePool::indices_of(pages));
+    }
+    void publish_mirrors(const Lane& lane, std::uint32_t logical_begin, std::span<const std::int32_t> indices) {
         for (std::size_t s = 0; s < segments_.size(); ++s) {
             if (!lane.mirror_rows[s].valid()) { continue; }
             DeviceSegment& seg = *segments_[s];
@@ -3389,6 +3610,17 @@ private:
             }
         }
         prefix_release(lane);
+        // A tap's copy-out of the lane's partial tail page may still be in flight (an abort right
+        // after the call that captured it, before the next call waited for it): each segment's
+        // compute stream waits for its part before the page returns to the pool, so a new lane's
+        // call or a restore (which starts behind compute) cannot rewrite it under the copy, and
+        // shrink_kv's synchronization covers the copy before it unmaps the page's chunk.
+        if (prefix_.cache && lane.prefix.tail_capture != 0) {
+            try {
+                prefix_.cache->order_after_capture(lane.prefix.tail_capture, prefix_.compute);
+            } catch (...) {}
+        }
+        lane.prefix.tail_capture = 0;
         lane.pages.clear();
         lane.reservation.reset();
         release_rows(lane);
@@ -3959,7 +4191,8 @@ private:
 
     // A segment's batch of an eager call, over its io copy: the MTP cells (and a round's residual
     // export) are the head's, the image columns the first segment's; the prefix waits are every
-    // segment's, consumed by the head's.
+    // segment's (each waits for its own layers' entries, recorded on its own streams), consumed by
+    // the head's.
     execution::ForwardBatch eager_batch(const DeviceSegment& seg, std::int32_t batch, std::int32_t width,
                                         std::int32_t logit_columns, const execution::MtpChunk* chunk,
                                         const execution::VisionInput* vision, bool streamed) {
@@ -4026,10 +4259,13 @@ private:
     // stream waits for it before its own; Gate: no host step between them, the receiver's graph
     // starts with its bounded gate (release_handoff publishes the round's word if the host unwinds
     // after that). A gated round's n-gram gate is armed (release_gate) once the PLE segment's graph
-    // is launched; with the gate handoff and a PLE segment before the head, its rows are read right
-    // after that launch (read_rows), so a later segment's bounded gate does not wait on the host's
-    // reads. Returns whether the rows were read here; otherwise the caller reads them after the
-    // head's work is enqueued, as an unsplit round does.
+    // is launched; with a PLE segment before the head, its rows are read right after that launch
+    // (read_rows), in either handoff mode: the later segments wait for that segment anyway, and
+    // its layer 1 waits less for the rows (with the event handoff it waited in 393 of 445 rounds,
+    // 255 us on average, when the rows were read after the head's work was enqueued), and a later
+    // segment's bounded gate does not wait on the host's reads. Returns whether the rows were read
+    // here; otherwise the caller reads them after the head's work is enqueued, as an unsplit round
+    // does.
     bool launch_round(std::int32_t batch, std::int32_t width, bool verify, bool gated, GateRelease& release_gate,
                       HandoffRelease& release_handoff, const std::function<void()>& read_rows) {
         const bool split    = segments_.size() > 1;
@@ -4039,6 +4275,7 @@ private:
         const std::uint32_t delay_ms       = split ? testing::take_round_delay() : 0U;
         const execution::NgramRowGate gate = row_gate();
         bool read = false;
+        timing_launch();
         for (const auto& segment : segments_) {
             DeviceSegment& seg = *segment;
             const SegmentWork on(*this, seg);
@@ -4050,6 +4287,7 @@ private:
             seg.residency->before_round(s, /*landing=*/true);
             if (seg.in != nullptr && handoff_ == HandoffMode::Event) { seg.in->wait_sent(s); }
             if (&seg == &first() && delay_ms != 0) { delay_stream(s, delay_ms); }
+            if (timing_.on) { CUDA_CHECK(cudaEventRecord(seg.timing_begin.event, s)); }
             replay(seg, round_graph(seg, batch, width, verify), [&] {
                 if (!verify) {
                     forward_call(seg, batch, 1, batch, nullptr, nullptr, nullptr, &gate);
@@ -4058,6 +4296,7 @@ private:
                 const execution::ForwardVerify view = verify_view(seg, batch, width);
                 forward_call(seg, batch, width, columns, &view, nullptr, nullptr, &gate);
             });
+            if (timing_.on) { CUDA_CHECK(cudaEventRecord(seg.timing_end.event, s)); }
             // From here an enqueued gate waits for its word: an error before the word is published
             // still publishes it (over zeroed rows or a stale residual), so the streams drain and
             // the error keeps its class.
@@ -4069,8 +4308,10 @@ private:
             }
             seg.residency->enqueue_route_download(s, columns);
             if (!split) { continue; }
+            // A trickle's promotions of the last round cross the link from here, after its layers.
+            if (trickles(seg)) { seg.residency->issue_deferred(s); }
             seg.device->flush();
-            if (handoff_ == HandoffMode::Gate && gated && &seg == &ple() && &seg != &head()) {
+            if (gated && &seg == &ple() && &seg != &head()) {
                 read_rows();
                 release_gate.owner = nullptr;
                 read = true;
@@ -4144,8 +4385,8 @@ private:
         fb.verify        = verify;
         fb.mtp_chunk     = chunk;
         fb.layer_waits   = prefix_.waits_for(seg.spec.index);
-        // Every segment's call waits for the same restores and copy-outs; the head's, the last a
-        // call or round enqueues, consumes them.
+        // Every segment's call reads the same restores and copy-outs, each waiting for its own
+        // layers' entries; the head's, the last a call or round enqueues, consumes them.
         if (&seg == &head()) { prefix_.next_waits = {}; }
         fb.vision        = vision;
         fb.stream        = streamed;
@@ -4327,6 +4568,7 @@ private:
             release_gate.owner = nullptr;
         }
         synchronize();
+        timing_synchronized();
         release_handoff.owner = nullptr; // every segment has synchronized
         check_expert_error();
         hash_logits("verify", lanes[0], positions[0], W, batch * W);
@@ -4462,6 +4704,10 @@ private:
                                      ple_states, slots, s);
             }
             if (seg.spec.head && mtp_) { mtp_catch_up(rows, W, commit); }
+            // A split submits an earlier segment's commit now, so its fold and tails run while the
+            // later segments commit and the head catches up and drafts, not just before its next
+            // round (a batched driver model, WDDM, holds launches until a flush or a blocking call).
+            if (segments_.size() > 1 && !seg.spec.head) { seg.device->flush(); }
         }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::int32_t row = 0; row < batch; ++row) {
@@ -4881,6 +5127,7 @@ private:
     void prefix_unpin(const PrefixSelection& selection) noexcept;
     void prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& selection,
                          DeviceKVPageReservation& reservation, std::uint32_t pages);
+    void copy_cache_page(DeviceKVPageHandle source, DeviceKVPageHandle destination);
     [[nodiscard]] std::uint32_t prefix_frontier(const Lane& lane, bool finishing) const noexcept;
     void prefix_publish(Lane& lane, std::uint32_t frontier);
     void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail);
@@ -4936,9 +5183,12 @@ private:
         const void* source = seg.parameters->layers[seg.parameters->layer_range().begin].moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
         if (rate <= 0.0 && source != nullptr && seg.staging.p != nullptr && seg.plan.staging > 0) {
-            // Windows can depress host-to-device DMA to a quarter or less for a few seconds after a
-            // large pin (measured on a Ryzen 5900X + RTX 5080: 28.4 GB/s, 7.1 GB/s right after ~48 GiB
-            // were locked): probe in spaced rounds and keep the best, stopping once three rounds agree.
+            // A GPU left idle while the banks were pinned runs its PCIe link at a lower generation
+            // until its compute engine wakes it (an RTX 5080 behind PCIe 4.0 x16 copies 3.6 GB/s at
+            // Gen1 and 7.1 at Gen2 instead of 28.4; its copy engines alone may not wake it): keep the
+            // device busy for a moment first. Then probe in spaced rounds and keep the best, stopping
+            // once three rounds agree.
+            wake_device_link(seg.staging.p, seg.plan.staging, std::chrono::milliseconds(250), seg.device->device);
             constexpr int kRounds = 16;
             constexpr auto kGap   = std::chrono::milliseconds(250);
             double previous       = 0.0;
@@ -4958,6 +5208,9 @@ private:
                                       .cpu_pcie_divisor_override = options_.cpu_pcie_divisor};
         seg.link_measured = rate > 0.0;
         seg.policy        = derive_link_policy(seg.link_measured ? rate : kReferenceLinkBytesPerSecond, inputs);
+        seg.trickle       = seg.policy.promotions == PromotionPolicy::Trickle
+                                ? trickle_promotions(seg.policy, seg.plan.record_stride)
+                                : 0U;
         if (!seg.link_measured) { return; } // no frames to probe with: keep the reference rate
         char text[256];
         std::snprintf(text, sizeof(text),
@@ -4973,12 +5226,19 @@ private:
         if (segments_.size() > 1) {
             // A split's segment follows its link's policy (promotes_in_rounds, the CPU port's jobs,
             // the warm start's seed share).
+            char promotes[96];
+            if (seg.policy.promotions == PromotionPolicy::Dynamic) {
+                std::snprintf(promotes, sizeof(promotes), "the expert cache promotes during requests");
+            } else if (trickles(seg) && seg.trickle > 0) {
+                std::snprintf(promotes, sizeof(promotes),
+                              "at most %u promotions per round, after its layers (slow link)", seg.trickle);
+            } else {
+                std::snprintf(promotes, sizeof(promotes), "no promotions during requests (slow link)");
+            }
             std::snprintf(text, sizeof(text),
                           "; %s; decode misses kept on the link: 1/%d, at most %u CPU jobs per layer call; warm "
                           "start seeds %.0f%% of the frames",
-                          seg.policy.promotions == PromotionPolicy::Dynamic ? "the expert cache promotes during requests"
-                                                                            : "no promotions during requests (slow link)",
-                          pcie_divisor(seg), seg.policy.cpu_jobs, 100.0 * seg.policy.seed_share);
+                          promotes, pcie_divisor(seg), seg.policy.cpu_jobs, 100.0 * seg.policy.seed_share);
             line += text;
         }
         diagnostic(line);

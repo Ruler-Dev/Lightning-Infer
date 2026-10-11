@@ -14,7 +14,12 @@
 //            before the pause, completes at full length and reports a replay restore; the tokens
 //            after the pause may differ from the solo run (prefill arithmetic), which is reported.
 //
-//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain]   (default: both modes)
+// --devices A,B --layer-split K runs the Engine as a layer split (multi-GPU WP15: the pause's
+// capture and the resume's restore cross every segment), with a 10-minute admission timeout, as a
+// split on a slow GPU keeps the paused request waiting longer.
+//
+//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain] [--devices A,B --layer-split K]
+//       (default: both modes)
 
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
@@ -24,6 +29,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -64,11 +71,23 @@ std::size_t common_prefix(const std::vector<infernix::TokenId>& a, const std::ve
                                     a.begin());
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp) {
+// A layer split's devices and K (empty: one device).
+struct Split {
+    std::vector<int> devices;
+    std::optional<std::uint32_t> k;
+};
+
+int run_mode(const char* artifact, const char* ngram, bool mtp, const Split& split) {
     std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
     infernix::EngineOptions options;
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
+    if (!split.devices.empty()) {
+        options.device             = split.devices.front();
+        options.devices            = split.devices;
+        options.layer_split        = split.k;
+        options.pending_timeout_ms = 600000;
+    }
     options.max_context = 4096;
     // 48 pages: both prompts bind (2 x 17 pages) but both extents (2 x 35) do not fit.
     options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(3072);
@@ -142,19 +161,31 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true;
-    if (argc > 1) {
-        plain = mtp = false;
+    bool plain = false, mtp = false;
+    Split split;
+    try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--plain") { plain = true; }
             if (arg == "--mtp") { mtp = true; }
+            if ((arg == "--devices" || arg == "--layer-split") && i + 1 >= argc) {
+                throw std::invalid_argument(arg + " needs a value");
+            }
+            if (arg == "--devices") {
+                const std::string value = argv[++i];
+                const std::size_t comma = value.find(',');
+                if (comma == std::string::npos) { throw std::invalid_argument("--devices takes A,B"); }
+                split.devices = {std::stoi(value.substr(0, comma)), std::stoi(value.substr(comma + 1))};
+            }
+            if (arg == "--layer-split") { split.k = static_cast<std::uint32_t>(std::stoul(argv[++i])); }
         }
-    }
-    try {
+        if (split.devices.empty() != !split.k.has_value()) {
+            throw std::invalid_argument("--devices A,B and --layer-split K go together");
+        }
+        if (!plain && !mtp) { plain = mtp = true; }
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false); }
-        if (mtp) { failures += run_mode(artifact, ngram, true); }
+        if (plain) { failures += run_mode(artifact, ngram, false, split); }
+        if (mtp) { failures += run_mode(artifact, ngram, true, split); }
         std::printf(failures == 0 ? "all preemption checks passed\n" : "%d preemption check(s) failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {

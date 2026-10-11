@@ -51,3 +51,15 @@ set_tests_properties(infernix_qwen4_exp_split_gate_two_gpu_real_test PROPERTIES
   LABELS "gpu;real"
   TIMEOUT 3600
   ENVIRONMENT "INFERNIX_NUMERICS_SMS=70")
+# The hybrid prefix cache across a split at K = 24 on two contexts of device 0 (multi-GPU WP15):
+# every scenario of the prefix-cache test (tap, Host-block and endpoint resumes, X3/X5/X6, a resumed
+# readout, coalescing, prefetch, the Host tier's file) on the unsplit Engine and on the split, whose
+# requests must give the unsplit ids, reused tokens, readout bits and logits hashes; the Host tier
+# files saved by each load into the other.
+add_test(NAME infernix_qwen4_exp_prefix_cache_split_real_test
+  COMMAND infernix_qwen4_exp_prefix_cache_real_test --devices 0,0 --layer-split 24)
+set_tests_properties(infernix_qwen4_exp_prefix_cache_split_real_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 7200)

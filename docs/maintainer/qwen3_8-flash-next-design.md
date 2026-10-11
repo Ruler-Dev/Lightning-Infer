@@ -2481,7 +2481,7 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   calls the host enqueues without waiting on the device; found with per-layer residual hashes and
   fixed). The layer walk stays one segment's (a
   split prefills chunk-major).
-  A split refuses the prefix cache and the SSD expert tier. `ProgramOptions::logits_hash`
+  A split refuses the SSD expert tier (the prefix cache came with WP15). `ProgramOptions::logits_hash`
   (`INFERNIX_LOGITS_HASH`, `testing::set_logits_hash`) writes the FNV-1a of the head's FP32 logits
   after every call and round that computes them. `infernix_qwen4_exp_split_prefill_real_test`
   compares split and unsplit Engines with it: prompts of 1, 255, 256 and 4,113 tokens, a decoded
@@ -2499,9 +2499,12 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   strictly increasing like the gate's. Event handoff (the default and `auto`): the sender records
   `sent` after its graph and the receiver's stream waits for it before its graph, so no host step
   separates them. Gate handoff (opt-in, two different GPUs only: on one GPU a waiting gate can
-  starve the sender): the receiver's graph starts with its bounded gate; a gated round whose PLE
-  segment precedes the head reads its n-gram rows right after that segment's launch, so the next
-  segment's bound never waits on the host; `HandoffRelease` publishes the word if the host unwinds
+  starve the sender): the receiver's graph starts with its bounded gate. In either mode a gated
+  round whose PLE segment precedes the head reads its n-gram rows right after that segment's
+  launch, so the next segment's bound never waits on the host and the PLE segment's layer 1 waits
+  less (with the event handoff the rows used to be read after the head's work was enqueued, and
+  layer 1 waited for them in 393 of 445 rounds, 255 us on average, K = 20); `HandoffRelease`
+  publishes the word if the host unwinds
   after a receiver's launch; a gate that runs out of `--handoff-timeout-ms` stores
   `(layer << 16) | 0xFF03` in the expert error word, which `check_expert_error` turns into a
   `RecoverableExecutionError`; the receiving segment's wait statistics are reported at each
@@ -2511,21 +2514,95 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   this: each layer folds on its own), the QSA tails over its attention layers, the PLE history on
   the PLE segment, the drafter's catch-up on the head (the MTP tail slab follows the head's
   attention layers); `settle_round` applies each segment's routes with its own budget, and the
-  route trace writes one record over the whole model (`RouteTrace::append_segments`). On one GPU
+  route trace writes one record over the whole model (`RouteTrace::append_segments`). A split
+  submits each earlier segment's commit, and every segment's cache update (table upload,
+  promotions), as soon as they are enqueued (`DeviceContext::flush`): a batched driver model (WDDM)
+  otherwise held them until the segment's next round, ahead of its graph. On one GPU
   every segment's work first waits for the work the other segment there enqueued last
   (`SegmentWork`, the segments' `compute_done` events), so the two never overlap (F1). The
   rounds' host restaging (io, round arrays, drafter io) follows each round's synchronization;
   `INFERNIX_SPLIT_SYNC=1` also synchronizes every segment before each restage, as a debugging aid.
+  `INFERNIX_SPLIT_TIMING=1` (a measurement knob) reports at each request's end (debug level) the
+  rounds' mean period (launch to launch), launch-to-synchronization wall time, each segment's
+  graph time on its GPU (events around its replay, after its handoff wait), and the host's
+  drafting and commit. Measured at K = 24 on the CLI code prompt (MTP, 368 rounds): period
+  25.6 ms = 22.8 ms launch to sync (graphs 11.0 ms on the RTX PRO 4000, 11.5 ms on the RTX 5080)
+  + 2.4 ms drafting + 0.3 ms commit, so launches and handoffs between the graphs take about 0.3 ms
+  of a round, the bound on what the gate handoff could save.
   A split's segments apply their link's policy (`derive_link_policy`): on a slow link (below
-  8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment promotes nothing during requests,
-  not even while its frames fill (`promotes_in_rounds`), its CPU port takes up to 32 jobs per
+  8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment's CPU port takes up to 32 jobs per
   layer call besides keeping only misses / 19 on the link, and the warm start seeds every frame
   (the saved ranking, the last cache's residents, then every other key the session used, most used
-  first: `extend_ranking`);
-  an unsplit Program keeps the dynamic policy on every link. Each segment's frames come from its
+  first, then the keys it never used, expert-major across the layers: `extend_ranking`, so a
+  segment whose frames cover its layers' experts holds them all; without a saved state, none yet
+  or `--expert-state off`, every key of its layers, expert-major). During requests it promotes
+  only a trickle (`PromotionPolicy::Trickle`, `trickles`, `trickle_budget`): each round at most
+  one expert per layer in a window of `trickle_bytes` / record stride consecutive layers (6 ms of
+  its link: six experts at 3.1 GB/s; `INFERNIX_TRICKLE_PROMOTIONS=N` overrides, `0` promotes
+  nothing), a window that moves on after every round that had a budget, so every layer gets its
+  turn. The copies wait in the residency (`ExpertResidency::set_trickle`) until the segment's share
+  of the next round is enqueued (`launch_round`: `issue_deferred`), so they cross its link while
+  the later segments compute, never ahead of its own staged misses; no new ones start while the
+  last are deferred or copying (`loads_pending`), and any other call that needs them issued (an
+  eager call's `before_round`, lend, give-back, resize, warm start, the next `after_round`) issues
+  them first. Its frames lent to a prompt's
+  wide calls (the stream ring and the wide arena) come back with the experts they evicted loaded
+  again (`ExpertResidency::set_refill_lent`, `CacheController::give_back` with refill), about 1 s
+  of its link per 1,100 frames, behind the next calls; without this a segment that promotes
+  little kept those frames empty for the rest of the session. Measured on the 20-turn conversation
+  benchmark (~50K tokens, prefix cache on, RTX PRO 4000 + RTX 5080): at K = 15 the RTX PRO 4000's
+  segment (7,679 frames for 7,680 experts) hit 92-96% per turn before the full seeding and the
+  refill, 99.8% after, and decode over the second half rose from 59.4 to 67.1 tok/s; at K = 24
+  its hit rose from 63% to 85% and decode from 58.3 to 73.0 tok/s. The trickle (2026-10-11) took
+  its second-half hit at K = 24 from 84.7% to 95.3% (CPU-served misses 396K to 106K) and decode
+  from 73.0 to 76.8 tok/s; at K = 20 from 91.9% to 97.8% (169K to 36K misses), decode 74.0 against
+  72.8 tok/s, within the runs' spread (the RTX 5080 started those runs with 5-14% fewer frames,
+  a chunk placed in system memory); under the power-saver plan, where CPU-served misses cost more,
+  the same build gave 70.7 tok/s at K = 24 with the trickle and 62.1 without.
+  An unsplit Program keeps the dynamic policy on every link. Each segment's frames come from its
   own device's sizing (on one device, its layer share of that device's). `testing::
   delay_next_round` holds the first segment's next round (a host function on its stream) to test
   the gate's timeout. Measured: see the multi-GPU wave 3 report.
+- **Layer split** (multi-GPU WP15). The prefix cache (§19.3.1) runs across a split. Page leases
+  come from the head's pool, and every segment holds its KV planes of the same page indices, so a
+  cached block is one lease whose bytes lie in every segment's planes. `PrefixCache` takes the
+  segments in layer order (`PrefixSegment`: device, pool, page group, first attention layer, MTP on
+  the head) and gives each a transfer and a restore stream on its device; `LaneStateImage` takes
+  one `LaneStateBuffers` per segment and maps each state-image group to the segment that runs its
+  layer (PLE with layer 1's group, the MTP group on the head). Captures, write-through and
+  restores walk the groups in forward order and enqueue each group's state parts and its KV
+  layer's planes on its segment's stream, after a producer event of that segment's compute stream
+  (`std::span<const cudaStream_t>` producers, one per segment); one event per group, recorded on
+  that segment's stream, so `PrefixState::waits_for` hands every segment's Forward the whole
+  model's L + 1 waits and each waits only on its own layers' entries (no cross-device wait). A
+  capture is published, a write-through completed and a restore retired once each segment's last
+  group event has completed. Page copies go by physical index on each segment's pool
+  (`DeviceKVPagePool::copy_page_index`, `copy_indices_to_host_records`,
+  `copy_indices_from_host_records`) with `segment_host_page_layout`, the segment's planes at their
+  `global_kv_plane` offsets in the whole model's record, so records, images, the persistence
+  format and its fingerprint stay the unsplit ones. Copy-on-write tail and anchor copies run on
+  every segment's compute stream (`SegmentWork`), table publishes go through `publish_rows`, the
+  MR3 flush runs on the head, and a slot's reuse waits on each segment for its own part of a
+  copy-out still in flight (`order_after_capture`). So does a released lane's partial tail page,
+  which a tap or boundary capture copies while the lane keeps it (`Lane::prefix.tail_capture`):
+  `release` orders every segment's compute stream after that capture before the page returns to
+  the pool, so neither a new lane's call nor a restore rewrites it under the copy, and
+  `shrink_kv`'s synchronization covers the copy before a chunk is unmapped (the RTX PRO 4000's
+  share of a copy-out takes 10 ms or more over its x4 link). A capture, write-through or restore
+  submit that throws part-way drains what it enqueued on every segment and gives back what it
+  took (its image or fills, pins, events), so nothing stays pinned, filling or open. A split
+  Program releases the cache before its segments. The lane-resident endpoint resume (no image restore) is unchanged.
+  `infernix_qwen4_exp_prefix_state_test` checks split lane images and page records (K = 1, 2, 24,
+  47) byte for byte against the unsplit ones; `infernix_qwen4_exp_prefix_cache_real_test --devices
+  A,B --layer-split K` runs every scenario on the unsplit and on the split Engine and compares
+  ids, reused tokens, readout bits and per-call logits hashes, and loads each placement's saved
+  Host tier file into the other. Measured 2026-10-10 at K = 24: on `--devices 0,0` and on the RTX
+  PRO 4000 + RTX 5080 (`0,1`, `INFERNIX_NUMERICS_SMS=70`) all 45 requests of the plain, MTP,
+  two-lane and X12 scenarios equal the unsplit Engine's (ids, reuse, readout bits, every unsplit
+  logits hash), the two placements' saved files are byte-identical and each loads into the other.
+  `infernix-serve --devices 0,1 --layer-split 24` on a six-turn chat (11.2K-11.5K-token prompts
+  from turn 3): the turns after the 11.2K-token one resumed 99.2-99.4 % of their prompt from
+  generation-opener snapshots with a 0.43-0.44 s TTFT, against 15.5 s for that turn.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
@@ -8118,6 +8195,10 @@ elastic pool does the same job with no kernel change:
   pinned banks into the miss staging slots before any call uses them: best of three, 64 records,
   a few tens of milliseconds (`core/link_probe`; `ProgramOptions::link_bytes_per_second` fixes it
   in tests). The diagnostic line `host-to-device link: ...` reports it and the choices below.
+  The probe first keeps the GPU busy with memsets for 250 ms (`wake_device_link`): a GPU left idle
+  while the banks were pinned sits in its lowest power state with its link at a lower PCIe
+  generation, and copies alone may not wake it (an RTX 5080 on PCIe 4.0 x16 measured 3.6 GB/s at
+  Gen1 and 7.1 at Gen2 instead of 28.4, which made its segment a slow-link one).
 - It rescales the link-bound costs from the reference rate at which they were fitted (27.5 GB/s): the
   prefix cost's restore rate and the walk-span cost.
 - The decode miss split keeps 1 / d of a call's misses on the link, with

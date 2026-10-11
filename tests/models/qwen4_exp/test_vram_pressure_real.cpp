@@ -13,6 +13,7 @@
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "infernix/engine.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -152,7 +153,10 @@ int main() {
         taken = 0;
         std::this_thread::sleep_for(std::chrono::milliseconds(4000));
         const auto idle_grow = diagnostics.resizes(grow_mark);
-        check(!idle_grow.empty() && idle_grow.back().second > idle_grow.back().first,
+        // Any growth counts: on a GPU that drives a display the driver may place a later chunk in
+        // system memory, which the cache gives back (a resize to the same size) and stops there.
+        check(std::any_of(idle_grow.begin(), idle_grow.end(),
+                          [](const auto& resize) { return resize.second > resize.first; }),
               "an idle engine grows the cache back");
         const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(after == baseline, "ids after the idle resizes equal the undisturbed run");

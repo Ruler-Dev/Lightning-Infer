@@ -145,14 +145,13 @@ int check_device_options() {
         gated.devices = {1, 1};
         failures += check(contains(validation_error(gated, Architecture::Qwen4Exp), "two different GPUs"),
                           "a gated layer split on one GPU was accepted");
-        if (!split::kSplitPrefixCache) {
-            infernix::EngineOptions cached = qwen4;
-            cached.context_cache.enabled   = true;
-            cached.context_cache.mode      = infernix::ContextCacheMode::Hybrid;
-            failures +=
-                check(contains(validation_error(cached, Architecture::Qwen4Exp), "prefix cache"),
-                      "a layer split accepted the prefix cache before it supports it");
-        }
+        // The hybrid prefix cache runs across the split (each segment copies its own planes).
+        static_assert(split::kSplitPrefixCache);
+        infernix::EngineOptions cached = qwen4;
+        cached.context_cache.enabled   = true;
+        cached.context_cache.mode      = infernix::ContextCacheMode::Hybrid;
+        failures += check(validation_error(cached, Architecture::Qwen4Exp).empty(),
+                          "a layer split refused the hybrid prefix cache");
     }
     // Two devices without K or a plan file resolve to auto; one device never does.
     const auto normalized = [](infernix::EngineOptions engine_options) {

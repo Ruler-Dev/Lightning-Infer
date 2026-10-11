@@ -484,6 +484,57 @@ void test_lending() {
     check(threw, "a frame is given back only while lent");
 }
 
+// Refilling lending (a layer split's slow-link segment, which promotes nothing during requests):
+// lend with refill remembers the experts it evicts, and give_back with refill loads them back into
+// the returned frames (one copy each, into distinct frames, READY once landed); without refill the
+// returned frames stay empty. A key that came back meanwhile is not loaded twice.
+void test_lending_refill() {
+    constexpr std::uint32_t kKeys = 64, kFrames = 8;
+    for (const bool refill : {false, true}) {
+        CacheController cache(kKeys, kFrames, 0, 1);
+        std::vector<CacheController::Command> cmds;
+        std::vector<std::uint32_t> ranked;
+        for (std::uint32_t k = 0; k < kFrames; ++k) { ranked.push_back(k); }
+        check(cache.seed(ranked, {}, cmds) == kFrames, "the warm start fills every frame");
+        cmds.clear();
+        const std::vector<std::uint8_t> none(kFrames, 0);
+        const std::uint32_t first = *cache.choose_run(3, none);
+        std::vector<std::uint32_t> lent;
+        for (std::uint32_t f = first; f < first + 3; ++f) { lent.push_back(*cache.frame_key(f)); }
+        check(cache.lend(first, 3, cmds, refill) == 3, "lend evicts the run's three experts");
+        cmds.clear();
+        const std::uint32_t loaded = cache.give_back(first, 3, cmds, refill);
+        std::set<std::uint32_t> frames, keys;
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kCopy) {
+                frames.insert(c.frame);
+                keys.insert(c.key);
+            }
+        }
+        if (!refill) {
+            check(loaded == 0 && keys.empty(), "without refill the returned frames stay empty");
+            continue;
+        }
+        check(loaded == 3 && keys == std::set<std::uint32_t>(lent.begin(), lent.end()) && frames.size() == 3,
+              "give_back with refill loads the three evicted experts into distinct frames");
+        bool loading = true;
+        for (const std::uint32_t key : lent) { loading &= cache.entry(key).state != ResidencyState::kAbsent; }
+        check(loading, "the refilled experts are no longer ABSENT");
+        // Lend again: each evicted key is loaded back exactly once.
+        cmds.clear();
+        const std::uint32_t again = *cache.choose_run(2, none);
+        const std::uint32_t K     = *cache.frame_key(again);
+        cache.lend(again, 2, cmds, true);
+        cmds.clear();
+        cache.give_back(again, 2, cmds, true);
+        std::size_t copies_of_k = 0;
+        for (const auto& c : cmds) {
+            copies_of_k += c.kind == CacheController::Command::Kind::kCopy && c.key == K ? 1U : 0U;
+        }
+        check(copies_of_k == 1, "an evicted key is loaded back once");
+    }
+}
+
 // Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
 // free frames while the policy has capacity (frames - slack), skipping keys already resident or out
 // of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
@@ -738,6 +789,7 @@ int main() {
     test_controller_resize();
     test_load_serials();
     test_lending();
+    test_lending_refill();
     test_seed();
     test_landing();
     test_state_file();

@@ -133,6 +133,7 @@ std::uint64_t ExpertResidency::pool_bytes() const noexcept {
 
 ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
     Resize out;
+    issue_deferred(compute); // waited for below with the other copies
     if (controller_ && controller_->loaned_frames() != 0) {
         out.frames = frames_; // a lease holds frames: the next boundary after its return resizes
         return out;
@@ -374,6 +375,9 @@ void ExpertResidency::tier_step(cudaStream_t compute) {
 }
 
 void ExpertResidency::before_round(cudaStream_t compute, bool landing) {
+    // A decode or verification round's deferred promotions wait for the Program's issue_deferred
+    // after the segment's share is enqueued; an eager call does not wait for them.
+    if (!landing) { issue_deferred(compute); }
     publish_landed();
     if (tier_ != nullptr) {
         finish_demotions(compute, false);
@@ -477,12 +481,15 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
     auto* table        = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
+    issue_deferred(compute); // an earlier round's, never issued (no round launched since)
     ++round_;
     commands_.clear();
     if (tier_ != nullptr) {
         tier_->end_round();
         uses_.clear();
     }
+    // A trickle's window: per_layer_budget for window_ consecutive layers from window_start_.
+    const bool windowed = window_ != 0 && window_ < layers_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
         group_.clear();
         const std::int32_t* ids = routes + static_cast<std::size_t>(layer) * route_stride_;
@@ -502,6 +509,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         // The layer's landed experts become resident in their frames; the rest of its reserved
         // frames return to the pool.
         std::size_t budget = per_layer_budget;
+        if (windowed && (layer + layers_ - window_start_) % layers_ >= window_) { budget = 0; }
         if (landing_per_layer_ > 0) {
             const auto* landed = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
             std::size_t adopted = 0;
@@ -534,6 +542,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     }
     reserved_.clear();
     landing_per_layer_ = 0;
+    if (windowed && per_layer_budget > 0) { window_start_ = (window_start_ + window_) % layers_; }
     if (frames_ == 0) { return; }
     if (tier_ != nullptr) { demote_or_drop(table); } // before on_quiescent frees the victims' frames
     controller_->on_quiescent(commands_);
@@ -551,7 +560,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         }
     }
     if (table_dirty_) { upload_table(compute); }
-    issue_loads(compute);
+    issue_loads(compute, defer_);
     sync_queue_pins();
 }
 
@@ -570,6 +579,7 @@ ExpertResidency::SavedState ExpertResidency::saved_state() const {
 std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
                                           cudaStream_t compute) {
     if (!controller_ || frames_ == 0) { return 0; }
+    issue_deferred(compute);
     if (!state.counts.empty() && state.counts.size() != static_cast<std::size_t>(layers_) * experts_) {
         throw std::invalid_argument("expert residency: the saved state has another key count");
     }
@@ -605,6 +615,7 @@ std::uint32_t ExpertResidency::lendable() const noexcept {
 ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
                                                   std::span<const cudaStream_t> writers) {
     if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
+    issue_deferred(compute);         // their frames count as busy below
     finish_demotions(compute, true); // a held frame must not be lent
     publish_landed();
     release_reservations();
@@ -617,7 +628,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     const auto first = controller_->choose_run(count, busy);
     if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
     commands_.clear();
-    stats_.lend_evictions += controller_->lend(*first, count, commands_);
+    stats_.lend_evictions += controller_->lend(*first, count, commands_, refill_lent_);
     report_evictions();
     sync_queue_pins();
     auto* table = static_cast<std::int32_t*>(table_host_.data());
@@ -645,15 +656,18 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
 
 void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
     if (!lease.valid()) { return; }
+    issue_deferred(compute); // counted as promotions; the refills below are counted apart
     commands_.clear();
-    controller_->give_back(lease.first, lease.count, commands_);
+    const std::uint32_t refilled = controller_->give_back(lease.first, lease.count, commands_, refill_lent_);
     stats_.lent_frames -= lease.count;
     lease = {};
     issue_loads(compute); // queued experts load into the run once `compute` reaches here
+    stats_.promotions -= refilled; // issue_loads counted them; they are refills, not promotions
+    stats_.refilled += refilled;
     sync_queue_pins();
 }
 
-void ExpertResidency::issue_loads(cudaStream_t compute) {
+void ExpertResidency::issue_loads(cudaStream_t compute, bool defer) {
     std::vector<Batch::Load> loads;
     for (const auto& command : commands_) {
         if (command.kind == CacheController::Command::Kind::kCopy) {
@@ -661,7 +675,43 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
         }
     }
     if (loads.empty()) { return; }
-    CUDA_CHECK(cudaEventRecord(table_ready_, compute));
+    if (defer) {
+        deferred_.insert(deferred_.end(), loads.begin(), loads.end());
+        return;
+    }
+    enqueue_loads(loads, compute);
+}
+
+void ExpertResidency::issue_deferred(cudaStream_t after) {
+    if (deferred_.empty()) { return; }
+    std::vector<Batch::Load> loads;
+    loads.swap(deferred_);
+    enqueue_loads(loads, after);
+    // Submitted now: on a batched driver model (WDDM) the copies would otherwise wait for the next
+    // blocking call, past the idle link time they were deferred to.
+    const cudaError_t status = cudaStreamQuery(copy_stream_);
+    if (status == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+    } else {
+        CUDA_CHECK(status);
+    }
+}
+
+bool ExpertResidency::loads_pending() const {
+    if (!deferred_.empty()) { return true; }
+    for (const auto& batch : in_flight_) {
+        const cudaError_t status = cudaEventQuery(batch.done);
+        if (status == cudaErrorNotReady) {
+            (void)cudaGetLastError();
+            return true;
+        }
+        CUDA_CHECK(status);
+    }
+    return false;
+}
+
+void ExpertResidency::enqueue_loads(std::span<const Batch::Load> loads, cudaStream_t after) {
+    CUDA_CHECK(cudaEventRecord(table_ready_, after));
     CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, table_ready_, 0));
     auto* base = const_cast<std::uint8_t*>(frame_base());
     // A prefill promotes thousands of records (~1.2 s of link at x8): batched copies keep the host

@@ -246,10 +246,14 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const;
     // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
     // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
-    // evicted elsewhere). Returns the number of evicted experts.
-    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
-    // Returns the run: capacity grows back and queued experts load into it.
-    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // evicted elsewhere). Returns the number of evicted experts. With `refill`, the evicted experts
+    // are remembered for give_back.
+    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill = false);
+    // Returns the run: capacity grows back and queued experts load into it. With `refill` (a cache
+    // that does not promote during requests, so nothing else would bring them back), the experts
+    // that lending evicted and that are still absent then load into the free frames, as a warm
+    // start does; those that do not fit wait for the next give_back. Returns how many it loaded so.
+    std::uint32_t give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill = false);
     // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then
     // loads `keys`, best first, into free frames while the policy has capacity. Before the first
     // round only. Returns the number of keys loaded.
@@ -298,6 +302,7 @@ private:
     std::vector<std::uint8_t> is_queued_;
     std::vector<std::uint64_t> load_serial_; // per key: the serial of its latest issued copy
     std::vector<std::uint32_t> frame_key_;   // per frame: the key it holds, or kNoKey
+    std::vector<std::uint32_t> lent_keys_;   // experts lending evicted, for a refilling give_back
     std::uint64_t next_serial_ = 0;
     LfruPolicy::Step step_;
 };

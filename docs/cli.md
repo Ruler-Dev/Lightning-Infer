@@ -397,20 +397,37 @@ by `--handoff-timeout-ms` (a round whose state does not arrive in time fails wit
 error and the engine keeps serving).
 
 Each GPU's expert cache follows its own PCIe link. A GPU on a slow link (below 8 GB/s, such as
-PCIe 3.0 x4) promotes no experts while requests run: its misses go to the CPU (it hands the CPU
-more of them, at most 32 per layer call), and its frames fill from the saved expert state at
-startup (every frame, not half: the last session's cached experts, then the other experts it used,
-most used first) and from the misses its decode stages anyway. A faster GPU keeps
-the dynamic cache of a single GPU. The startup line of each segment names its link and policy.
+PCIe 3.0 x4) sends most misses to the CPU (it hands the CPU more of them, at most 32 per layer
+call) and fills every frame at startup, not half: from the saved expert state (the last session's
+cached experts, then the other experts it used, most used first, then the experts it never used),
+or without one every expert of its layers in turn, so a GPU with room for all its layers' experts
+holds them all. While requests run it promotes only a trickle: at most one expert per layer for a
+few layers per round (6 ms of its link, six experts at 3.1 GB/s), copied once its layers of the
+next round are done, while the other GPU computes; so its cache follows a conversation's topics
+without its link slowing its own layers. The frames a long prompt borrows for its wide calls get
+their experts back afterwards. A faster GPU keeps the dynamic cache of a single GPU. The startup
+line of each segment names its link and policy. `INFERNIX_TRICKLE_PROMOTIONS=N` (a measurement
+knob) sets the trickle's experts per round; `0` promotes nothing during requests.
 
-A split refuses, until each is supported, `--vision`, the prefix cache (`infernix-serve
---no-prefix-reuse` disables it), the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier),
+The hybrid prefix cache (`infernix-serve` reuses prefixes by default) runs across the split: each
+GPU keeps the cached blocks' KV for its own layers on the same pages, and copies its own layers'
+KV and recurrent state to and from the pinned Host tier on its own streams, so a resumed turn
+waits on each GPU only for its own layers. Snapshots, cached blocks and the `--prefix-cache-file`
+keep the whole model's layout, so a file saved by an unsplit run loads into a split one and the
+reverse. A resumed request keeps the split's exactness: with the same launch decompositions it
+gives the unsplit run's bits.
+
+A split refuses, until each is supported, `--vision`, the
+[SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier),
 which needs every expert in Host RAM, and `--layer-split auto` (the default with two devices) or
 `@FILE`, which need the split planner: pass `--layer-split K`, with `1 <= K < 48`. `--devices A`
 with one ordinal runs exactly as `--device A`. `--devices A,A` runs both segments on one GPU, each
 with its own context, one after the other (their work never overlaps on the GPU), with the event
 handoff only: a test mode for exactness. `INFERNIX_SPLIT_SYNC=1` (a debugging aid) synchronizes
-both GPUs before the host restages a call's or round's inputs.
+both GPUs before the host restages a call's or round's inputs. `INFERNIX_SPLIT_TIMING=1` (a
+measurement knob) logs at each request's end, at debug level, where its decode rounds' time went:
+the mean round period, the time from launch to synchronization and each GPU's graph time within
+it, and the host's drafting and commit.
 
 `INFERNIX_LOGITS_HASH=FILE` (a check for this exactness, for both the CLI and the HTTP server)
 appends one line per call or round that computes logits to `FILE`: its kind (`prefill`, `forced`,
