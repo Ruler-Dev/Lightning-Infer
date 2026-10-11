@@ -112,7 +112,7 @@ void test_slow_link() {
                     gbps(rate));
         require(p.trickle_bytes == static_cast<std::uint64_t>(rate * kSlowLinkTrickleSeconds) &&
                     p.idle_refill_promotions == 32,
-                "the trickle is 6 ms of the link per round" + gbps(rate));
+                "the trickle is 13 ms of the link per round" + gbps(rate));
     }
     for (const double rate : {8e9, 27.5e9, 28.4e9, 64e9}) {
         const LinkPolicy p = derive_link_policy(rate, {});

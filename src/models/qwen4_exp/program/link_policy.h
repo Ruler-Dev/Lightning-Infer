@@ -32,10 +32,16 @@ inline constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
 // where its link is idle (after its layers of the next round, while the next segment runs).
 inline constexpr double kSlowLinkBytesPerSecond = 8e9;
 inline constexpr std::uint32_t kSlowLinkCpuJobs = 32;
-// A slow link's promotion bytes per round: the link time of kSlowLinkTrickleSeconds (6 ms: about
-// six 2.64 MiB experts at 3.1 GB/s), well inside the time a decode round's later segments keep it
-// idle (about 14-16 ms on an RTX PRO 4000 + RTX 5080 split at K = 20-24).
-inline constexpr double kSlowLinkTrickleSeconds = 6e-3;
+// A slow link's promotion bytes per round: the link time of kSlowLinkTrickleSeconds (13 ms: 14
+// 2.64 MiB experts at 3.1 GB/s), about the time a decode round's later segments keep it idle
+// (7-9 ms at K = 28 in a two- or three-column round, 14-16 ms at K = 20-24, 26 ms in an 8-column
+// copy round); a longer batch only delays the next one (no new promotions while one copies).
+// Measured on an RTX PRO 4000 + RTX 5080 split at K = 28 (multi-GPU wave 5), against 6 ms (six
+// experts): the 20-turn conversation 82.4 against 81.4 tok/s over the second half (the RTX PRO
+// 4000's hit 92.1% against 90.8%), the code-agent conversation with n-gram copies 103.6 against
+// 100.4 tok/s over all turns (its first two turns 74.1 / 114.7 against 58.9 / 89.4: the cache
+// follows a new topic sooner), with identical replies; 28 experts per round gave 81.5 and 103.4.
+inline constexpr double kSlowLinkTrickleSeconds = 13e-3;
 
 // When a segment's expert cache promotes misses into frames.
 //   Dynamic:  today's LFRU: every miss-driven promotion the decode budget allows, scaled by
@@ -70,7 +76,7 @@ struct LinkPolicyInputs {
 
 // The policy of a link of `rate` bytes per second; a rate that is not positive and finite (nothing
 // measured) yields the reference link's, as the single-GPU Program keeps the reference rate then.
-// rate < 8e9: Trickle (rate * 6 ms per round), seed 1.0 and at least 32 CPU jobs (0, CPU-served
+// rate < 8e9: Trickle (rate * 13 ms per round), seed 1.0 and at least 32 CPU jobs (0, CPU-served
 // misses disabled, stays 0).
 [[nodiscard]] inline LinkPolicy derive_link_policy(double rate,
                                                    const LinkPolicyInputs& in) noexcept {

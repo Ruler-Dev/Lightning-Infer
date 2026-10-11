@@ -405,9 +405,12 @@ call) and fills every frame at startup, not half: from the saved expert state (t
 cached experts, then the other experts it used, most used first, then the experts it never used),
 or without one every expert of its layers in turn, so a GPU with room for all its layers' experts
 holds them all. While requests run it promotes only a trickle: at most one expert per layer for a
-few layers per round (6 ms of its link, six experts at 3.1 GB/s), copied once its layers of the
+few layers per round (13 ms of its link, 14 experts at 3.1 GB/s), copied once its layers of the
 next round are done, while the other GPU computes; so its cache follows a conversation's topics
-without its link slowing its own layers. The frames a long prompt borrows for its wide calls get
+without its link slowing its own layers. On an RTX PRO 4000 + RTX 5080 split at `K = 28` the
+20-turn conversation decoded at 82.4 tok/s over its second half with this trickle, 81.4 with the
+earlier 6 ms and 65.2 with none; on a code-agent conversation the first turns after the switch to
+code ran at 74.1 and 114.7 tok/s against 58.9 and 89.4 with 6 ms, with the same replies. The frames a long prompt borrows for its wide calls get
 their experts back afterwards. A faster GPU keeps the dynamic cache of a single GPU. The startup
 line of each segment names its link and policy. `INFERNIX_TRICKLE_PROMOTIONS=N` (a measurement
 knob) sets the trickle's experts per round; `0` promotes nothing during requests.

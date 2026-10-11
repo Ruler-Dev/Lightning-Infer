@@ -2565,10 +2565,11 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   segment whose frames cover its layers' experts holds them all; without a saved state, none yet
   or `--expert-state off`, every key of its layers, expert-major). During requests it promotes
   only a trickle (`PromotionPolicy::Trickle`, `trickles`, `trickle_budget`): each round at most
-  one expert per layer in a window of `trickle_bytes` / record stride consecutive layers (6 ms of
-  its link: six experts at 3.1 GB/s; `INFERNIX_TRICKLE_PROMOTIONS=N` overrides, `0` promotes
-  nothing), a window that moves on after every round that had a budget, so every layer gets its
-  turn. The copies wait in the residency (`ExpertResidency::set_trickle`) until the segment's share
+  one expert per layer in a window of `trickle_bytes` / record stride consecutive layers (13 ms of
+  its link since multi-GPU wave 5, 14 experts at 3.1 GB/s, 6 ms before;
+  `INFERNIX_TRICKLE_PROMOTIONS=N` overrides, `0` promotes nothing), a window that moves on after
+  every round that had a budget, so every layer gets its turn. The copies wait in the residency
+  (`ExpertResidency::set_trickle`) until the segment's share
   of the next round is enqueued (`launch_round`: `issue_deferred`), so they cross its link while
   the later segments compute, never ahead of its own staged misses; no new ones start while the
   last are deferred or copying (`loads_pending`), and any other call that needs them issued (an
@@ -2587,6 +2588,25 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   72.8 tok/s, within the runs' spread (the RTX 5080 started those runs with 5-14% fewer frames,
   a chunk placed in system memory); under the power-saver plan, where CPU-served misses cost more,
   the same build gave 70.7 tok/s at K = 24 with the trickle and 62.1 without.
+  Multi-GPU wave 5 sized the trickle at K = 28 (second half of the 20-turn conversation; the RTX
+  PRO 4000's hit since the start): none 65.2 tok/s (75.2%; rounds 26.1 ms, its graph 16.4 ms),
+  6 per round 81.4 (90.8%; 22.3 and 12.6 ms), 14 per round 82.4 and 82.2 in two runs (92.1%),
+  28 per round 81.5 (92.7%). On the code-agent conversation with `--ngram-draft-tokens 7`
+  (8-column copy rounds of ~70 ms, whose later segment leaves the link idle ~26 ms): 6 per round
+  100.4 tok/s over all turns (106.7 over the second half), 14 per round 103.6 and 102.5 (107.0 and
+  106.0), 28 per round 103.4 (106.1). The gain is in the first turns after the switch from the
+  saved state's topics to code (58.9 and 89.4 tok/s with 6, 74.1 and 114.7 with 14): a late
+  8-column round barely changes, its misses being the frames' capacity (7,222 for 14,336 experts),
+  so the trickle mostly sets how fast the cache follows a new topic. At K = 24: 81.0 tok/s with 6,
+  80.6 with 14 (hit 94.3% against 95.4%, the RTX PRO 4000's graph 10.62 against 10.59 ms; the RTX
+  5080 had 45 fewer frames in that run). Every reply was identical, so 13 ms (14 experts) became
+  the default. Rejected: sizing each round's count from the link's measured idle window (timing
+  events recorded around the segment's share, `INFERNIX_TRICKLE_PROMOTIONS=auto`): with it the
+  gated handoff waited up to its 1 s bound behind the RTX PRO 4000's round although its graph took
+  25-46 ms, and requests failed or ended after one or two tokens (inference: the timing event
+  recorded last before the segment's flush left its launches unsubmitted under WDDM); fixed counts
+  of 14 and 28 did not. Promoting every token on the RTX 5080 (a measurement knob, interval 1
+  instead of 4) tripled its promotions for a hit of 77.0% against 76.9% and no faster decode.
   An unsplit Program keeps the dynamic policy on every link. Each segment's frames come from its
   own device's sizing (on one device, its layer share of that device's). `testing::
   delay_next_round` holds the first segment's next round (a host function on its stream) to test
