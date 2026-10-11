@@ -1,4 +1,7 @@
-// Complete public-Op benchmark for the registered Q8 LinearSwiGLU profiles.
+// Complete public-Op benchmark for the registered Q8 LinearSwiGLU profiles: the companion and
+// DFlash2 problems, and Qwen3.8-Flash-Next's shared expert (gate/up [1280, 2560], 640 outputs).
+// --dump PATH writes every point's output in sweep order, so two builds can be compared byte for
+// byte.
 
 #include "core/weight.h"
 #include "infernix/ops/linear_swiglu.h"
@@ -37,12 +40,14 @@ struct Problem {
 
 constexpr Problem kCompanion{"companion", 12288, 6144, 2048};
 constexpr Problem kDFlash2{"dflash2", 34816, 17408, 5120};
+constexpr Problem kFlashNextShared{"flash_next_shared", 1280, 640, 2560};
 
 struct Options {
     std::vector<std::int32_t> t_sweep;
     int warmup = 5;
     int repeat = 30;
     std::string csv_out;
+    std::string dump;
     std::string problem = kCompanion.name;
     bool profile        = false;
     bool graph          = false;
@@ -92,6 +97,8 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
+        } else if (arg == "--dump") {
+            options.dump = next("--dump path");
         } else if (arg == "--profile") {
             options.profile = true;
         } else if (arg == "--execution") {
@@ -100,10 +107,11 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("execution must be eager or graph");
             options.graph = mode == "graph";
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--problem companion|dflash2] [--t-sweep 1,2,...] "
-                        "[--warmup N] [--repeat N] [--csv-out PATH] [--profile] "
-                        "[--execution eager|graph]\n",
-                        argv[0]);
+            std::printf(
+                "Usage: %s [--problem companion|dflash2|flash_next_shared] [--t-sweep 1,2,...] "
+                "[--warmup N] [--repeat N] [--csv-out PATH] [--dump PATH] [--profile] "
+                "[--execution eager|graph]\n",
+                argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
@@ -112,8 +120,9 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.problem != kCompanion.name && options.problem != kDFlash2.name) {
-        throw std::invalid_argument("--problem must be companion or dflash2");
+    if (options.problem != kCompanion.name && options.problem != kDFlash2.name &&
+        options.problem != kFlashNextShared.name) {
+        throw std::invalid_argument("--problem must be companion, dflash2 or flash_next_shared");
     }
     if (options.t_sweep.empty()) {
         if (options.problem == kDFlash2.name) {
@@ -170,7 +179,9 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
 int main(int argc, char** argv) {
     try {
         const Options options  = parse_options(argc, argv);
-        const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
+        const Problem& problem = options.problem == kDFlash2.name           ? kDFlash2
+                                 : options.problem == kFlashNextShared.name ? kFlashNextShared
+                                                                            : kCompanion;
         DeviceContext context;
         const cudaStream_t stream = context.stream;
         std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.props.name,
@@ -187,6 +198,11 @@ int main(int argc, char** argv) {
             QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden, ops::LinearPolicy::A16Only,
             *minimum, *maximum);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
+        std::ofstream dump;
+        if (!options.dump.empty()) {
+            dump.open(options.dump, std::ios::binary);
+            if (!dump) throw std::runtime_error("cannot open " + options.dump);
+        }
         std::vector<Result> results;
         for (const auto t : options.t_sweep) {
             Tensor x(input.p, DType::BF16, {problem.hidden, t});
@@ -195,6 +211,14 @@ int main(int argc, char** argv) {
                 ops::linear_swiglu(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
                                    launch_stream);
             };
+            if (dump.is_open()) {
+                body(stream);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<char> bytes(static_cast<std::size_t>(problem.output_rows) * t * 2);
+                CUDA_CHECK(
+                    cudaMemcpy(bytes.data(), output.p, bytes.size(), cudaMemcpyDeviceToHost));
+                dump.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            }
             bench::TimedGraph graph;
             if (options.graph) graph.capture(stream, body);
             if (options.profile) {
