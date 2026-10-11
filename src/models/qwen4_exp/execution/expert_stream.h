@@ -51,6 +51,12 @@ public:
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
 
+    // Paced copies, for a stream whose layers' copies must not hold another device's traffic on a
+    // GPU with one copy engine (which runs copies in the order they were enqueued): after_experts()
+    // only lists layer + 2's copies, in runs of at most `run_bytes`; pump() enqueues the next
+    // `bytes` of them, and before_experts() of that layer, or the next after_experts(), the rest.
+    void set_paced(std::size_t run_bytes) noexcept { run_bytes_ = run_bytes; }
+    void pump(std::size_t bytes);
     // The stream that writes the ring (a writer for the lender to order after its promotions).
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
     // Records per ring of `bytes`: what is left after the slot tables, an even number.
@@ -79,7 +85,12 @@ public:
     // copies of layer + 2 follow.
     void after_experts(std::uint32_t layer, cudaStream_t compute);
     // After the chunk's last layer: `compute` is ordered after every copy (each was waited for).
-    void end() noexcept { active_ = false; }
+    void end() noexcept {
+        active_ = false;
+        listed_.clear();
+        next_listed_ = 0;
+        listing_     = false;
+    }
 
     struct Stats {
         std::uint64_t streamed = 0; // expert records copied
@@ -89,12 +100,23 @@ public:
 
 private:
     void enqueue(std::uint32_t layer);
+    void enqueue_listed(std::size_t bytes);
 
     std::uint32_t experts_ = 0, layers_ = 0;
     std::uint64_t stride_  = 0;
     RecordOf record_of_;
     Hold hold_;
     bool one_allocation_ = true;
+    std::size_t run_bytes_ = 0; // paced (set_paced): the listed copies, the layer they fill
+    struct Copy {
+        void* destination;
+        const void* source;
+        std::size_t bytes;
+    };
+    std::vector<Copy> listed_;
+    std::size_t next_listed_    = 0;
+    std::uint32_t listed_layer_ = 0;
+    bool listing_               = false;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;
     cudaEvent_t uploaded_ = nullptr;

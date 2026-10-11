@@ -93,7 +93,11 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
     active_ = true;
     enqueue(0);
-    if (layers_ > 1) { enqueue(1); }
+    enqueue_listed(SIZE_MAX);
+    if (layers_ > 1) {
+        enqueue(1);
+        enqueue_listed(SIZE_MAX);
+    }
 }
 
 std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
@@ -139,26 +143,60 @@ void ExpertStream::enqueue(std::uint32_t layer) {
         }
         const std::uint8_t* source = record_of_(layer, e);
         std::uint32_t end = e + 1;
-        while (one_allocation_ && end < experts_ && row[end] == row[end - 1] + 1 &&
+        const std::size_t run_limit = run_bytes_ == 0 ? experts_ : std::max<std::size_t>(1, run_bytes_ / stride_);
+        while (one_allocation_ && end < experts_ && end - e < run_limit && row[end] == row[end - 1] + 1 &&
                record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * stride_) {
             ++end;
         }
         const std::size_t bytes = static_cast<std::size_t>(end - e) * stride_;
-        copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
+        if (run_bytes_ != 0) {
+            listed_.push_back({records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes});
+        } else {
+            copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
+        }
         stats_.streamed += end - e;
         ++stats_.copies;
         e = end;
+    }
+    if (run_bytes_ != 0) {
+        listing_      = true;
+        listed_layer_ = layer;
+        return; // pump() and before_experts() enqueue them, then record landed_
     }
     copies.flush();
     CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
 }
 
+void ExpertStream::enqueue_listed(std::size_t bytes) {
+    if (!listing_) { return; }
+    CopyBatch copies(stream_);
+    std::size_t taken = 0;
+    while (next_listed_ < listed_.size() && taken < bytes) {
+        const Copy& c = listed_[next_listed_++];
+        copies.add(c.destination, c.source, c.bytes);
+        taken += c.bytes;
+    }
+    copies.flush();
+    if (next_listed_ == listed_.size()) {
+        CUDA_CHECK(cudaEventRecord(landed_[listed_layer_], stream_));
+        listed_.clear();
+        next_listed_ = 0;
+        listing_     = false;
+    }
+}
+
+void ExpertStream::pump(std::size_t bytes) {
+    if (active_ && bytes > 0) { enqueue_listed(bytes); }
+}
+
 void ExpertStream::before_experts(std::uint32_t layer, cudaStream_t compute) {
+    if (listing_ && listed_layer_ == layer) { enqueue_listed(SIZE_MAX); }
     if (active_ && streams_[layer] != 0) { CUDA_CHECK(cudaStreamWaitEvent(compute, landed_[layer], 0)); }
 }
 
 void ExpertStream::after_experts(std::uint32_t layer, cudaStream_t compute) {
     if (!active_) { return; }
+    enqueue_listed(SIZE_MAX); // the previous layer's rest, before this one's are listed
     CUDA_CHECK(cudaEventRecord(consumed_[layer], compute));
     if (!gated_ && layer + 2 < layers_) { enqueue(layer + 2); }
 }
