@@ -246,8 +246,10 @@ struct DeviceSegment {
     BulkHandoff* bulk_out = nullptr;
     SegmentEvent compute_done;
     DeviceBuffer handoff_stats;
-    // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming).
+    // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming);
+    // on the head also around the drafter's catch-up and draft graph.
     SegmentEvent timing_begin, timing_end;
+    SegmentEvent catch_begin, catch_end, draft_begin, draft_end;
 
     // ---- the Forward and its CUDA graph families ----
     std::unique_ptr<execution::Forward> forward;

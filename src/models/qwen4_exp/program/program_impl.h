@@ -647,8 +647,8 @@ public:
             }
             handoff_ = options_.handoff == SplitHandoff::Gate ? HandoffMode::Gate : HandoffMode::Event;
             split_sync_ = split_sync_from_environment();
-            timing_.on  = split_timing_from_environment();
         }
+        timing_.on = split_timing_from_environment();
         ple_segment_ = map.ple().index;
         const auto public_tokens = dim(parameters_.model.resources().public_token_count);
         for (std::size_t s = 0; s < map.size(); ++s) {
@@ -699,6 +699,10 @@ public:
                 const DeviceGuard on(segment->device->device);
                 CUDA_CHECK(cudaEventCreate(&segment->timing_begin.event));
                 CUDA_CHECK(cudaEventCreate(&segment->timing_end.event));
+            }
+            const DeviceGuard on(head().device->device);
+            for (SegmentEvent* e : {&head().catch_begin, &head().catch_end, &head().draft_begin, &head().draft_end}) {
+                CUDA_CHECK(cudaEventCreate(&e->event));
             }
         }
         // Every segment's fixed allocations, checked against its plan and its device's free memory.
@@ -1397,18 +1401,38 @@ public:
         if (split_sync_) { synchronize(); }
     }
 
-    // Measurement knob INFERNIX_SPLIT_TIMING=1 (a split only): where a decode or verification
-    // round's time goes, reported at each request's end (debug level) as means per round: the round
-    // period (launch to launch), the launch-to-synchronization wall time and within it each segment's
-    // graph on its GPU (timing events around its replay, after its handoff wait), and the host's
-    // drafting and commit (with the cache update) between rounds. Costs two event records per
-    // segment and round.
+    // Measurement knob INFERNIX_SPLIT_TIMING=1 (a split, or one GPU as its reference): where a
+    // decode or verification round's time goes, reported at each request's end (debug level) as
+    // means per round: the round period (launch to launch), the launch-to-synchronization wall time
+    // and within it each segment's graph on its GPU (timing events around its replay, after its
+    // handoff wait), and the host's drafting and commit (with the cache update) between rounds;
+    // then the same per verified width (1 for a plain round), with the draft steps run before the
+    // round, from which a verified column's marginal cost follows (choose_draft_length). Costs two
+    // event records per segment and round.
     static bool split_timing_from_environment() {
         const char* value = std::getenv("INFERNIX_SPLIT_TIMING");
         if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) { return false; }
         if (std::strcmp(value, "1") == 0) { return true; }
         throw std::invalid_argument(std::string("INFERNIX_SPLIT_TIMING must be 0 or 1, not '") + value + "'");
     }
+    // INFERNIX_SPLIT_TIMING's host marks of a round's phases, in their usual order.
+    enum class Mark : std::uint8_t {
+        Synced,        // the round's synchronization returned (timing_synchronized)
+        CommitBegin,   // commit() entered
+        SettleBegin,   // settle_round() entered (the cache update)
+        Settled,       // settle_round() returned
+        DecodeBegin,   // decode() entered
+        DraftLaunched, // the draft graph and its downloads are enqueued
+        DraftSynced,   // the draft's synchronization returned
+        LaunchBegin,   // launch_round() entered
+        FirstLaunched, // the first segment's graph launch returned
+        Launched,      // launch_round() returned
+        Count
+    };
+    static constexpr std::size_t kMarkCount = static_cast<std::size_t>(Mark::Count);
+    static constexpr std::array<const char*, kMarkCount> kMarkNames = {
+        "synced", "commit", "settle", "settled", "decode", "draft-launched", "draft-synced", "launch",
+        "first-launched", "launched"};
     struct SplitTiming {
         bool on    = false;
         bool armed = false; // the round in flight recorded its events
@@ -1416,14 +1440,39 @@ public:
         double period_ms = 0, wall_ms = 0, draft_ms = 0, commit_ms = 0;
         std::vector<double> graph_ms; // per segment
         Clock::time_point launched{}, previous{};
+        // The drafting before the round in flight (its host span and draft steps).
+        double round_draft_ms    = 0;
+        std::int32_t round_steps = 0;
+        // Per verified width W (index W - 1): sums over its rounds.
+        struct Width {
+            std::uint64_t rounds = 0, steps = 0;
+            double wall_ms = 0, draft_ms = 0;
+            std::vector<double> graph_ms; // per segment
+        };
+        std::vector<Width> widths;
+        // Host marks between rounds (Mark): the time from each mark to the next one taken, summed
+        // per transition, so the round's critical path between the head's synchronization and the
+        // first segment's launch is broken down.
+        Mark last_mark = Mark::Count;
+        Clock::time_point last_at{};
+        std::array<std::array<double, kMarkCount>, kMarkCount> mark_ms{};
+        std::array<std::array<std::uint64_t, kMarkCount>, kMarkCount> mark_n{};
+        // The head's drafter on its GPU: the catch-up (commit) and the draft graph, and the head's
+        // idle gap between them; sums and counts over the rounds that ran them.
+        bool catch_recorded = false, draft_recorded = false;
+        double catch_ms = 0, gap_ms = 0, steps_ms = 0;
+        std::uint64_t catch_n = 0, gap_n = 0, steps_n = 0;
     };
     SplitTiming timing_;
-    // Adds the host time of its scope to `total` (none when null).
+    // Adds the host time of its scope to `total` and stores it in `last` (none when `total` is
+    // null).
     struct HostSpan {
-        explicit HostSpan(double* total) : total_(total) {}
+        explicit HostSpan(double* total, double* last = nullptr) : total_(total), last_(last) {}
         ~HostSpan() {
             if (total_ != nullptr) {
-                *total_ += std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
+                *total_ += ms;
+                if (last_ != nullptr) { *last_ = ms; }
             }
         }
         HostSpan(const HostSpan&)            = delete;
@@ -1431,8 +1480,50 @@ public:
 
     private:
         double* total_;
+        double* last_;
         Clock::time_point start_ = Clock::now();
     };
+    // Takes host mark `m`: adds the time since the last mark to their transition.
+    void mark(Mark m) noexcept {
+        if (!timing_.on) { return; }
+        const auto now = Clock::now();
+        if (timing_.last_mark != Mark::Count) {
+            const auto from = static_cast<std::size_t>(timing_.last_mark), to = static_cast<std::size_t>(m);
+            timing_.mark_ms[from][to] += std::chrono::duration<double, std::milli>(now - timing_.last_at).count();
+            ++timing_.mark_n[from][to];
+        }
+        timing_.last_mark = m;
+        timing_.last_at   = now;
+    }
+    // Records the head's drafter event `e` (catch_begin .. draft_end) on its stream.
+    void drafter_event(SegmentEvent& e, bool& recorded) {
+        if (!timing_.on) { return; }
+        CUDA_CHECK(cudaEventRecord(e.event, head().device->stream));
+        recorded = true;
+    }
+    // After the draft's synchronization: the catch-up, the head's gap before the draft graph, and
+    // the draft graph, each when recorded since the last.
+    void drafter_synchronized() {
+        if (!timing_.on) { return; }
+        const DeviceSegment& h = head();
+        float ms = 0.0F;
+        if (timing_.catch_recorded) {
+            CUDA_CHECK(cudaEventElapsedTime(&ms, h.catch_begin.event, h.catch_end.event));
+            timing_.catch_ms += ms;
+            ++timing_.catch_n;
+            if (timing_.draft_recorded) {
+                CUDA_CHECK(cudaEventElapsedTime(&ms, h.catch_end.event, h.draft_begin.event));
+                timing_.gap_ms += ms;
+                ++timing_.gap_n;
+            }
+        }
+        if (timing_.draft_recorded) {
+            CUDA_CHECK(cudaEventElapsedTime(&ms, h.draft_begin.event, h.draft_end.event));
+            timing_.steps_ms += ms;
+            ++timing_.steps_n;
+        }
+        timing_.catch_recorded = timing_.draft_recorded = false;
+    }
     void timing_launch() {
         if (!timing_.on) { return; }
         const auto now = Clock::now();
@@ -1442,18 +1533,33 @@ public:
         }
         timing_.previous = timing_.launched = now;
         timing_.armed    = true;
+        mark(Mark::LaunchBegin);
     }
-    // After the round's synchronization.
-    void timing_synchronized() {
+    // After the synchronization of a round of verified width `width` (1: plain).
+    void timing_synchronized(std::int32_t width) {
         if (!timing_.on || !timing_.armed) { return; }
         timing_.armed = false;
-        timing_.wall_ms += std::chrono::duration<double, std::milli>(Clock::now() - timing_.launched).count();
+        mark(Mark::Synced);
+        if (timing_.widths.size() < static_cast<std::size_t>(width)) {
+            timing_.widths.resize(static_cast<std::size_t>(width));
+        }
+        SplitTiming::Width& w = timing_.widths[static_cast<std::size_t>(width - 1)];
+        w.graph_ms.resize(segments_.size(), 0.0);
+        const double wall = std::chrono::duration<double, std::milli>(Clock::now() - timing_.launched).count();
+        timing_.wall_ms += wall;
+        w.wall_ms += wall;
+        w.draft_ms += timing_.round_draft_ms;
+        w.steps += static_cast<std::uint64_t>(timing_.round_steps);
+        ++w.rounds;
+        timing_.round_draft_ms = 0;
+        timing_.round_steps    = 0;
         for (std::size_t s = 0; s < segments_.size(); ++s) {
             const DeviceSegment& seg = *segments_[s];
             const DeviceGuard on(seg.device->device);
             float ms = 0.0F;
             CUDA_CHECK(cudaEventElapsedTime(&ms, seg.timing_begin.event, seg.timing_end.event));
             timing_.graph_ms[s] += ms;
+            w.graph_ms[s] += ms;
         }
         ++timing_.rounds;
     }
@@ -1473,6 +1579,36 @@ public:
                 }
                 line += ") + draft " + std::to_string(d) + " + commit " + std::to_string(c) + " + other " +
                         std::to_string(p - w - d - c);
+                // Per verified width: rounds, mean draft steps and drafting before the round, mean
+                // launch-to-sync wall time and graphs.
+                line += "; by width:";
+                for (std::size_t i = 0; i < timing_.widths.size(); ++i) {
+                    const SplitTiming::Width& x = timing_.widths[i];
+                    if (x.rounds == 0) { continue; }
+                    const auto m = static_cast<double>(x.rounds);
+                    line += " W" + std::to_string(i + 1) + " n " + std::to_string(x.rounds) + " steps " +
+                            std::to_string(static_cast<double>(x.steps) / m) + " draft " +
+                            std::to_string(x.draft_ms / m) + " wall " + std::to_string(x.wall_ms / m) + " (graphs";
+                    for (const double g : x.graph_ms) { line += " " + std::to_string(g / m); }
+                    line += ");";
+                }
+                // Between rounds: each host transition's mean and count, then the head's drafter.
+                line += " between rounds (host, mean ms):";
+                for (std::size_t from = 0; from < kMarkCount; ++from) {
+                    for (std::size_t to = 0; to < kMarkCount; ++to) {
+                        const std::uint64_t k = timing_.mark_n[from][to];
+                        if (k == 0) { continue; }
+                        line += " " + std::string(kMarkNames[from]) + "->" + kMarkNames[to] + " " +
+                                std::to_string(timing_.mark_ms[from][to] / static_cast<double>(k)) + " (" +
+                                std::to_string(k) + ")";
+                    }
+                }
+                const auto mean = [](double sum, std::uint64_t k) { return k ? sum / static_cast<double>(k) : 0.0; };
+                line += "; head drafter (GPU, mean ms): catch-up " + std::to_string(mean(timing_.catch_ms, timing_.catch_n)) +
+                        " (" + std::to_string(timing_.catch_n) + "), idle before the draft " +
+                        std::to_string(mean(timing_.gap_ms, timing_.gap_n)) + ", draft graph " +
+                        std::to_string(mean(timing_.steps_ms, timing_.steps_n)) + " (" + std::to_string(timing_.steps_n) +
+                        ")";
                 diagnostic(line, DiagnosticLevel::Debug);
             }
         } catch (...) {}
@@ -2257,6 +2393,7 @@ public:
         static_assert(kSplitDecode, "a layer split's rounds run across its segments");
         const GrammarScope grammar(*this, masks);
         const auto start = Clock::now();
+        mark(Mark::DecodeBegin);
         const auto batch = static_cast<std::int32_t>(sequences.size());
         if (batch <= 0 || batch > static_cast<std::int32_t>(options_.max_concurrency)) {
             throw std::logic_error("Qwen4Exp: decode batch is empty or too large");
@@ -2323,7 +2460,8 @@ public:
         // wait reads every committed-token column (the anchor's) and all of a copy row's.
         std::array<std::int32_t, kMaximumConcurrency> staged{};
         if (mtp_) {
-            const HostSpan drafting(timing_.on ? &timing_.draft_ms : nullptr);
+            const HostSpan drafting(timing_.on ? &timing_.draft_ms : nullptr, &timing_.round_draft_ms);
+            timing_.round_steps = steps;
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
                 if (width == 1) { return; }
                 for (std::int32_t b = 0; b < batch; ++b) {
@@ -2380,7 +2518,7 @@ public:
             read_rows();
             release_gate.owner = nullptr;
         });
-        timing_synchronized();
+        timing_synchronized(1);
         release_handoff.owner = nullptr; // every segment has synchronized
         hash_logits("decode", lanes[0], positions[0], 1, batch);
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
@@ -2444,6 +2582,7 @@ public:
         const auto rows = ContractAccess::rows(pending);
         if (decisions.size() != rows.size()) { throw std::logic_error("Qwen4Exp: commit decisions are not row aligned"); }
         const HostSpan committing(timing_.on ? &timing_.commit_ms : nullptr);
+        mark(Mark::CommitBegin);
         // A verification round's commit runs on every segment; a plain round's (the drafter's
         // catch-up, a cancelled row's saved column) on the head.
         if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
@@ -2784,6 +2923,7 @@ private:
     void settle_round() {
         if (!deferred_.pending) { return; }
         deferred_.pending = false;
+        mark(Mark::SettleBegin);
         // Each segment's cache applies the round's routes with its own budget.
         std::vector<std::size_t> budgets(segments_.size());
         for (std::size_t s = 0; s < segments_.size(); ++s) {
@@ -2809,6 +2949,7 @@ private:
             if (segments_.size() > 1) { seg.device->flush(); }
         }
         apply_vram_target(false);
+        mark(Mark::Settled);
     }
 
     // The expert caches' counters, summed over the segments.
@@ -4297,6 +4438,7 @@ private:
                 forward_call(seg, batch, width, columns, &view, nullptr, nullptr, &gate);
             });
             if (timing_.on) { CUDA_CHECK(cudaEventRecord(seg.timing_end.event, s)); }
+            if (&seg == &first()) { mark(Mark::FirstLaunched); }
             // From here an enqueued gate waits for its word: an error before the word is published
             // still publishes it (over zeroed rows or a stale residual), so the streams drain and
             // the error keeps its class.
@@ -4317,6 +4459,7 @@ private:
                 read = true;
             }
         }
+        mark(Mark::Launched);
         return read;
     }
 
@@ -4568,7 +4711,7 @@ private:
             release_gate.owner = nullptr;
         }
         synchronize();
-        timing_synchronized();
+        timing_synchronized(W);
         release_handoff.owner = nullptr; // every segment has synchronized
         check_expert_error();
         hash_logits("verify", lanes[0], positions[0], W, batch * W);
@@ -4824,7 +4967,7 @@ private:
         for (std::int32_t k = 1; k <= mtp_k_; ++k) {
             reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
-            const double score = tokens / (1.0 + kWidthCost * k);
+            const double score = tokens / (1.0 + width_cost_ * k);
             if (score > best_score) {
                 best_score = score;
                 best       = k;
@@ -4930,6 +5073,7 @@ private:
             }
             return;
         }
+        drafter_event(head().draft_begin, timing_.draft_recorded);
         replay(head(), head().mtp_draft_graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
         for (std::int32_t j = 0; j < steps; ++j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
@@ -4954,15 +5098,19 @@ private:
                                                 {1, batch})});
         }
         });
+        drafter_event(head().draft_end, timing_.draft_recorded);
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
+        mark(Mark::DraftLaunched);
         if (while_drafting) {
             head().device->flush();
             while_drafting();
         }
         head().device->synchronize();
+        mark(Mark::DraftSynced);
+        drafter_synchronized();
         for (std::int32_t b = 0; b < batch; ++b) {
             Lane& lane = lanes_[lanes[b]];
             if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
@@ -5003,6 +5151,7 @@ private:
         const Tensor rope(io + io_layout_.rope, DType::I32, {W * batch, 3});
         const Tensor block_rope(io + io_layout_.block_rope, DType::I32, {batch, 3});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+        drafter_event(head().catch_begin, timing_.catch_recorded);
         replay(head(), head().mtp_catch_graphs[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
         head().forward->run_mtp({.residuals   = Tensor(head().mtp_residuals.p, DType::BF16, {width_, W * batch}),
                                  .ids         = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
@@ -5023,6 +5172,7 @@ private:
                               positions.view({W, batch}), Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}),
                               tails, slots, execution::qsa_geometry(c_), s);
         });
+        drafter_event(head().catch_end, timing_.catch_recorded);
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             const auto lane      = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
@@ -5638,6 +5788,21 @@ private:
     static constexpr double kAcceptanceWeight     = 0.1;
     static constexpr double kWidthCost            = 0.38;
     static constexpr std::uint64_t kProbeInterval = 8;
+    // kWidthCost, or the measurement knob INFERNIX_WIDTH_COST=<x> (a draft column's cost in plain
+    // rounds, in [0, 4]): the draft lengths it picks change which rounds verify how many columns,
+    // never a token (one row verifies at most 8 columns, on the column-invariant routes).
+    static double width_cost_from_environment() {
+        const char* value = std::getenv("INFERNIX_WIDTH_COST");
+        if (value == nullptr || *value == '\0') { return kWidthCost; }
+        char* end         = nullptr;
+        const double cost = std::strtod(value, &end);
+        if (end == value || *end != '\0' || !(cost >= 0.0 && cost <= 4.0)) {
+            throw std::invalid_argument(std::string("INFERNIX_WIDTH_COST must be a number in [0, 4], not '") + value +
+                                        "'");
+        }
+        return cost;
+    }
+    const double width_cost_ = width_cost_from_environment();
     // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).

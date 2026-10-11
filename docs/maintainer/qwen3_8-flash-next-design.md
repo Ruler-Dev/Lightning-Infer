@@ -2528,7 +2528,29 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   drafting and commit. Measured at K = 24 on the CLI code prompt (MTP, 368 rounds): period
   25.6 ms = 22.8 ms launch to sync (graphs 11.0 ms on the RTX PRO 4000, 11.5 ms on the RTX 5080)
   + 2.4 ms drafting + 0.3 ms commit, so launches and handoffs between the graphs take about 0.3 ms
-  of a round, the bound on what the gate handoff could save.
+  of a round, the bound on what the gate handoff could save. Since multi-GPU wave 5 the knob also
+  runs on one GPU (the split's reference) and adds, per verified width, the rounds, the draft steps
+  run before them, the drafting and the launch-to-sync time per segment; each host transition
+  between rounds (`Mark`: synchronization, commit, cache update, decode, draft launched and
+  synchronized, launch, first segment launched, launched) as a mean; and on the head, from events,
+  the drafter's catch-up, its idle gap before the draft graph and the draft graph.
+  Measured at K = 28 over the second half of the 20-turn conversation benchmark (6,319 rounds,
+  event handoff): period 23.29 ms = 21.35 ms launch to sync (graphs 13.54 ms on the RTX PRO 4000,
+  7.53 ms on the RTX 5080, 0.28 ms handoff, acceptance and synchronization) + 1.64 ms drafting +
+  0.27 ms commit; between rounds the host spends 0.44 ms besides the draft (commit 0.12, cache
+  update 0.15, draft launch 0.09, first launch 0.05 ms) and the RTX 5080 idles 0.15 ms between the
+  catch-up (0.13 ms) and the draft graph (1.42 ms for 1.8 steps). So a split adds no fixed cost
+  beyond the handoff's 0.3 ms: the earlier "4-5 ms per round independent of K" was the RTX PRO
+  4000's slower layers (its 28 layers took 9.5 ms in a one-column round, the RTX 5080's 20 layers
+  and the head 5.3 ms). By verified width, with the drafting before the round and the commit:
+  W = 1 (24.9 % of rounds) 17.05 ms, W = 2 (36.9 %) 21.16, W = 3 (28.5 %) 27.73, W = 4 (8.5 %)
+  32.90, W = 5 (1.2 %) 42.34 ms; a draft step costs 0.82 ms. Against a plain round without
+  drafting (15.75 ms) a round of K drafts costs 1.33, 1.77, 2.11 and 2.71 plain rounds for
+  K = 1..4, 0.33-0.43 per draft, about the 0.38 fitted on the RTX 5090 (`kWidthCost`, kept). One
+  column more costs 4.4-6.2 ms of the 23 ms round, and a token is worth about 12 ms there (1.93
+  tokens per round), so verifying a draft pays from about 0.43 acceptance, near the 0.5 draft-head
+  probability below which a one-row round stops verifying (`kDraftMinLogprob`, kept).
+  `INFERNIX_WIDTH_COST=X` (a measurement knob) replaces `kWidthCost`.
   A split's segments apply their link's policy (`derive_link_policy`): on a slow link (below
   8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment's CPU port takes up to 32 jobs per
   layer call besides keeping only misses / 19 on the link, and the warm start seeds every frame

@@ -425,9 +425,14 @@ with one ordinal runs exactly as `--device A`. `--devices A,A` runs both segment
 with its own context, one after the other (their work never overlaps on the GPU), with the event
 handoff only: a test mode for exactness. `INFERNIX_SPLIT_SYNC=1` (a debugging aid) synchronizes
 both GPUs before the host restages a call's or round's inputs. `INFERNIX_SPLIT_TIMING=1` (a
-measurement knob) logs at each request's end, at debug level, where its decode rounds' time went:
-the mean round period, the time from launch to synchronization and each GPU's graph time within
-it, and the host's drafting and commit.
+measurement knob, also on one GPU as the split's reference) logs at each request's end, at debug
+level, where its decode rounds' time went: the mean round period, the time from launch to
+synchronization and each GPU's graph time within it, and the host's drafting and commit; then the
+same per verified width (with the draft steps run before the round, from which a verified
+column's cost follows), the host's steps between rounds (synchronization, commit, cache update,
+drafting, launches) and the drafter's catch-up, idle gap and draft graph on the head GPU.
+`INFERNIX_WIDTH_COST=X` (a measurement knob, `0..4`) replaces the one-row draft policy's cost of a
+draft in plain rounds (0.38); it changes how many columns rounds verify, never a token.
 
 `INFERNIX_LOGITS_HASH=FILE` (a check for this exactness, for both the CLI and the HTTP server)
 appends one line per call or round that computes logits to `FILE`: its kind (`prefill`, `forced`,
