@@ -2603,6 +2603,9 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   `infernix-serve --devices 0,1 --layer-split 24` on a six-turn chat (11.2K-11.5K-token prompts
   from turn 3): the turns after the 11.2K-token one resumed 99.2-99.4 % of their prompt from
   generation-opener snapshots with a 0.43-0.44 s TTFT, against 15.5 s for that turn.
+- **Layer split** (multi-GPU WP16). A split's prompts walk layer-major on every segment, each
+  segment streaming its own layers' experts once per span (§19.3.8, "F4 on a layer split").
+  `test_split_prefill_real --walk-modes` checks the bits against the unsplit run and chunk-major.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
@@ -7673,6 +7676,45 @@ the drive's knee) remains open.
     call; every chunk routes nearly every expert, so the credited set is about the same.
 - **Toggle.** A temporary environment variable (`INFERNIX_TMP_WALK_OFF`) gave the A/B in one
   binary; it was removed before the commit.
+
+#### F4 on a layer split (multi-GPU WP16, 2026-10-11)
+
+A split first refused the walk (`walk_span_end` returned at once), so its prompts ran chunk-major
+and the RTX PRO 4000's segment (K = 28: 14,336 experts, ~7,200 frames, a 3.1 GB/s PCIe 3.0 x4 link)
+streamed its ~8,500 non-resident experts (~22 GiB, ~7 s) for every 4,096-token call: a 63K-token
+prompt prefilled at 565 tok/s, the RTX 5080 waiting for most of it.
+
+- **The walk on every segment** (`prefill_walk.cpp`). `walk_span_end` lends every segment's stream
+  lease with its walk area (the span is as long as every area allows); `walk_begin` uploads each
+  chunk's io image to every segment's area (the n-gram rows to the PLE segment only, as
+  `upload_io`), and rebases the MTP cells onto the head's copy and the image columns onto the first
+  segment's; `walk_pass` runs layer l on `layer_segment(l)`, and after a segment's last layer of
+  chunk c the boundary's `BulkHandoff` moves the chunk's residual columns into the next segment's
+  walk residual, ordered on both streams with no host wait. `walk_enqueue` groups each step's layers
+  by segment (`SegmentWork`, the segment's wide arena; on one GPU the segments' kernels never
+  overlap) and submits each group, since the next segment's stream waits for its crossings. The
+  span's end runs each segment's route download, stream end and `after_round`. A segment whose
+  lendable frames do not hold the walk area beside full ring halves (the 16 GB card at a long
+  context, `--devices 0,0`) squeezes the halves (a layer's experts beyond its half are staged per
+  chunk) rather than giving up the walk. `walk_report` logs each span (debug): its chunks and tokens,
+  each segment's time on its GPU from its first to its last pass, and the wall time.
+- **Same bits.** `test_split_prefill_real --walk-modes` compares, for 12,388 (three calls and a
+  100-token tail) and 73,828-token prompts (two spans) each with 8 generated tokens, the unsplit
+  Engine against the split walking and chunk-major: ids equal, logits lines equal or, where a walk
+  computes fewer, covered by the other run's.
+- **Span ends and the prefix cache's taps.** `INFERNIX_SPLIT_WALK`: `2` (the default) ends a split's
+  span at exact taps only (`walk_tap_due`, `prefix_tap_due(..., exact_only)`): the history ladder's
+  flexible taps, which ask for a call boundary rather than a split, are realized where the span ends
+  (`prefix_after_prefill_call` realizes every tap at or before the boundary), so a split's ladder
+  snapshots of a long prompt sit later than an unsplit Program's; `1` ends a span at every tap, as
+  one GPU does; `0` runs chunk-major. Each extra span costs the RTX PRO 4000's segment another pass
+  over its non-resident experts (~8 s of its link).
+- **Measured** (`bench_context_steps.py --step 50000`, one 63,487-token step in a 262K window, K = 28,
+  RTX PRO 4000 + RTX 5080, production flags): chunk-major 112.5 s to the first token (565 tok/s);
+  walking with every tap 43.1 s (4 spans, the ladder's taps at 32K, 48K and 56K; the first segment
+  8.3-11.2 s per span, link-bound below ~24K tokens); with exact taps only 24.1 s (2,631 tok/s, one
+  span: 18.7 s on the first segment, 5.2 s on the second). The 20-turn conversation's paste turns:
+  18.4 / 28.4 / 12.0 / 25.6 s to 9.6 / 12.9 / 11.3 / 9.8 s, every reply byte-identical.
 
 #### F5: QSA prompt attention on Tensor Cores
 

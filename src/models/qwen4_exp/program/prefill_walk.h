@@ -5,11 +5,13 @@
 // runs layer-major (every decoder layer over all of the span's chunks, then the next), so each
 // layer's non-resident experts are streamed once per span instead of once per call. The chunk grid,
 // and with it every output bit, is the chunk-major one. The span's residual stream [S*H, tokens] and
-// each chunk's staged io image live in the stream lease after the ring.
+// each chunk's staged io image live in the stream lease after the ring: on a layer split in every
+// segment's lease, at the same offsets (multi-GPU WP16).
 
 #include "core/arena.h"
 #include "models/qwen4_exp/execution/forward.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -32,6 +34,7 @@ struct WalkState {
         std::vector<std::optional<execution::VisionInput>> vision;
         std::vector<std::vector<execution::VisionInput>> mtp_vision;
         std::uint64_t steps = 0;
+        std::chrono::steady_clock::time_point began{}; // walk_begin (the span's debug report)
     } span;
     PinnedHostBuffer host{1}; // every chunk's io image, uploaded once per span
     // The next span's n-gram rows, read into host's chunk slots while the current span's steps run

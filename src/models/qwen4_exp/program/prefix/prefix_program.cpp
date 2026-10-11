@@ -846,7 +846,9 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
 
 // Whether prefix_after_prefill_call after the call that ends at calls[next_call - 1] would realize a
 // tap (the layer walk ends its span there: the capture needs that boundary's state in every layer).
-bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const {
+// `exact_only`: whether an exact tap is due there (a flexible tap's snapshot may move to a later
+// boundary, where prefix_after_prefill_call realizes it).
+bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call, bool exact_only) const {
     if (!prefix_.cache || !lane.prefix.reuse || lane.prefix.taps.empty() || next_call == 0 ||
         next_call >= lane.calls.size()) {
         return false;
@@ -855,6 +857,7 @@ bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const 
     if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return false; }
     const bool final_next = next_call + 1U == lane.calls.size();
     return std::any_of(lane.prefix.taps.begin(), lane.prefix.taps.end(), [&](const pc::PlannedTap& tap) {
+        if (exact_only) { return tap.placement == pc::TapPlacement::Exact && tap.position <= B; }
         return tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
     });
 }

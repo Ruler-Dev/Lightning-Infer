@@ -648,6 +648,7 @@ public:
             handoff_ = options_.handoff == SplitHandoff::Gate ? HandoffMode::Gate : HandoffMode::Event;
             split_sync_ = split_sync_from_environment();
             timing_.on  = split_timing_from_environment();
+            split_walk_ = split_walk_from_environment();
         }
         ple_segment_ = map.ple().index;
         const auto public_tokens = dim(parameters_.model.resources().public_token_count);
@@ -972,6 +973,8 @@ public:
             for (const auto& segment : segments_) {
                 const DeviceGuard on(segment->device->device);
                 CUDA_CHECK(cudaEventCreateWithFlags(&segment->compute_done.event, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreate(&segment->walk_first.event));
+                CUDA_CHECK(cudaEventCreate(&segment->walk_last.event));
             }
         }
         for (std::size_t s = 0; s < segments_.size(); ++s) {
@@ -1312,9 +1315,9 @@ public:
     // The segments by role (SegmentMap): the first embeds; the PLE segment computes the PLE and its
     // n-gram gate; the head (the last) runs the final mixer, the head, sampling, acceptance and the
     // MTP drafter and allocates the KV pages. whole() is the one segment of an unsplit Program, which
-    // runs every layer: the paths a split does not run yet (the layer walk, the SSD tier) reach the
-    // layers' state, KV, expert cache and Forward through it; on a split Program it throws
-    // std::logic_error, so such a path fails instead of running on segment 0 alone.
+    // runs every layer: the paths a split does not run yet (the SSD tier) reach the layers' state, KV,
+    // expert cache and Forward through it; on a split Program it throws std::logic_error, so such a
+    // path fails instead of running on segment 0 alone.
     DeviceSegment& first() noexcept { return *segments_.front(); }
     const DeviceSegment& first() const noexcept { return *segments_.front(); }
     DeviceSegment& head() noexcept { return *segments_.back(); }
@@ -1395,6 +1398,21 @@ public:
     }
     void before_restage() const {
         if (split_sync_) { synchronize(); }
+    }
+
+    // How a layer split's long prompts run (prefill_walk.cpp), INFERNIX_SPLIT_WALK (outputs are the
+    // same bits in every mode):
+    //   2 (the default) walks them layer-major on every segment (design §19.3.8 F4, multi-GPU WP16),
+    //     a span ending at exact prefix taps only: a flexible tap is realized where the span ends;
+    //   1 walks them with every tap ending a span, as an unsplit Program does;
+    //   0 keeps them chunk-major, every call crossing the segments in turn.
+    enum class SplitWalk : std::uint8_t { ChunkMajor = 0, EveryTap = 1, ExactTaps = 2 };
+    static SplitWalk split_walk_from_environment() {
+        const char* value = std::getenv("INFERNIX_SPLIT_WALK");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "2") == 0) { return SplitWalk::ExactTaps; }
+        if (std::strcmp(value, "1") == 0) { return SplitWalk::EveryTap; }
+        if (std::strcmp(value, "0") == 0) { return SplitWalk::ChunkMajor; }
+        throw std::invalid_argument(std::string("INFERNIX_SPLIT_WALK must be 0, 1 or 2, not '") + value + "'");
     }
 
     // Measurement knob INFERNIX_SPLIT_TIMING=1 (a split only): where a decode or verification
@@ -3978,8 +3996,19 @@ private:
             if (wide_frames >= lendable) { return false; }
             const std::uint32_t evicted = wide_frames + walk_frames;
             const std::uint32_t widened = std::min(E, most + (evicted + layers - 1) / layers);
-            const bool walk = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
-            const std::uint32_t half = walk ? widened : std::min(E, most + (wide_frames + layers - 1) / layers);
+            const bool full = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
+            // A split's segment whose lendable frames do not hold the walk area beside full halves
+            // (a 16 GB card at a long context, two segments sharing one GPU) squeezes the halves
+            // instead of giving up the walk: a layer's experts beyond its half are staged per chunk,
+            // as any miss, and the rest still cross the link once per span. Without the walk, every
+            // call of the prompt would stream all of them on every segment.
+            const std::uint32_t room = lendable > wide_frames + walk_frames ? lendable - wide_frames - walk_frames : 0U;
+            const bool squeezed      = walk_frames > 0 && !full && segments_.size() > 1 && room >= 2 * kStreamHalfMin + 1 &&
+                                  seg.expert_stream->slots_in(static_cast<std::size_t>(room) * stride) >= 2 * kStreamHalfMin;
+            const bool walk          = full || squeezed;
+            const std::uint32_t half = full       ? widened
+                                       : squeezed ? std::min(widened, (room - 1) / 2)
+                                                  : std::min(E, most + (wide_frames + layers - 1) / layers);
             const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
             if (half == 0 || seg.expert_stream->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
                 return false;
@@ -3993,6 +4022,13 @@ private:
             seg.stream_at_lease     = seg.expert_stream->stats();
             seg.split_at_lease      = seg.forward->split_stats();
             seg.prefetched_at_lease = walk_.prefetched_chunks;
+            diagnostic(segment_name(seg) + "prefill stream lease: " + std::to_string(seg.stream_lease.count) +
+                           " of " + std::to_string(seg.residency->frames()) + " frames (ring " + std::to_string(ring) +
+                           " for halves of " + std::to_string(half) + ", the most non-resident experts of a layer " +
+                           std::to_string(most) + "; wide arena " + std::to_string(wide_frames) + "; walk area " +
+                           std::to_string(walk ? walk_frames : 0U) +
+                           (walk_frames > 0 && !walk ? " (not lendable)" : squeezed ? ", the halves squeezed" : "") + ")",
+                       DiagnosticLevel::Debug);
         }
         return true;
     }
@@ -5538,10 +5574,22 @@ private:
     std::size_t walk_span_end(const Lane& lane, std::uint32_t index);
     void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
     PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
+    // The segment that runs decoder layer `layer` (the whole model's without a split).
+    [[nodiscard]] DeviceSegment& layer_segment(std::uint32_t layer);
+    // Chunk c's staged io image in `seg`'s walk area, after the span's residual.
+    [[nodiscard]] std::byte* walk_slot(const DeviceSegment& seg, std::size_t chunk) const noexcept;
+    void walk_upload(DeviceSegment& seg, std::size_t chunk, const std::byte* host_slot);
     void walk_pass(std::size_t chunk, std::uint32_t layer);
+    // An eager walk batch over chunk c's io image in `seg`'s walk area.
+    [[nodiscard]] execution::ForwardBatch walk_batch(const DeviceSegment& seg, std::size_t chunk);
     void walk_enqueue(std::uint32_t to_layer);
+    void walk_report(Clock::time_point began) noexcept;
     void walk_abandon() noexcept;
-    [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call) const;
+    // `exact_only`: only an exact tap (a planned call end) is due; flexible taps wait for a later boundary.
+    [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call, bool exact_only = false) const;
+    // Whether a layer walk's span ends at calls[next_call - 1] for a tap (prefix_tap_due; a split in
+    // SplitWalk::ExactTaps ends its spans at exact taps only).
+    [[nodiscard]] bool walk_tap_due(const Lane& lane, std::size_t next_call) const;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 
@@ -5667,6 +5715,7 @@ private:
     HandoffMode handoff_            = HandoffMode::Event;
     std::uint32_t handoff_sequence_ = 0;
     bool split_sync_                = false;
+    SplitWalk split_walk_           = SplitWalk::ExactTaps; // INFERNIX_SPLIT_WALK (a split only)
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

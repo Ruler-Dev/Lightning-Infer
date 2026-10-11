@@ -248,6 +248,10 @@ struct DeviceSegment {
     DeviceBuffer handoff_stats;
     // INFERNIX_SPLIT_TIMING: timing events around its share of a round (ProgramImpl::SplitTiming).
     SegmentEvent timing_begin, timing_end;
+    // A split's layer walk: recorded before the segment's first pass of a span and after its last,
+    // for the span's debug report (ProgramImpl::walk_report).
+    SegmentEvent walk_first, walk_last;
+
 
     // ---- the Forward and its CUDA graph families ----
     std::unique_ptr<execution::Forward> forward;

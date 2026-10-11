@@ -388,9 +388,17 @@ Prefill, forced tokens (an injected thinking-close control) and decoding run acr
 plain decode rounds and, with `--spec mtp` or n-gram drafts, the drafter on `B` and verification
 rounds. Their logits and greedy output are the unsplit run's bit for bit when both GPUs use the
 same launch decompositions (`--devices A,A`, or two different GPUs with
-[`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls run
-chunk by chunk on `A`, then on `B` (each GPU streams its own layers' experts per chunk, so long
-prompts prefill slower than on one GPU, most on a slow `A` link). A round runs `A`'s layers, then
+[`INFERNIX_NUMERICS_SMS`](#numerics-sm-count) at the smaller one's SM count). A prompt's calls of
+256 tokens or more run as a layer walk on both GPUs: `A` runs each of its layers over every call
+of a span (up to 64K tokens), then the span's hidden state crosses to `B`, which runs its layers
+the same way, so each GPU streams its layers' non-resident experts once per span instead of once
+per call. A span ends at the prefix cache's exact snapshots (a client breakpoint, the end of the system block, the generation opener):
+the history ladder's snapshots, which one GPU takes at call boundaries inside a long prompt, are
+taken where the span ends instead, since each extra span costs a slow-link `A` another pass over
+its experts. A single call, and narrower calls (an opener's few tokens), run on `A`, then on `B`.
+The bits are those of the call-by-call prefill. Measurement knobs, the same outputs:
+`INFERNIX_SPLIT_WALK=1` ends a span at every snapshot as one GPU does, `INFERNIX_SPLIT_WALK=0` runs
+every call on `A`, then on `B`. A round runs `A`'s layers, then
 `B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` (the default) orders `B`
 after `A` with a cross-device event; `gate` lets `B` start at once and wait on the GPU, bounded
 by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a recoverable
