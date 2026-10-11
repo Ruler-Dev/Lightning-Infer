@@ -3236,7 +3236,16 @@ As built, which differs from §11.2 where noted:
 - **Graphs.** The K-step chain is one CUDA graph per batch size and the catch-up one per
   (batch, width), as for verification.
 - **N-gram proposals** stay available beside MTP: a longer copy proposal replaces a round's MTP
-  drafts.
+  drafts. A round whose every drafting row verifies a copy runs no MTP draft steps (multi-GPU
+  wave 5): the drafter then only writes an unwritten pending cell, and the round stages its rows'
+  n-gram rows itself. The steps' K/V writes were speculative cells inside the verified window,
+  which the commit's catch-up rewrites, so the drafter's state and every token are unchanged.
+  Measured on the code-agent conversation (`bench_code_agent.py`: 10 files of the engine, each
+  pasted and rewritten whole with a change, then rewritten again with a fix, thinking off; 20 turns,
+  43K tokens final) on an RTX PRO 4000 + RTX 5080 split at K = 28: MTP alone 92.8 tok/s over the
+  second half (90.6 over all turns, 84 % of rounds at 5 columns), MTP with
+  `--ngram-draft-tokens 7` 105.7 (99.5), byte-identical replies; 76 % of the rounds verified
+  8-column copies (74 ms each, 97-99 % accepted) and skipped the draft steps' 2.2 ms.
 
 **First results** (dense8m, INT8 KV, C = 1, greedy, cold-cache CLI, K = 3, text head). Greedy
 token ids equal plain decode on both prompts (300 and 200 tokens); `resident_moe_experts` and

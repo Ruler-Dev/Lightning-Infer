@@ -2456,6 +2456,19 @@ public:
             }
             width = std::max(width, 1 + extents[b]);
         }
+        // A round whose every drafting row verifies an n-gram copy proposal instead runs no MTP
+        // draft steps, whose drafts it would discard: the drafter then only writes an unwritten
+        // pending cell (as a round without drafts does), and the round stages its rows' n-gram
+        // rows itself. The steps' K/V writes are speculative cells inside the verified window,
+        // which the commit's catch-up rewrites, so the drafter's state and every token are
+        // unchanged; such a round saves the steps' time (about 2 ms of a 25 ms split round).
+        if (steps > 0) {
+            bool copies_only = true;
+            for (std::int32_t b = 0; b < batch; ++b) {
+                if (wanted[b] > 0 && !from_ngram_[b]) { copies_only = false; }
+            }
+            if (copies_only) { steps = 0; }
+        }
         // Columns of each verification row whose n-gram rows are already staged: the drafter's
         // wait reads every committed-token column (the anchor's) and all of a copy row's.
         std::array<std::int32_t, kMaximumConcurrency> staged{};
