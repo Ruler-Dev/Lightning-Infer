@@ -119,7 +119,9 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   code-agent conversation (each file pasted, rewritten whole with a change, then rewritten again
   with a fix; 20 turns, 43K tokens, RTX PRO 4000 + RTX 5080 at `K = 28`) decode rose from 92.8 to
   105.7 tok/s over the second half (90.6 to 99.5 over all turns), with byte-identical replies:
-  76 % of its rounds verified 8-column copies, 97-99 % accepted. Seven drafts are the most that
+  76 % of its rounds verified 8-column copies, 97-99 % accepted; on the 20-turn conversation
+  benchmark (prose and pasted engine files) it gave 80.8 against 81.4 tok/s, within the runs'
+  spread, with the same replies. Seven drafts are the most that
   keep a round at 8 columns, on the column-invariant dense routes, so it gives plain decode's
   tokens. See [ngram copy proposals](ngram.md).
 - `--max-concurrency N` (1-8) runs up to N requests at once. Its main gain is a shorter wait for

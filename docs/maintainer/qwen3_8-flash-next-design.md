@@ -2557,6 +2557,12 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   tokens per round), so verifying a draft pays from about 0.43 acceptance, near the 0.5 draft-head
   probability below which a one-row round stops verifying (`kDraftMinLogprob`, kept).
   `INFERNIX_WIDTH_COST=X` (a measurement knob) replaces `kWidthCost`.
+  Tried and not kept (multi-GPU wave 5): leaving a commit's cache update to the next round's
+  decode, run while the head drafts (the head's table upload and promotions on a stream of their
+  own, which its compute stream waited for before its next round), cut the commit from 0.28 to
+  0.13 ms and the drafter's idle gap from 0.15 to 0.04 ms, but launch to sync grew by 0.09 ms:
+  rounds of 22.20 against 22.27 ms, 81.7 against 81.4 tok/s over the conversation's second half,
+  the same replies, within the runs' spread for an update path every entry point had to settle.
   A split's segments apply their link's policy (`derive_link_policy`): on a slow link (below
   8 GB/s; the RTX PRO 4000's PCIe 3.0 x4 at 3.1 GB/s) a segment's CPU port takes up to 32 jobs per
   layer call besides keeping only misses / 19 on the link, and the warm start seeds every frame
@@ -3272,6 +3278,11 @@ As built, which differs from §11.2 where noted:
   second half (90.6 over all turns, 84 % of rounds at 5 columns), MTP with
   `--ngram-draft-tokens 7` 105.7 (99.5), byte-identical replies; 76 % of the rounds verified
   8-column copies (74 ms each, 97-99 % accepted) and skipped the draft steps' 2.2 ms.
+  Against the build before that change (gate handoff on both): 100.7 tok/s over the second half
+  (95.4 aggregate), whose 8-column copy rounds still ran 2.1 draft steps (4.1 ms, a 73.6 ms
+  period against 69.6), and 106.7 (100.4) after it, with the same replies. On the 20-turn
+  conversation benchmark (prose and pasted engine files, ~50K tokens) the copies gave 80.8 against
+  81.4 tok/s over the second half, within the runs' spread, with the same replies.
 
 **First results** (dense8m, INT8 KV, C = 1, greedy, cold-cache CLI, K = 3, text head). Greedy
 token ids equal plain decode on both prompts (300 and 200 tokens); `resident_moe_experts` and
