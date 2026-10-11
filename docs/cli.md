@@ -392,13 +392,17 @@ same launch decompositions (`--devices A,A`, or two different GPUs with
 256 tokens or more run as a layer walk on both GPUs: `A` runs each of its layers over every call
 of a span (up to 64K tokens), then the span's hidden state crosses to `B`, which runs its layers
 the same way, so each GPU streams its layers' non-resident experts once per span instead of once
-per call. A span ends at the prefix cache's exact snapshots (a client breakpoint, the end of the system block, the generation opener):
-the history ladder's snapshots, which one GPU takes at call boundaries inside a long prompt, are
-taken where the span ends instead, since each extra span costs a slow-link `A` another pass over
-its experts. A single call, and narrower calls (an opener's few tokens), run on `A`, then on `B`.
-The bits are those of the call-by-call prefill. Measurement knobs, the same outputs:
-`INFERNIX_SPLIT_WALK=1` ends a span at every snapshot as one GPU does, `INFERNIX_SPLIT_WALK=0` runs
-every call on `A`, then on `B`. A round runs `A`'s layers, then
+per call. `B` also computes `A`'s MoE during `A`'s part of the span (the MoE offload): per layer
+`A` sends the MoE input and the routing (5 KiB per token), `B` runs the routed experts and the
+shared expert and sends the combined output back (5 KiB per token), so `A` streams no expert over
+its link and a single call is walked too; `B` streams `A`'s experts over its own link. A span ends
+at the prefix cache's snapshots, as on one GPU, so a split takes the same snapshots. Narrower
+calls (an opener's few tokens) run on `A`, then on `B`. The bits are those of the call-by-call
+prefill. Measurement knobs, the same outputs: `INFERNIX_SPLIT_MOE_OFFLOAD=0` keeps `A`'s experts
+on `A` (which then streams them, once per span), `INFERNIX_SPLIT_WALK=2` ends a span at exact
+snapshots only (a client breakpoint, the end of the system block, the generation opener; the
+history ladder's snapshots inside a long prompt are taken where the span ends, or not at all),
+`INFERNIX_SPLIT_WALK=0` runs every call on `A`, then on `B`. A round runs `A`'s layers, then
 `B`'s, each GPU replaying its own CUDA graphs: `--split-handoff event` (the default) orders `B`
 after `A` with a cross-device event; `gate` lets `B` start at once and wait on the GPU, bounded
 by `--handoff-timeout-ms` (a round whose state does not arrive in time fails with a recoverable

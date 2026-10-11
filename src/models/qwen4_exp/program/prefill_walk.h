@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <vector>
 
@@ -35,6 +36,11 @@ struct WalkState {
         std::vector<std::vector<execution::VisionInput>> mtp_vision;
         std::uint64_t steps = 0;
         std::chrono::steady_clock::time_point began{}; // walk_begin (the span's debug report)
+        // The MoE offload (walk_offload_layers): fronts whose backs are not enqueued yet, oldest
+        // first (layer, chunk), carried from one step to the next, and the fronts enqueued so far
+        // (the staging slots' rotation).
+        std::deque<std::pair<std::uint32_t, std::size_t>> pending;
+        std::uint64_t fronts = 0;
     } span;
     PinnedHostBuffer host{1}; // every chunk's io image, uploaded once per span
     // The next span's n-gram rows, read into host's chunk slots while the current span's steps run

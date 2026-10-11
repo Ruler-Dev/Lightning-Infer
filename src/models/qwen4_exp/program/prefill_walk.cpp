@@ -26,11 +26,27 @@
 // layers' experts. On two segments of one GPU their kernels never overlap (SegmentWork). A 3.1 GB/s
 // x4 segment streams each non-resident expert once per span instead of once per 4,096-token call,
 // which bounded its chunk-major prefill (~7 s of link per call at K = 28).
+//
+// MoE offload (multi-GPU WP23, a split of two segments): the first segment's MoE runs on the second,
+// which streams the routed experts over its own link while it would otherwise wait for its part of
+// the span. Per layer and chunk the first segment runs the layer up to the MoE's input and its
+// routing (Forward::layer_front), its boundary crossing carries those (~5 KiB per column) to the
+// second segment, whose Forward::moe_remote runs the dispatch, the routed experts, the shared expert
+// (a copy of the layer's projections in the second segment's walk area) and the combine, and the
+// result (5 KiB per column) comes back for Forward::layer_back. The units pipeline (the first
+// segment fronts the rest of a layer's chunks while a chunk's experts run on the second), and side
+// streams carry every copy, so neither compute stream waits for a link. The first segment then
+// streams no expert at all (its lease holds no ring), and a span of one call is worth walking. Its
+// link (one copy engine for both directions on these GPUs under WDDM) carries ~10 KiB per column
+// and layer, which bounds the first part of a long span with the first segment's compute. The bits
+// are layer()'s: the same kernels see the same inputs.
 
 #include "models/qwen4_exp/program/program_impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <deque>
 #include <stdexcept>
 
 namespace infernix::models::qwen4_exp::detail {
@@ -54,16 +70,59 @@ DeviceSegment& ProgramImpl::layer_segment(std::uint32_t layer) {
     throw std::out_of_range("Qwen4Exp: no segment runs layer " + std::to_string(layer));
 }
 
-// Each span costs a split a pass over its slowest segment's non-resident experts (~8 s of a 3.1 GB/s
-// x4 link at K = 28, against ~2 s for a 27.6 GB/s x8 GPU alone), so on a split (SplitWalk::ExactTaps)
-// only an exact tap ends a span: a flexible one (a history ladder tap, which asks for a call
-// boundary, not a split) is realized where the span ends instead.
+// Every tap ends a span, as on one GPU, so a split takes the unsplit Program's snapshots. The
+// measurement knob SplitWalk::ExactTaps ends a split's span at exact taps only: a flexible one (a
+// history ladder tap, which asks for a call boundary, not a split) is realized where the span ends,
+// saving each extra span's fixed cost (the rings' first layers, the offload's pipeline filling).
 bool ProgramImpl::walk_tap_due(const Lane& lane, std::size_t next_call) const {
     return prefix_tap_due(lane, next_call, segments_.size() > 1 && split_walk_ == SplitWalk::ExactTaps);
 }
 
 std::byte* ProgramImpl::walk_slot(const DeviceSegment& seg, std::size_t chunk) const noexcept {
     return walk_area(seg) + walk_.span.residual_bytes + chunk * walk_.span.io_stride;
+}
+
+namespace {
+
+// The MoE offload's copies (walk_offload_layers). These GPUs have one copy engine each under WDDM,
+// which runs a device's copies in the order they were enqueued: a copy enqueued before its input is
+// ready holds every later one of that device, whatever its stream (measured: an upload of a chunk's
+// result enqueued right after its experts kept the first segment's link idle while they ran).
+//
+// Staging slots of the first segment: a chunk's MoE inputs wait in one until its side stream has
+// sent them, while the compute stream fronts the next chunks.
+constexpr std::size_t kOffloadSlots = 8;
+// The crossings' pinned rings, of 16 MiB pieces: the inputs (~20 MiB per 4,096-token chunk) can run
+// ahead of the second segment by several chunks; the results ride kResultLag + 1 chunks deep.
+constexpr std::size_t kCrossingPiece  = 16ULL << 20;
+constexpr std::uint32_t kInputPieces  = 16;
+constexpr std::uint32_t kResultPieces = 8;
+// A chunk's result is uploaded to the first segment after the next kResultLag chunks' inputs were
+// downloaded there, by when it has normally arrived, but at least two chunks before its back needs
+// it (a span of n chunks: n - 2 at most). 16K tokens (n = 4): 2,875 tok/s uploading each at once,
+// 3,275 one chunk later, 3,406 two later; with the paced ring copies below, 3,621-3,646 two later
+// against 2,987-3,031 three later.
+constexpr std::size_t kResultLag = 2;
+// The second segment's ring copies of the first segment's layers: in runs of at most this, enqueued
+// in shares over the chunks of the layer before (ExpertStream::set_paced), so a layer's 1.35 GB do
+// not hold the crossings for ~50 ms (16K tokens: 3,525 tok/s copied at once, 3,640 paced).
+constexpr std::size_t kRemoteRun = 64ULL << 20;
+
+} // namespace
+
+// The bytes of one chunk's MoE inputs (x, routing ids, weights, shared gate) at `columns`.
+std::size_t ProgramImpl::offload_input_bytes(std::size_t columns) const noexcept {
+    const std::size_t H = c_.hidden_size, K = c_.moe.top_k;
+    return walk_align(2 * H * columns) + 2 * walk_align(4 * K * columns) + walk_align(4 * columns);
+}
+
+// The MoE offload's part of the first segment's walk area, after the span's io images: per chunk
+// the result of its routed experts (BF16 [H, chunk]), then per chunk its inject (FP32 [S, chunk]),
+// then the staging slots of its MoE inputs.
+std::size_t ProgramImpl::offload_bytes(std::size_t chunks) const noexcept {
+    const auto columns = static_cast<std::size_t>(chunk_);
+    return chunks * (walk_align(2ULL * c_.hidden_size * columns) + walk_align(4ULL * c_.hc.streams * columns)) +
+           kOffloadSlots * offload_input_bytes(columns);
 }
 
 execution::ForwardBatch ProgramImpl::walk_batch(const DeviceSegment& seg, std::size_t c) {
@@ -82,12 +141,106 @@ execution::ForwardBatch ProgramImpl::walk_batch(const DeviceSegment& seg, std::s
     return fb;
 }
 
+void ProgramImpl::prepare_moe_offload() {
+    DeviceSegment& a = *segments_[0];
+    DeviceSegment& b = *segments_[1];
+    moe_bulk_.push_back(std::make_unique<BulkHandoff>(a.device->device, b.device->device, kCrossingPiece, kInputPieces));
+    a.moe_out = moe_bulk_.back().get();
+    moe_bulk_.push_back(std::make_unique<BulkHandoff>(b.device->device, a.device->device, kCrossingPiece, kResultPieces));
+    a.moe_back = moe_bulk_.back().get();
+    for (DeviceSegment* seg : {&a, &b}) {
+        const DeviceGuard on(seg->device->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&seg->side.stream, cudaStreamNonBlocking));
+    }
+    {
+        const DeviceGuard on(a.device->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&a.side.out, cudaStreamNonBlocking));
+        for (auto* list : {&a.side.staged, &a.side.sent}) {
+            for (std::size_t k = 0; k < kOffloadSlots; ++k) {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                list->push_back(event);
+            }
+        }
+    }
+    const LayerRange layers           = a.spec.layers;
+    const std::uint32_t E             = c_.moe.experts;
+    const std::uint64_t record_stride = a.plan.record_stride;
+    std::vector<ops::offloaded_moe::ExpertScales> scales(static_cast<std::size_t>(layers.size()) * E);
+    {
+        const DeviceGuard on(a.device->device);
+        for (std::uint32_t l = layers.begin; l < layers.end; ++l) {
+            const auto& moe = a.parameters->layers[l].moe;
+            b.remote_records.push_back(reinterpret_cast<const std::uint8_t*>(moe.bank->planes.records));
+            CUDA_CHECK(cudaMemcpy(scales.data() + static_cast<std::size_t>(l - layers.begin) * E, moe.device_scales,
+                                  E * sizeof(ops::offloaded_moe::ExpertScales), cudaMemcpyDeviceToHost));
+        }
+    }
+    // The layers' shared-expert projections: each parent's bytes (the Weight's planes lie in it),
+    // aligned in one pinned image, and Weights pointing into the image.
+    {
+        std::vector<const execution::LinearParameters*> sources;
+        for (std::uint32_t l = layers.begin; l < layers.end; ++l) {
+            const auto& moe = a.parameters->layers[l].moe;
+            sources.push_back(&moe.shared_gate_up);
+            sources.push_back(&moe.shared_down);
+        }
+        std::vector<std::size_t> offsets;
+        std::size_t bytes = 0;
+        for (const auto* p : sources) {
+            const Weight& w = p->weight;
+            if (w.payload == nullptr || w.payload_bytes == 0) {
+                throw std::logic_error("Qwen4Exp MoE offload: a shared expert projection has no payload");
+            }
+            offsets.push_back(bytes);
+            bytes += walk_align(w.payload_bytes);
+        }
+        b.remote_shared_host  = std::make_unique<PinnedHostBuffer>(bytes);
+        b.remote_shared_bytes = bytes;
+        auto* image           = static_cast<std::byte*>(b.remote_shared_host->data());
+        const DeviceGuard on(a.device->device);
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+            const Weight& w = sources[i]->weight;
+            CUDA_CHECK(cudaMemcpy(image + offsets[i], w.payload, w.payload_bytes, cudaMemcpyDeviceToHost));
+            const auto* begin = static_cast<const std::byte*>(w.payload);
+            const auto moved  = [&](const void* p) -> const void* {
+                if (p == nullptr) { return nullptr; }
+                const auto* q = static_cast<const std::byte*>(p);
+                if (q < begin || q >= begin + w.payload_bytes) {
+                    throw std::logic_error("Qwen4Exp MoE offload: a shared expert plane lies outside its parent");
+                }
+                return image + offsets[i] + (q - begin);
+            };
+            execution::LinearParameters copy = *sources[i];
+            copy.weight.payload = image + offsets[i];
+            copy.weight.qdata   = moved(w.qdata);
+            copy.weight.qhigh   = moved(w.qhigh);
+            copy.weight.scales  = moved(w.scales);
+            b.remote_shared.push_back(copy);
+        }
+    }
+    const DeviceGuard on(b.device->device);
+    b.remote_scales = DeviceBuffer(scales.size() * sizeof(ops::offloaded_moe::ExpertScales));
+    CUDA_CHECK(cudaMemcpy(b.remote_scales.p, scales.data(), scales.size() * sizeof(ops::offloaded_moe::ExpertScales),
+                          cudaMemcpyHostToDevice));
+    b.remote_frames = DeviceBuffer(E * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemset(b.remote_frames.p, 0xFF, E * sizeof(std::int32_t))); // -1: none resident
+    b.remote_table.assign(static_cast<std::size_t>(layers.size()) * E, -1);
+    execution::ExpertStream::RecordOf record_of = [records = b.remote_records, record_stride](std::uint32_t layer,
+                                                                                            std::uint32_t expert) {
+        return records[layer] + static_cast<std::size_t>(expert) * record_stride;
+    };
+    b.remote_stream = std::make_unique<execution::ExpertStream>(layers.size(), E, record_stride, std::move(record_of),
+                                                                /*one_allocation=*/true);
+    b.remote_stream->set_paced(kRemoteRun);
+}
+
 // The exclusive end of the span that starts at lane.next_call; lane.next_call when the call runs
 // chunk-major. Lends each segment's stream lease (with the walk's area) when none is held, or lends
 // it again with the area when the held one has none for the span (another lane's chunk-major calls
 // lent it). Another prefilling lane waits while the span runs (context_blocks), so two long prompts
 // walk span by span instead of both re-streaming every expert per call. A split's span is as long
-// as every segment's area allows, and ends at exact taps only (walk_tap_due); INFERNIX_SPLIT_WALK=0
+// as every segment's area allows, and ends at the prefix taps (walk_tap_due); INFERNIX_SPLIT_WALK=0
 // keeps a split's prompts chunk-major.
 std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     const std::size_t first = lane.next_call;
@@ -108,11 +261,23 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         tokens.push_back(total);
         if (walk_tap_due(lane, end)) { break; }
     }
-    if (end - first < 2) { return first; }
-    for (const auto& segment : segments_) {
-        DeviceSegment& seg = *segment;
+    // With the MoE offload one call is worth a span: the first segment's experts run on the second.
+    const std::size_t least = moe_offload_ ? 1 : 2;
+    if (end - first < least) { return first; }
+    for (std::size_t s = 0; s < segments_.size(); ++s) {
+        DeviceSegment& seg = *segments_[s];
         const SegmentWork on(*this, seg);
-        if (seg.stream_lease.valid() && walk_bytes(tokens[2], 2) > seg.stream_walk_bytes) {
+        // The offload's first segment streams nothing (no ring) and keeps its experts' results in
+        // its area; its second streams the first one's layers through its ring, every expert of a
+        // layer at once, and holds their shared experts in its area.
+        const bool front     = moe_offload_ && s == 0;
+        const auto area_of   = [&](std::uint32_t tokens, std::size_t chunks) {
+            return walk_bytes(tokens, chunks) + (front ? offload_bytes(chunks) : 0) +
+                   (moe_offload_ && s == 1 ? seg.remote_shared_bytes : 0);
+        };
+        const std::size_t probe = std::min<std::size_t>(least == 1 ? 1 : 2, end - first);
+        if (seg.stream_lease.valid() &&
+            (area_of(tokens[probe], probe) > seg.stream_walk_bytes || (front && seg.stream_ring_bytes > 0))) {
             // Between calls nothing reads the lease; its frames go back and come out again with the area.
             return_stream_lease(seg);
         }
@@ -121,14 +286,13 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
             // of the configured chunk, plus a remainder call.
             const std::uint32_t remaining = std::min(lane.prefill_end - lane.state_tokens, kWalkMaxTokens);
             const std::size_t chunks      = remaining / static_cast<std::uint32_t>(chunk_) + 2;
-            if (!stream_chunk(seg, static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
-                              walk_bytes(remaining, chunks))) {
-                return first;
-            }
+            stream_chunk(seg, static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens), area_of(remaining, chunks),
+                         /*ring_wanted=*/!front, moe_offload_ && s == 1 ? c_.moe.experts : 0U);
+            if (!seg.stream_lease.valid() || (!front && seg.stream_ring_bytes == 0)) { return first; }
         }
-        while (end - first >= 2 && walk_bytes(tokens[end - first], end - first) > seg.stream_walk_bytes) { --end; }
+        while (end - first >= least && area_of(tokens[end - first], end - first) > seg.stream_walk_bytes) { --end; }
     }
-    return end - first >= 2 ? end : first;
+    return end - first >= least ? end : first;
 }
 
 // Chunk c's io image (staged at `host_slot`) into `seg`'s walk area on its stream: all of it to the
@@ -189,12 +353,39 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         if (t.data != nullptr) { t.data = rebase(t.data, seg, c); }
         return t;
     };
-    for (const auto& segment : segments_) {
-        DeviceSegment& seg = *segment;
+    for (std::size_t s = 0; s < segments_.size(); ++s) {
+        DeviceSegment& seg = *segments_[s];
         const SegmentWork on(*this, seg);
         if (segments_.size() > 1) { CUDA_CHECK(cudaEventRecord(seg.walk_first.event, seg.device->stream)); }
         seg.residency->before_round(seg.device->stream);
-        seg.expert_stream->begin(ring_span(seg), seg.residency->host_table(), seg.device->stream);
+        if (!moe_offload_) {
+            seg.expert_stream->begin(ring_span(seg), seg.residency->host_table(), seg.device->stream);
+        } else if (s == 1) {
+            // The first segment's layers through this ring until its part ends (walk_offload_cross),
+            // and their shared experts into the area after the span's io images.
+            seg.remote_stream->begin(ring_span(seg), seg.remote_table.data(), seg.device->stream);
+            std::byte* shared = walk_slot(seg, n);
+            CUDA_CHECK(cudaMemcpyAsync(shared, seg.remote_shared_host->data(), seg.remote_shared_bytes,
+                                       cudaMemcpyHostToDevice, seg.device->stream));
+            const auto* image = static_cast<const std::byte*>(seg.remote_shared_host->data());
+            const auto moved  = [&](const void* p) -> const void* {
+                return p == nullptr ? nullptr : shared + (static_cast<const std::byte*>(p) - image);
+            };
+            seg.remote_shared_bound = seg.remote_shared;
+            for (auto& p : seg.remote_shared_bound) {
+                p.weight.payload = moved(p.weight.payload);
+                p.weight.qdata   = moved(p.weight.qdata);
+                p.weight.qhigh   = moved(p.weight.qhigh);
+                p.weight.scales  = moved(p.weight.scales);
+            }
+        }
+        if (moe_offload_) {
+            while (seg.side.events.size() < n) {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                seg.side.events.push_back(event);
+            }
+        }
     }
     DeviceSegment& embedder = layer_segment(0);
     for (std::size_t c = 0; c < n; ++c) {
@@ -239,12 +430,22 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
             walk_.span.vision[c] =
                 execution::VisionInput{vision->embeddings, rebase_tensor(vision->columns, first(), c)};
         }
-        // The chunk's embedding and first layer run while the host stages the next chunk.
+        // The chunk's embedding and first layer run while the host stages the next chunk; with the
+        // MoE offload the embedding alone (its layers pipeline over the span's chunks).
         const SegmentWork on(*this, embedder);
         const WideWork wide(*this, embedder, w);
-        walk_pass(c, 0);
+        if (moe_offload_) {
+            execution::ForwardBatch fb = walk_batch(embedder, c);
+            Tensor residual(walk_area(embedder) + 2ULL * static_cast<std::size_t>(width_) *
+                                                      static_cast<std::size_t>(walk_.span.offsets[c]),
+                            DType::BF16, {width_, w});
+            embedder.forward->begin_call(fb, nullptr);
+            embedder.forward->embed(fb, residual);
+        } else {
+            walk_pass(c, 0);
+        }
     }
-    walk_.span.next_layer = 1;
+    walk_.span.next_layer = moe_offload_ ? 0 : 1;
     walk_.prefetch        = WalkState::WalkPrefetch{}; // consumed; the slots now hold this span's chunks
     ++walk_.spans_run;
     walk_.calls_run += n;
@@ -328,7 +529,7 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
     if (l == 0) { seg.forward->embed(fb, residual); }
     seg.forward->layer(l, fb, residual);
     if (l + 1 == L) { seg.forward->finish(fb, residual, logits_here ? &logits : nullptr); }
-    if (l + 1 == seg.spec.layers.end && !seg.spec.head) {
+    if (l + 1 == seg.spec.layers.end && !seg.spec.head && !moe_offload_) {
         // The boundary: chunk c's residual columns into the next segment's walk residual, at the
         // same columns; the receiver's first layer of chunk c is ordered after them.
         DeviceSegment& next = *segments_[seg.spec.index + 1];
@@ -336,6 +537,216 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
                                walk_area(next) + column_bytes * static_cast<std::size_t>(walk_.span.offsets[c]),
                                residual.bytes(), seg.device->stream, next.device->stream);
     }
+}
+
+namespace {
+
+// Submits a stream's queued work without waiting (the batched driver model holds it until then).
+void submit(cudaStream_t stream) {
+    const cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+        return;
+    }
+    CUDA_CHECK(status);
+}
+
+} // namespace
+
+// Layers [from, to) of the first segment over the span's chunks, their MoE on the second (the MoE
+// offload): per layer l and chunk c, the first segment's front (Forward::layer_front), its four
+// tensors copied into a staging slot and sent from there by its side stream through moe_out (one
+// run) into chunk c's columns of the second segment's walk residual (unused until the crossing),
+// received on the second segment's side stream; the second segment's moe_remote once they landed
+// and its result sent through moe_back on its compute stream, uploaded into the first segment's
+// area on that one's side stream only after the next chunks' inputs were downloaded (kResultLag of
+// them, fewer in a short span; a device's copies run in the order they were enqueued); then a share
+// of the ring's next layer. The first segment's back (Forward::layer_back) comes as late as it can:
+// just before chunk c's front of layer l + 1 (it reads chunk c's residual), so a layer's other
+// fronts run while chunk c's experts and its two crossings do; a step's last backs wait for the next
+// step's fronts. A chunk's front needs layer l's state after the earlier chunks' fronts and its own
+// residual, nothing of another chunk's back, so the order changes no bit. Neither compute stream
+// carries a copy over the first segment's link (its 20 MiB of inputs per 4,096-token chunk take
+// ~6.5 ms at 3.1 GB/s, the 20 MiB result as long). On one GPU the two segments' kernels never
+// overlap (SegmentWork), so each step waits for the other's.
+void ProgramImpl::walk_offload_layers(std::uint32_t from, std::uint32_t to, std::int32_t widest) {
+    DeviceSegment& a               = *segments_[0];
+    DeviceSegment& b               = *segments_[1];
+    const std::size_t n            = walk_.span.widths.size();
+    const std::uint32_t E          = c_.moe.experts;
+    const auto H                   = static_cast<std::int32_t>(c_.hidden_size);
+    const auto K                   = static_cast<std::int32_t>(c_.moe.top_k);
+    const auto S                   = static_cast<std::int32_t>(c_.hc.streams);
+    const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(width_);
+    // The first segment's part of its walk area (offload_bytes), after the span's io images.
+    const std::size_t y_stride      = walk_align(2ULL * c_.hidden_size * static_cast<std::size_t>(chunk_));
+    const std::size_t inject_stride = walk_align(4ULL * c_.hc.streams * static_cast<std::size_t>(chunk_));
+    const std::size_t slot_bytes    = offload_input_bytes(static_cast<std::size_t>(chunk_));
+    std::byte* results              = walk_slot(a, n);
+    std::byte* staging_slots        = results + n * (y_stride + inject_stride);
+    // A share of the ring's next layer per chunk (ExpertStream::pump), and the results' lag.
+    const std::size_t pace       = (static_cast<std::size_t>(b.remote_stream->half()) * a.plan.record_stride + n - 1) / n;
+    const std::size_t result_lag = n > 2 ? std::min(kResultLag, n - 2) : 0;
+    const auto residual_of          = [&](std::size_t c) {
+        return Tensor(walk_area(a) + column_bytes * static_cast<std::size_t>(walk_.span.offsets[c]), DType::BF16,
+                      {width_, walk_.span.widths[c]});
+    };
+    const auto y_of = [&](std::size_t c) {
+        return Tensor(results + c * y_stride, DType::BF16, {H, walk_.span.widths[c]});
+    };
+    const auto inject_of = [&](std::size_t c) {
+        return Tensor(results + n * y_stride + c * inject_stride, DType::FP32, {S, walk_.span.widths[c]});
+    };
+    // Results sent by the second segment whose uploads to the first are not enqueued yet, oldest
+    // first: (layer, chunk, pieces).
+    struct SentResult {
+        std::uint32_t layer;
+        std::size_t chunk;
+        std::vector<BulkHandoff::Piece> pieces;
+    };
+    std::deque<SentResult> results_sent;
+    const auto receive_result = [&] {
+        const SentResult r = std::move(results_sent.front());
+        results_sent.pop_front();
+        const DeviceGuard on(a.device->device);
+        a.moe_back->receive(r.pieces, y_of(r.chunk).data, a.side.stream);
+        CUDA_CHECK(cudaEventRecord(a.side.events[r.chunk], a.side.stream));
+        submit(a.side.stream);
+    };
+    // Chunk c's MoE inputs at `at`, in the order they cross: x, routing ids, weights, gate.
+    const auto inputs_at = [&](std::byte* at, std::int32_t w) {
+        std::array<Tensor, 4> t{Tensor(nullptr, DType::BF16, {H, w}), Tensor(nullptr, DType::I32, {K, w}),
+                                Tensor(nullptr, DType::FP32, {K, w}), Tensor(nullptr, DType::FP32, {w})};
+        for (Tensor& tensor : t) {
+            tensor.data = at;
+            at += walk_align(tensor.bytes());
+        }
+        return t;
+    };
+    // Layer l's front of chunk c, its inputs' crossing and its routed experts on the second segment.
+    const auto front_of = [&](std::uint32_t l, std::size_t c) {
+        std::vector<BulkHandoff::Piece> inputs;
+        const std::int32_t w      = walk_.span.widths[c];
+        const std::size_t slot    = walk_.span.fronts++ % kOffloadSlots;
+        const std::uint32_t local = l - a.spec.layers.begin;
+        const std::array<Tensor, 4> staged = inputs_at(staging_slots + slot * slot_bytes, w);
+        // Into chunk c's columns of the second segment's walk residual, unused until the crossing.
+        const std::array<Tensor, 4> landed =
+            inputs_at(walk_area(b) + column_bytes * static_cast<std::size_t>(walk_.span.offsets[c]), w);
+        {
+            const SegmentWork on(*this, a);
+            const WideWork wide(*this, a, widest);
+            execution::ForwardBatch fb = walk_batch(a, c);
+            Tensor residual            = residual_of(c);
+            Tensor inject              = inject_of(c);
+            execution::MoeFront front;
+            a.forward->begin_call(fb, nullptr);
+            a.forward->layer_front(l, fb, residual, inject, front);
+            // The slot's previous inputs (kOffloadSlots fronts ago) have been sent.
+            CUDA_CHECK(cudaStreamWaitEvent(a.device->stream, a.side.sent[slot], 0));
+            const Tensor* produced[] = {&front.x, &front.routing.ids, &front.routing.weights,
+                                        &front.routing.shared_gate};
+            for (std::size_t i = 0; i < staged.size(); ++i) {
+                CUDA_CHECK(cudaMemcpyAsync(staged[i].data, produced[i]->data, produced[i]->bytes(),
+                                           cudaMemcpyDeviceToDevice, a.device->stream));
+            }
+            CUDA_CHECK(cudaEventRecord(a.side.staged[slot], a.device->stream));
+            submit(a.device->stream);
+            CUDA_CHECK(cudaStreamWaitEvent(a.side.out, a.side.staged[slot], 0));
+            // The four tensors lie in one run at the same offsets on both sides.
+            const auto* first = static_cast<const std::byte*>(staged.front().data);
+            const auto* end   = static_cast<const std::byte*>(staged.back().data) + staged.back().bytes();
+            inputs = a.moe_out->send(first, static_cast<std::size_t>(end - first), a.side.out);
+            CUDA_CHECK(cudaEventRecord(a.side.sent[slot], a.side.out));
+            submit(a.side.out);
+        }
+        {
+            const DeviceGuard on(b.device->device);
+            a.moe_out->receive(inputs, landed.front().data, b.side.stream);
+            CUDA_CHECK(cudaEventRecord(b.side.events[c], b.side.stream));
+            submit(b.side.stream);
+        }
+        {
+            const SegmentWork on(*this, b);
+            const WideWork wide(*this, b, widest);
+            CUDA_CHECK(cudaStreamWaitEvent(b.device->stream, b.side.events[c], 0));
+            const execution::RemoteMoe remote{
+                .frames        = static_cast<const std::int32_t*>(b.remote_frames.p),
+                .host_records  = b.remote_records[local],
+                .record_stride = a.plan.record_stride,
+                .scales        = static_cast<const ops::offloaded_moe::ExpertScales*>(b.remote_scales.p) +
+                          static_cast<std::size_t>(local) * E,
+                .shared_gate_up = &b.remote_shared_bound.at(2ULL * local),
+                .shared_down    = &b.remote_shared_bound.at(2ULL * local + 1),
+                .stream       = b.remote_stream.get(),
+                .stream_layer = local};
+            const Tensor y = b.forward->moe_remote(remote, landed[0], {landed[1], landed[2], landed[3]});
+            results_sent.push_back({l, c, a.moe_back->send(y.data, y.bytes(), b.device->stream)});
+            // The layer's half of the ring is free after its last chunk's result has left (the next
+            // layer but one is listed), and a share of the listed copies follows each chunk's.
+            if (c + 1 == n) { b.remote_stream->after_experts(local, b.device->stream); }
+            b.remote_stream->pump(pace);
+            submit(b.device->stream);
+        }
+        // The upload of the result result_lag chunks back follows this chunk's downloads.
+        while (results_sent.size() > result_lag) { receive_result(); }
+    };
+    // Fronts whose backs are not enqueued yet, oldest first: (layer, chunk), carried across steps.
+    auto& pending   = walk_.span.pending;
+    const auto back = [&] {
+        const auto [l, c] = pending.front();
+        pending.pop_front();
+        // Its result's upload first (and every older one's).
+        while (std::any_of(results_sent.begin(), results_sent.end(),
+                           [&](const SentResult& r) { return r.layer == l && r.chunk == c; })) {
+            receive_result();
+        }
+        const SegmentWork on(*this, a);
+        CUDA_CHECK(cudaStreamWaitEvent(a.device->stream, a.side.events[c], 0));
+        Tensor residual = residual_of(c);
+        a.forward->layer_back(l, residual, inject_of(c), y_of(c));
+    };
+    for (std::uint32_t l = from; l < to; ++l) {
+        for (std::size_t c = 0; c < n; ++c) {
+            // Chunk c's residual must be through layer l - 1: its back, and every older one, first.
+            while (!pending.empty() && pending.front().first + 1 < l) { back(); }
+            while (!pending.empty() && pending.front().first + 1 == l && pending.front().second <= c) { back(); }
+            front_of(l, c);
+            pending.emplace_back(l, c);
+        }
+    }
+    while (!results_sent.empty()) { receive_result(); }
+    // The last layer's backs before the crossing; a step's last layer leaves them to the next step,
+    // whose fronts they precede, so the step's end drains nothing.
+    if (to == a.spec.layers.end) {
+        while (!pending.empty()) { back(); }
+    }
+    const DeviceGuard on(a.device->device);
+    submit(a.device->stream);
+}
+
+// After the first segment's last layer with the MoE offload: every chunk's residual crosses into
+// the second segment's walk residual (its MoE inputs there are spent: its stream ran their experts
+// first), and the second segment's own layers start streaming through its ring, after the first
+// one's last experts were read.
+void ProgramImpl::walk_offload_cross() {
+    DeviceSegment& a               = *segments_[0];
+    DeviceSegment& b               = *segments_[1];
+    const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(width_);
+    for (std::size_t c = 0; c < walk_.span.widths.size(); ++c) {
+        const std::size_t at = column_bytes * static_cast<std::size_t>(walk_.span.offsets[c]);
+        a.bulk_out->transfer(walk_area(a) + at, walk_area(b) + at,
+                             column_bytes * static_cast<std::size_t>(walk_.span.widths[c]), a.device->stream,
+                             b.device->stream);
+    }
+    {
+        const DeviceGuard on(a.device->device);
+        a.device->flush();
+    }
+    const SegmentWork on(*this, b);
+    b.remote_stream->end();
+    b.expert_stream->begin(ring_span(b), b.residency->host_table(), b.device->stream);
+    b.device->flush();
 }
 
 // Layers [next_layer, to_layer) of every chunk, grouped by segment: each group under its segment's
@@ -348,6 +759,20 @@ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
         DeviceSegment& seg      = layer_segment(l);
         const std::uint32_t end = std::min(to_layer, seg.spec.layers.end);
         const bool split        = segments_.size() > 1;
+        if (moe_offload_ && seg.spec.index == 0) {
+            // The first segment's layers with their experts on the second (each step under its own
+            // segment's SegmentWork and wide arena); it starts at layer 0, recorded in walk_begin.
+            walk_offload_layers(l, end, widest);
+            l = end;
+            if (end == seg.spec.layers.end) {
+                {
+                    const DeviceGuard on(seg.device->device);
+                    CUDA_CHECK(cudaEventRecord(seg.walk_last.event, seg.device->stream));
+                }
+                walk_offload_cross();
+            }
+            continue;
+        }
         const SegmentWork on(*this, seg);
         const WideWork wide(*this, seg, widest);
         if (split && l == seg.spec.layers.begin && l > 0) {
@@ -368,9 +793,9 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     const std::uint32_t L = c_.num_hidden_layers;
     std::uint32_t tokens  = 0;
     for (const auto w : walk_.span.widths) { tokens += static_cast<std::uint32_t>(w); }
-    // The first step already ran layer 0 while staging.
-    const std::uint32_t to =
-        std::min(L, walk_.span.next_layer + walk_.span.layers_per_step - (walk_.span.steps == 0 ? 1U : 0U));
+    // The first step already ran layer 0 while staging (not with the MoE offload).
+    const std::uint32_t to = std::min(
+        L, walk_.span.next_layer + walk_.span.layers_per_step - (walk_.span.steps == 0 && walk_.span.next_layer > 0 ? 1U : 0U));
     {
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
@@ -380,7 +805,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     if (to < L) {
         // While the device runs this step, read the next span's n-gram rows (one span's chunks spread
         // over the remaining steps; ~35-70 ms of NVMe reads per 4,096-token chunk).
-        if (walk_.span.steps > 1 && walk_.span.end_call < lane.calls.size()) {
+        if (walk_.span.steps > (segments_.size() > 1 ? 2U : 1U) && walk_.span.end_call < lane.calls.size()) {
             const std::size_t remaining = (L - to + walk_.span.layers_per_step - 1) / walk_.span.layers_per_step + 1;
             const std::size_t slots     = walk_.host.size() / walk_.span.io_stride;
             const std::size_t have      = walk_.prefetch.valid ? walk_.prefetch.widths.size() : 0;
@@ -388,7 +813,23 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         }
         {
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
-            synchronize();
+            if (segments_.size() > 1) {
+                // A split waits for the previous step's end: the device runs this step meanwhile.
+                const std::size_t k = walk_.span.steps % 2;
+                for (const auto& segment : segments_) {
+                    const DeviceGuard on(segment->device->device);
+                    CUDA_CHECK(cudaEventRecord(segment->walk_steps[k].event, segment->device->stream));
+                    segment->device->flush();
+                }
+                if (walk_.span.steps > 1) {
+                    for (const auto& segment : segments_) {
+                        const DeviceGuard on(segment->device->device);
+                        CUDA_CHECK(cudaEventSynchronize(segment->walk_steps[1 - k].event));
+                    }
+                }
+            } else {
+                synchronize();
+            }
         }
         for (const auto& segment : segments_) {
             const SegmentWork on(*this, *segment);
@@ -474,6 +915,13 @@ void ProgramImpl::walk_abandon() noexcept {
         try {
             const DeviceGuard on(segment->device->device);
             segment->expert_stream->end();
+            if (segment->remote_stream) {
+                (void)cudaStreamSynchronize(segment->remote_stream->stream());
+                segment->remote_stream->end();
+            }
+            for (cudaStream_t side : {segment->side.stream, segment->side.out}) {
+                if (side != nullptr) { (void)cudaStreamSynchronize(side); }
+            }
         } catch (...) {}
     }
     walk_.span     = WalkState::LayerWalk{};

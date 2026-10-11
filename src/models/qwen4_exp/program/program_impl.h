@@ -649,6 +649,7 @@ public:
             split_sync_ = split_sync_from_environment();
             timing_.on  = split_timing_from_environment();
             split_walk_ = split_walk_from_environment();
+            moe_offload_ = map.size() == 2 && split_walk_ != SplitWalk::ChunkMajor && moe_offload_from_environment();
         }
         ple_segment_ = map.ple().index;
         const auto public_tokens = dim(parameters_.model.resources().public_token_count);
@@ -975,6 +976,9 @@ public:
                 CUDA_CHECK(cudaEventCreateWithFlags(&segment->compute_done.event, cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventCreate(&segment->walk_first.event));
                 CUDA_CHECK(cudaEventCreate(&segment->walk_last.event));
+                for (auto& step : segment->walk_steps) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&step.event, cudaEventDisableTiming));
+                }
             }
         }
         for (std::size_t s = 0; s < segments_.size(); ++s) {
@@ -1000,6 +1004,7 @@ public:
                                                                std::move(builds[s].experts), dim(options_.max_context),
                                                                segment);
         }
+        if (moe_offload_) { prepare_moe_offload(); }
         synchronize();
         report_lane_cost(lanes, record_stride);
     }
@@ -1402,15 +1407,26 @@ public:
 
     // How a layer split's long prompts run (prefill_walk.cpp), INFERNIX_SPLIT_WALK (outputs are the
     // same bits in every mode):
-    //   2 (the default) walks them layer-major on every segment (design §19.3.8 F4, multi-GPU WP16),
-    //     a span ending at exact prefix taps only: a flexible tap is realized where the span ends;
-    //   1 walks them with every tap ending a span, as an unsplit Program does;
+    //   1 (the default) walks them layer-major on every segment (design §19.3.8 F4, multi-GPU WP16),
+    //     every prefix tap ending a span as on an unsplit Program, so the snapshots are the same;
+    //   2 ends a span at exact taps only: a flexible tap is realized where the span ends (fewer
+    //     spans, a long prompt's history ladder snapshots later or not at all);
     //   0 keeps them chunk-major, every call crossing the segments in turn.
     enum class SplitWalk : std::uint8_t { ChunkMajor = 0, EveryTap = 1, ExactTaps = 2 };
+    // INFERNIX_SPLIT_MOE_OFFLOAD (a split of two segments that walks): 1 (the default) lets the
+    // second segment compute the first one's MoE (routed and shared experts) in the layer walk
+    // (multi-GPU WP23, walk_offload_layers), 0 keeps it on the first segment, which streams its
+    // routed experts over its own link. The same bits either way.
+    static bool moe_offload_from_environment() {
+        const char* value = std::getenv("INFERNIX_SPLIT_MOE_OFFLOAD");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "1") == 0) { return true; }
+        if (std::strcmp(value, "0") == 0) { return false; }
+        throw std::invalid_argument(std::string("INFERNIX_SPLIT_MOE_OFFLOAD must be 0 or 1, not '") + value + "'");
+    }
     static SplitWalk split_walk_from_environment() {
         const char* value = std::getenv("INFERNIX_SPLIT_WALK");
-        if (value == nullptr || *value == '\0' || std::strcmp(value, "2") == 0) { return SplitWalk::ExactTaps; }
-        if (std::strcmp(value, "1") == 0) { return SplitWalk::EveryTap; }
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "1") == 0) { return SplitWalk::EveryTap; }
+        if (std::strcmp(value, "2") == 0) { return SplitWalk::ExactTaps; }
         if (std::strcmp(value, "0") == 0) { return SplitWalk::ChunkMajor; }
         throw std::invalid_argument(std::string("INFERNIX_SPLIT_WALK must be 0, 1 or 2, not '") + value + "'");
     }
@@ -3970,15 +3986,19 @@ private:
     // Whether this chunk streams; lends the ring first when none is held. With `walk_bytes`, the
     // lease also holds a layer walk's area after the ring (stream_walk_bytes; zero when the
     // lendable frames do not cover it): the experts its frames evict widen each half by their
-    // per-layer share.
-    bool stream_chunk(DeviceSegment& seg, std::int32_t width, std::size_t walk_bytes = 0) {
+    // per-layer share. `min_half`: the halves hold at least that many records (another segment's
+    // layers stream through the ring, MoE offload). Without `ring_wanted` (the MoE offload's first
+    // segment, whose routed experts run elsewhere) the lease holds the wide arena and the walk area
+    // only, and no chunk streams through it.
+    bool stream_chunk(DeviceSegment& seg, std::int32_t width, std::size_t walk_bytes = 0, bool ring_wanted = true,
+                      std::uint32_t min_half = 0) {
         if (!seg.expert_stream || width < kStreamMinColumns || seg.residency->frames() == 0) { return false; }
         if (!seg.stream_lease.valid()) {
             // The segment's layers (its cache's tables hold them from 0).
             const std::uint32_t layers = seg.residency->layers();
             const std::int32_t* table  = seg.residency->host_table();
             const std::uint32_t E      = c_.moe.experts;
-            std::uint32_t most         = 0;
+            std::uint32_t most         = std::min(min_half, E);
             for (std::uint32_t l = 0; l < layers; ++l) {
                 std::uint32_t absent = 0;
                 for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
@@ -3994,6 +4014,22 @@ private:
             const auto walk_frames          = frames_of(walk_bytes);
             const std::uint32_t lendable    = seg.residency->lendable();
             if (wide_frames >= lendable) { return false; }
+            if (!ring_wanted) {
+                if (walk_frames == 0 || wide_frames + walk_frames > lendable) { return false; }
+                seg.stream_lease        = seg.residency->lend(wide_frames + walk_frames, seg.device->stream, {});
+                seg.stream_ring_bytes   = 0;
+                seg.stream_wide_bytes   = static_cast<std::size_t>(wide_frames) * stride;
+                seg.stream_walk_bytes   = static_cast<std::size_t>(walk_frames) * stride;
+                seg.stream_at_lease     = seg.expert_stream->stats();
+                seg.split_at_lease      = seg.forward->split_stats();
+                seg.prefetched_at_lease = walk_.prefetched_chunks;
+                diagnostic(segment_name(seg) + "prefill stream lease: " + std::to_string(seg.stream_lease.count) +
+                               " of " + std::to_string(seg.residency->frames()) + " frames (no ring: its routed experts "
+                               "run on the next segment; wide arena " + std::to_string(wide_frames) + "; walk area " +
+                               std::to_string(walk_frames) + ")",
+                           DiagnosticLevel::Debug);
+                return false; // nothing streams through it
+            }
             const std::uint32_t evicted = wide_frames + walk_frames;
             const std::uint32_t widened = std::min(E, most + (evicted + layers - 1) / layers);
             const bool full = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
@@ -4013,7 +4049,10 @@ private:
             if (half == 0 || seg.expert_stream->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
                 return false;
             }
-            const cudaStream_t writers[] = {seg.expert_stream->stream()};
+            // The ring's writers: the segment's expert stream and, with the MoE offload, the stream of the
+            // previous segment's layers.
+            std::vector<cudaStream_t> writers{seg.expert_stream->stream()};
+            if (seg.remote_stream) { writers.push_back(seg.remote_stream->stream()); }
             seg.stream_lease =
                 seg.residency->lend(ring + wide_frames + (walk ? walk_frames : 0U), seg.device->stream, writers);
             seg.stream_ring_bytes   = static_cast<std::size_t>(ring) * stride;
@@ -4030,7 +4069,7 @@ private:
                            (walk_frames > 0 && !walk ? " (not lendable)" : squeezed ? ", the halves squeezed" : "") + ")",
                        DiagnosticLevel::Debug);
         }
-        return true;
+        return seg.stream_ring_bytes > 0; // a held lease without a ring streams nothing
     }
 
     // The ring's part of the stream lease.
@@ -5580,6 +5619,16 @@ private:
     [[nodiscard]] std::byte* walk_slot(const DeviceSegment& seg, std::size_t chunk) const noexcept;
     void walk_upload(DeviceSegment& seg, std::size_t chunk, const std::byte* host_slot);
     void walk_pass(std::size_t chunk, std::uint32_t layer);
+    // The MoE offload (moe_offload_; multi-GPU WP23): its resources at construction, the walk
+    // area's part for the results on the first segment, and layers of the first segment over the
+    // span's chunks with their routed experts on the second.
+    void prepare_moe_offload();
+    [[nodiscard]] std::size_t offload_bytes(std::size_t chunks) const noexcept;
+    [[nodiscard]] std::size_t offload_input_bytes(std::size_t columns) const noexcept;
+    void walk_offload_layers(std::uint32_t from, std::uint32_t to, std::int32_t widest);
+    // A split's crossing after its first segment's part of the span with the MoE offload: every
+    // chunk's residual into the next segment's walk residual, whose stream starts there.
+    void walk_offload_cross();
     // An eager walk batch over chunk c's io image in `seg`'s walk area.
     [[nodiscard]] execution::ForwardBatch walk_batch(const DeviceSegment& seg, std::size_t chunk);
     void walk_enqueue(std::uint32_t to_layer);
@@ -5655,6 +5704,8 @@ private:
     // bulk_out point at them): declared before the segments, whose Forwards and streams use them.
     std::vector<std::unique_ptr<HandoffChannel>> channels_;
     std::vector<std::unique_ptr<BulkHandoff>> bulk_;
+    // The MoE offload's crossings (DeviceSegment::moe_out, moe_back), both on the first segment.
+    std::vector<std::unique_ptr<BulkHandoff>> moe_bulk_;
     // The device segments in layer order (device_segment.h): one covering every layer, or a layer
     // split's. Declared after the host objects their expert caches, Forwards and VRAM monitors read
     // (the SSD tier and its fetch channel, the expert error word, the CPU expert service, the route
@@ -5715,7 +5766,8 @@ private:
     HandoffMode handoff_            = HandoffMode::Event;
     std::uint32_t handoff_sequence_ = 0;
     bool split_sync_                = false;
-    SplitWalk split_walk_           = SplitWalk::ExactTaps; // INFERNIX_SPLIT_WALK (a split only)
+    SplitWalk split_walk_           = SplitWalk::EveryTap; // INFERNIX_SPLIT_WALK (a split only)
+    bool moe_offload_               = false; // INFERNIX_SPLIT_MOE_OFFLOAD (prepare_moe_offload)
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

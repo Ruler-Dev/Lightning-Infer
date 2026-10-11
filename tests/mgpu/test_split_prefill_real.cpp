@@ -4,7 +4,10 @@
 // reference device. Every call and round that computes logits writes the FNV-1a of the head's FP32
 // logits (ProgramOptions::logits_hash, through testing::set_logits_hash), so the comparison covers
 // each prefill call's logits, the first token, forced tokens' logits and every decode or
-// verification round's logits, besides the generated ids.
+// verification round's logits, besides the generated ids. A layer walk computes no logits before
+// its span's last chunk, and the split walks even a single call (the MoE offload), so a prompt's
+// lines may be fewer than the unsplit run's: each is then found, in order, among them, the last
+// ones equal.
 //
 // Cases, per K: raw-token prompts of 1, 255, 256 and 4113 tokens (two prefill calls at the default
 // --prefill-chunk 4096: 4096 + 17), each generating one token; the 255-token prompt generating
@@ -21,11 +24,13 @@
 // delays one round's first segment past the gate's bound (testing::delay_next_round): that request
 // fails with a recoverable handoff timeout and the next one gives the reference's bits.
 //
-// --walk-modes runs each split twice, walking its long prompts layer-major on both segments (multi-GPU
-// WP16, the default) and chunk-major (INFERNIX_SPLIT_WALK=0), and compares each with the unsplit run
-// and with the default one: equal ids, and each run's logits lines either equal (the same calls
-// computed logits) or, where a layer walk computed fewer (no logits before a span's last chunk),
-// every line of the walking run found in order among the other's, the last ones equal. --prompt-decode N lets every prompt
+// --walk-modes runs each split three times: walking its long prompts layer-major on both segments
+// with the first segment's MoE on the second (multi-GPU WP16 and WP23, the default),
+// walking without that MoE offload (INFERNIX_SPLIT_MOE_OFFLOAD=0), and chunk-major
+// (INFERNIX_SPLIT_WALK=0); it compares each with the unsplit run and with the default one: equal
+// ids, and each run's logits lines either equal (the same calls computed logits) or, where a layer
+// walk computed fewer (no logits before a span's last chunk), every line of the walking run found
+// in order among the other's, the last ones equal. --prompt-decode N lets every prompt
 // generate N tokens (default 1), so its decode rounds read every layer's state after the prompt.
 // E.g. --prompts 12388,73828 --context 81920 --walk-modes --prompt-decode 8: 3 x 4096 + 100 tokens
 // (one span, then a narrow call) and 18 x 4096 + 100 (two spans: 16 calls at kWalkMaxTokens, 2).
@@ -460,24 +465,29 @@ int main(int argc, char** argv) {
         }
 
         if (o.walk_modes) { print_walks(reference.diagnostics); }
-        // (K, mode): 0 the default (layer walk), 1 chunk-major.
+        // (K, mode): 0 the default (layer walk with the MoE offload), 1 the walk without it, 2 chunk-major.
         std::vector<std::pair<std::uint32_t, int>> runs;
         for (const std::uint32_t k : o.splits) {
             runs.emplace_back(k, 0);
-            if (o.walk_modes) { runs.emplace_back(k, 1); }
+            if (o.walk_modes) {
+                runs.emplace_back(k, 1);
+                runs.emplace_back(k, 2);
+            }
         }
-        const char* const mode_names[] = {" (layer walk)", " (chunk-major)"};
-        const char* const mode_files[] = {"", "-chunk"};
+        const char* const mode_names[] = {" (layer walk, MoE offload)", " (layer walk)", " (chunk-major)"};
+        const char* const mode_files[] = {"", "-walk", "-chunk"};
         std::map<std::uint32_t, Run> walked; // per K, the default run (--walk-modes)
         for (const auto& [k, mode] : runs) {
             const bool walking     = mode == 0;
             const std::string name = "--devices " + std::to_string(o.devices[0]) + "," + std::to_string(o.devices[1]) +
                                      " --layer-split " + std::to_string(k) + (o.walk_modes ? mode_names[mode] : "");
             std::printf("%s\n", name.c_str());
-            set_variable("INFERNIX_SPLIT_WALK", mode == 1 ? "0" : "2");
+            set_variable("INFERNIX_SPLIT_WALK", mode == 2 ? "0" : "");
+            set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", mode == 1 ? "0" : "");
             const Run split = run_engine(o, artifact, ngram, o.devices, k,
                                          o.work / ("split-" + std::to_string(k) + mode_files[mode] + ".hash"), tokens);
-            set_variable("INFERNIX_SPLIT_WALK", "2");
+            set_variable("INFERNIX_SPLIT_WALK", "");
+            set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", "");
             if (o.walk_modes) { print_walks(split.diagnostics); }
             for (const std::uint32_t n : o.prompts) {
                 const Outcome& want = reference.prompts.at(n);
@@ -500,10 +510,11 @@ int main(int argc, char** argv) {
                                   std::to_string(got.lines.size()) + ")");
                     }
                 } else {
-                    check(got.lines == want.lines,
+                    // The split walks a single call too (the MoE offload), so it may compute fewer lines.
+                    check(same_logits(want.lines, got.lines),
                           name + ": the " + std::to_string(n) + "-token prompt's " + std::to_string(want.lines.size()) +
-                              " call(s) have the unsplit run's logits (last: " + first_line(got) + " vs " +
-                              first_line(want) + ")");
+                              " call(s) have the unsplit run's logits (" + std::to_string(got.lines.size()) +
+                              " lines, last: " + first_line(got) + " vs " + first_line(want) + ")");
                 }
             }
             if (o.forced) {
