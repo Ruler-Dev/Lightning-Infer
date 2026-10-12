@@ -6,8 +6,10 @@
 // On a layer split ("On a layer split" in §19.3.2) the tower runs on one segment (place_vision),
 // whose cache lends the window and the handoff and whose stream encodes; the first segment's scatter
 // and the head's MTP prompt cells read the handoff, each segment on another GPU from its own copy,
-// filled once through a pinned crossing after the encode (vision_mirror). Segments on the tower's GPU
-// read the handoff in place: their work never overlaps the tower's there (SegmentWork).
+// lent with the handoff (vision_lend) and filled once through a pinned crossing after the encode
+// (vision_mirror). Segments on the tower's GPU read the handoff in place: their work never overlaps
+// the tower's there (SegmentWork). The leases start their pools and, with several media prompts in
+// flight, wait rather than split a pool (vision_lend).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
@@ -26,6 +28,12 @@ namespace {
 // The handoff crossing's pinned ring: a 1,024-token image's handoff (5 MiB) in two pieces.
 constexpr std::size_t kVisionPieceBytes = 4ULL << 20;
 constexpr std::uint32_t kVisionPieces  = 4;
+
+// A Vision lend that would split a pool waits for another lane's leases while the lanes' prefill
+// makes steps; after this many polls without one it lends anyway (the stream leases are then sized
+// by the longest run, ProgramImpl::stream_chunk), so a lane whose prefill cannot run during a
+// binding never holds the encode. One poll per engine boundary, up to three per engine cycle.
+constexpr std::uint32_t kVisionWaitPolls = 256;
 
 // INFERNIX_SPLIT_VISION (a measurement knob, a split only): auto (the default) places the tower by
 // vision_tower_segment, first and last force the first or the last segment.
@@ -167,7 +175,101 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
     lane.vision       = std::move(vision);
 }
 
-void ProgramImpl::vision_step(Lane& lane) {
+// Lends the encode's leases, each at the bottom of its pool (choose_run at_start): the tower's
+// handoff (W) or handoff and window (L), and each reading segment's copy on another GPU. The handoff
+// and the copies stay lent through the prompt's calls, whose stream lease may need most of a pool's
+// frames in one run (on a 16 GB card, alone or a split's head, more than half of them): a lease that
+// would leave the frames still lendable split (lend_fit: another prompt's stream lease in the way,
+// or a hole a released handoff left) waits while another lane prefills, whose calls return its
+// leases, once the stream and wide leases went back (between calls nothing reads them; a layer
+// walk's span holds them). Nothing is lent while it waits.
+bool ProgramImpl::vision_lend(LaneVision& v, std::uint32_t index) {
+    using LendFit                  = ExpertResidency::LendFit;
+    const VisionWindowPlan& window = v.admission->window;
+    DeviceSegment& tower           = vision_seg();
+    const std::size_t bytes =
+        2ULL * static_cast<std::size_t>(parameters_.vision->merger_fc2.weight.n) * window.encoded_tokens;
+    struct Want {
+        std::size_t segment;
+        std::uint32_t frames;
+    };
+    std::vector<Want> wants{{vision_segment_, window.frames}};
+    for (std::size_t s = 0; s < vision_bulk_.size(); ++s) {
+        if (!vision_bulk_[s]) { continue; }
+        const std::uint64_t stride = segments_[s]->residency->frame_stride();
+        wants.push_back({s, static_cast<std::uint32_t>((bytes + stride - 1) / stride)});
+    }
+    // The worst fit over the pools, their stream and wide leases counted as coming back.
+    const auto fit = [&] {
+        LendFit worst = LendFit::Keeps;
+        for (const Want& want : wants) {
+            DeviceSegment& seg = *segments_[want.segment];
+            const DeviceGuard on(seg.device->device);
+            const ExpertResidency::FrameLease transient[] = {seg.stream_lease, seg.work_lease};
+            worst = std::min(worst, seg.residency->lend_fit(want.frames, seg.device->stream, transient));
+        }
+        return worst;
+    };
+    LendFit worst = fit();
+    if (worst != LendFit::Keeps && !walk_.span.active) {
+        for (const Want& want : wants) {
+            DeviceSegment& seg = *segments_[want.segment];
+            const DeviceGuard on(seg.device->device);
+            return_stream_lease(seg); // the next streamed chunk lends it again
+            return_wide_work(seg);
+        }
+        worst = fit();
+    }
+    if (worst != LendFit::Keeps && prefilling_besides(index)) {
+        if (prefill_steps_ != v.wait_steps) {
+            v.wait_steps = prefill_steps_;
+            v.wait_polls = 0;
+        } else {
+            ++v.wait_polls;
+        }
+        if (!v.wait_reported) {
+            diagnostic(segment_name(tower) + "the Vision encode waits for frames: " +
+                           (worst == LendFit::None ? std::string("no run holds its leases")
+                                                   : std::string("its leases would split a pool")) +
+                           " while another lane's prompt holds leases",
+                       DiagnosticLevel::Debug);
+            v.wait_reported = true;
+        }
+        if (worst == LendFit::None) {
+            if (v.wait_polls == kVisionWaitPolls) {
+                diagnostic(segment_name(tower) + "the Vision encode still waits for frames another lane's prompt "
+                                                 "holds, and no prefill step ran for " +
+                               std::to_string(kVisionWaitPolls) + " polls",
+                           DiagnosticLevel::Warning);
+            }
+            return false; // no lease can be made before they come back
+        }
+        if (v.wait_polls < kVisionWaitPolls) { return false; }
+    }
+    if (worst == LendFit::Splits) {
+        diagnostic(segment_name(tower) + "the Vision leases are lent although they split a pool (no other lane's "
+                                         "prefill step came); stream leases take the longest run meanwhile",
+                   DiagnosticLevel::Debug);
+    }
+    // LendFit::None with no other lane prefilling (nothing else is lent then: the frames shrank since
+    // admission): lend throws, as it always did.
+    const cudaStream_t writers[] = {tower.device->transfer_stream};
+    v.lease = tower.residency->lend(window.frames, tower.device->stream, writers, /*at_start=*/true);
+    for (std::size_t k = 1; k < wants.size(); ++k) {
+        DeviceSegment& reader = *segments_[wants[k].segment];
+        LaneVision::Mirror mirror{.segment = wants[k].segment};
+        {
+            // Its upload (vision_mirror) runs on the reader's stream, which the lease makes wait for
+            // promotions still landing in the run; the reader's calls run after it.
+            const DeviceGuard on(reader.device->device);
+            mirror.lease = reader.residency->lend(wants[k].frames, reader.device->stream, {}, /*at_start=*/true);
+        }
+        v.mirrors.push_back(mirror); // released with the lane whatever follows
+    }
+    return true;
+}
+
+bool ProgramImpl::vision_step(Lane& lane, std::uint32_t index) {
     LaneVision& v                        = *lane.vision;
     const VisionWindowPlan& window       = v.admission->window;
     const qwen3_5::VisionConfig& config  = *parameters_.model.config().vision;
@@ -177,14 +279,10 @@ void ProgramImpl::vision_step(Lane& lane) {
     const cudaStream_t s                 = tower.device->stream;
     const auto out                       = parameters_.vision->merger_fc2.weight.n;
     if (!v.pass) {
-        // Lend the handoff (W) or handoff and window (L); promotions still landing in the run are
-        // waited for by compute and the weight stream's transfer stream. The run starts the pool
-        // (the handoff first, so the window's frames rejoin the rest when they go back): the handoff
-        // stays lent through the prompt's calls, whose stream lease may need most of the frames in
-        // one run (on a 16 GB card, alone or a split's head, more than half of them).
-        const cudaStream_t writers[] = {tower.device->transfer_stream};
-        return_stream_lease(tower); // a prefill ring is lent again by the next streamed chunk
-        v.lease   = tower.residency->lend(window.frames, s, writers, /*at_start=*/true);
+        // The handoff (W) or handoff and window (L), the handoff first so the window's frames rejoin
+        // the rest when they go back; promotions still landing in the run are waited for by compute
+        // and the weight stream's transfer stream.
+        if (!vision_lend(v, index)) { return false; }
         v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {
@@ -236,7 +334,7 @@ void ProgramImpl::vision_step(Lane& lane) {
         if (end > config.depth) { end = stages; }
     }
     v.pass->advance(end);
-    if (!v.pass->done()) { return; }
+    if (!v.pass->done()) { return true; }
     if (v.stream) { v.stream->finish(s); }
     CUDA_CHECK(cudaEventRecord(v.timer->stop, s));
     if (window.lease) {
@@ -256,26 +354,16 @@ void ProgramImpl::vision_step(Lane& lane) {
     v.payloads.clear(); // the media payloads are not needed again
     vision_mirror(v);
     v.encoded = true;
+    return true;
 }
 
 void ProgramImpl::vision_mirror(LaneVision& v) {
     DeviceSegment& tower    = vision_seg();
     const std::size_t bytes = v.handoff.bytes();
-    for (std::size_t s = 0; s < vision_bulk_.size(); ++s) {
-        if (!vision_bulk_[s]) { continue; }
-        DeviceSegment& reader      = *segments_[s];
-        const std::uint64_t stride = reader.residency->frame_stride();
-        LaneVision::Mirror mirror{.segment = s};
-        {
-            // Its upload runs on the reader's stream, which the lease makes wait for promotions still
-            // landing in the run; the reader's calls run after it.
-            const DeviceGuard on(reader.device->device);
-            mirror.lease = reader.residency->lend(static_cast<std::uint32_t>((bytes + stride - 1) / stride),
-                                                  reader.device->stream, {}, /*at_start=*/true);
-        }
-        v.mirrors.push_back(mirror); // released with the lane whatever follows
-        vision_bulk_[s]->transfer(v.handoff.data, mirror.lease.memory.data, bytes, tower.device->stream,
-                                  reader.device->stream);
+    for (const LaneVision::Mirror& mirror : v.mirrors) {
+        DeviceSegment& reader = *segments_[mirror.segment];
+        vision_bulk_[mirror.segment]->transfer(v.handoff.data, mirror.lease.memory.data, bytes, tower.device->stream,
+                                               reader.device->stream);
         const DeviceGuard on(reader.device->device);
         reader.device->flush();
     }

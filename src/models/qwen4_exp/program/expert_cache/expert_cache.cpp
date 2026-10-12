@@ -575,11 +575,14 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
     const std::uint32_t n = frames_.backed();
     if (count == 0 || count > n) { return std::nullopt; }
     if (at_start) {
-        bool whole = true;
-        for (std::uint32_t f = 0; f < count && whole; ++f) {
-            whole = !frames_.is_loaned(f) && (frames_.is_free(f) || frame_key_[f] != kNoKey);
+        // First fit: the lowest run of frames neither lent nor retiring.
+        std::uint32_t run = 0;
+        for (std::uint32_t f = 0; f < n; ++f) {
+            const bool eligible = !frames_.is_loaned(f) && (frames_.is_free(f) || frame_key_[f] != kNoKey);
+            run                 = eligible ? run + 1 : 0;
+            if (run == count) { return f + 1 - count; }
         }
-        if (whole) { return 0U; }
+        return std::nullopt;
     }
     // Sliding window over the backed frames: the summed score of held experts (free frames 0),
     // with lent and retiring frames and, in the first pass, busy frames breaking the window.
@@ -610,6 +613,24 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
         if (best) { return best; }
     }
     return std::nullopt;
+}
+
+std::uint32_t CacheController::longest_run(std::span<const Run> back, Run taken) const {
+    const std::uint32_t n = frames_.backed();
+    std::vector<std::uint8_t> free(n, 0);
+    for (std::uint32_t f = 0; f < n; ++f) {
+        free[f] = !frames_.is_loaned(f) && (frames_.is_free(f) || frame_key_[f] != kNoKey) ? 1 : 0;
+    }
+    for (const Run& run : back) {
+        for (std::uint32_t f = run.first; f < run.first + run.count && f < n; ++f) { free[f] = 1; }
+    }
+    for (std::uint32_t f = taken.first; f < taken.first + taken.count && f < n; ++f) { free[f] = 0; }
+    std::uint32_t longest = 0, run = 0;
+    for (std::uint32_t f = 0; f < n; ++f) {
+        run     = free[f] != 0 ? run + 1 : 0;
+        longest = std::max(longest, run);
+    }
+    return longest;
 }
 
 std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill) {

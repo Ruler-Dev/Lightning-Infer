@@ -612,21 +612,57 @@ std::uint32_t ExpertResidency::lendable() const noexcept {
     return frames_ > lent + floor ? frames_ - lent - floor : 0;
 }
 
-ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
-                                                  std::span<const cudaStream_t> writers, bool at_start) {
-    if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
-    issue_deferred(compute);         // their frames count as busy below
+void ExpertResidency::settle_for_lend(cudaStream_t compute) {
+    issue_deferred(compute);         // their frames count as busy
     finish_demotions(compute, true); // a held frame must not be lent
     publish_landed();
     release_reservations();
+}
+
+std::vector<std::uint8_t> ExpertResidency::busy_frames() const {
     std::vector<std::uint8_t> busy(frames_, 0);
     for (const auto& batch : in_flight_) {
         for (const auto& load : batch.loads) {
             if (load.frame < frames_) { busy[load.frame] = 1; }
         }
     }
-    const auto first = controller_->choose_run(count, busy, at_start);
-    if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
+    return busy;
+}
+
+std::uint32_t ExpertResidency::longest_run() const { return controller_ ? controller_->longest_run() : 0; }
+
+ExpertResidency::LendFit ExpertResidency::lend_fit(std::uint32_t count, cudaStream_t compute,
+                                                   std::span<const FrameLease> transient) {
+    if (!controller_ || count == 0 || count > lendable()) { return LendFit::None; }
+    settle_for_lend(compute);
+    const auto first = controller_->choose_run(count, busy_frames(), /*at_start=*/true);
+    if (!first) { return LendFit::None; }
+    std::vector<CacheController::Run> back;
+    std::uint32_t returned = 0;
+    for (const FrameLease& lease : transient) {
+        if (!lease.valid()) { continue; }
+        back.push_back({lease.first, lease.count});
+        returned += lease.count;
+    }
+    // lendable() counts the transient leases as lent and not this one yet (count <= lendable()).
+    const std::uint32_t after = lendable() + returned - count;
+    return controller_->longest_run(back, {*first, count}) >= after ? LendFit::Keeps : LendFit::Splits;
+}
+
+ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
+                                                  std::span<const cudaStream_t> writers, bool at_start) {
+    auto lease = try_lend(count, compute, writers, at_start);
+    if (!lease) { throw std::logic_error("expert residency: no run of frames to lend"); }
+    return *lease;
+}
+
+std::optional<ExpertResidency::FrameLease> ExpertResidency::try_lend(std::uint32_t count, cudaStream_t compute,
+                                                                     std::span<const cudaStream_t> writers,
+                                                                     bool at_start) {
+    if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
+    settle_for_lend(compute);
+    const auto first = controller_->choose_run(count, busy_frames(), at_start);
+    if (!first) { return std::nullopt; }
     commands_.clear();
     stats_.lend_evictions += controller_->lend(*first, count, commands_, refill_lent_);
     report_evictions();
@@ -651,7 +687,9 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     }
     stats_.lent_frames += count;
     auto* base = const_cast<std::uint8_t*>(frame_base());
-    return {*first, count, DeviceSpan{base + static_cast<std::size_t>(*first) * stride_, static_cast<std::size_t>(count) * stride_}};
+    const DeviceSpan memory{base + static_cast<std::size_t>(*first) * stride_,
+                            static_cast<std::size_t>(count) * stride_};
+    return FrameLease{*first, count, memory};
 }
 
 void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {

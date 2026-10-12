@@ -190,13 +190,19 @@ struct LaneVision {
     ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
     Tensor handoff;                            // BF16 [out, V_encoded]
     // A layer split: the handoff's copy for each segment that reads it (the first segment's scatter,
-    // the head's MTP prompt cells) on another GPU than the tower, in frames its own cache lends,
-    // filled through the pinned crossing once the encode ends (ProgramImpl::vision_mirror).
+    // the head's MTP prompt cells) on another GPU than the tower, in frames its own cache lends with
+    // the tower's lease (ProgramImpl::vision_lend), filled through the pinned crossing once the
+    // encode ends (ProgramImpl::vision_mirror).
     struct Mirror {
         std::size_t segment = 0;
         ExpertResidency::FrameLease lease;
     };
     std::vector<Mirror> mirrors;
+    // A lend that waits for another lane's leases (vision_lend): the prefill steps counted when it
+    // last saw them advance, the polls since, and whether the wait was reported.
+    std::uint64_t wait_steps = ~0ULL;
+    std::uint32_t wait_polls = 0;
+    bool wait_reported       = false;
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
     std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
     std::unique_ptr<qwen3_5::execution::VisionPassLayout> layout;
@@ -2217,7 +2223,8 @@ public:
     }
 
     // Advances the binding: a media prompt's encode window one step per call (design §19.3.2; other
-    // lanes run between steps), then the lane is published.
+    // lanes run between steps), then the lane is published. The first step makes no progress while
+    // its leases would split a pool that another prefilling lane's calls free (vision_lend).
     ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
         if (pause_) {
             ContextProgress out{.kind = ContextOperationKind::Pause};
@@ -2239,13 +2246,12 @@ public:
         }
         if (admitted.vision && !vision_encoded(admitted)) {
             try {
-                vision_step(admitted);
+                out.advanced = vision_step(admitted, *transaction_lane_);
             } catch (...) {
                 release(*transaction_lane_);
                 transaction_lane_.reset();
                 throw;
             }
-            out.advanced = true;
             if (!vision_encoded(admitted)) { return out; }
         }
         out.advanced  = true;
@@ -2290,6 +2296,7 @@ public:
         const auto index  = lane_of(sequence);
         Lane& lane        = lanes_[index];
         if (lane.phase != Phase::Prefill) { throw std::logic_error("Qwen4Exp: prefill on a lane that is not prefilling"); }
+        ++prefill_steps_;
         if (walk_.span.active) {
             if (walk_.span.lane != index) {
                 throw std::logic_error("Qwen4Exp: another lane's prefill holds the layer walk");
@@ -4191,62 +4198,91 @@ private:
             // call runs wide calls.
             const std::uint32_t wide_frames = seg.wide_dedicated ? 0U : frames_of(seg.wide_work);
             const auto walk_frames          = frames_of(walk_bytes);
-            const std::uint32_t lendable    = seg.residency->lendable();
-            if (wide_frames >= lendable) { return false; }
-            if (!ring_wanted) {
-                if (walk_frames == 0 || wide_frames + walk_frames > lendable) { return false; }
-                seg.stream_lease        = seg.residency->lend(wide_frames + walk_frames, seg.device->stream, {});
-                seg.stream_ring_bytes   = 0;
+            // Another lane's Vision leases can split the frames so that no run holds the lease (design
+            // §19.3.2 "On a layer split"): it is then sized again by the longest run (squeezed halves, no
+            // walk area, or no lease at all) rather than failing the prompt.
+            std::uint32_t lendable = seg.residency->lendable();
+            for (bool retry = false;; retry = true) {
+                if (wide_frames >= lendable) { return false; }
+                if (!ring_wanted) {
+                    if (walk_frames == 0 || wide_frames + walk_frames > lendable) { return false; }
+                    const auto lease = seg.residency->try_lend(wide_frames + walk_frames, seg.device->stream, {});
+                    if (!lease) {
+                        if (retry) { return false; }
+                        lendable = std::min(lendable, seg.residency->longest_run());
+                        continue;
+                    }
+                    seg.stream_lease        = *lease;
+                    seg.stream_ring_bytes   = 0;
+                    seg.stream_wide_bytes   = static_cast<std::size_t>(wide_frames) * stride;
+                    seg.stream_walk_bytes   = static_cast<std::size_t>(walk_frames) * stride;
+                    seg.stream_at_lease     = seg.expert_stream->stats();
+                    seg.split_at_lease      = seg.forward->split_stats();
+                    seg.prefetched_at_lease = walk_.prefetched_chunks;
+                    diagnostic(segment_name(seg) + "prefill stream lease: " +
+                                   std::to_string(seg.stream_lease.count) + " of " +
+                                   std::to_string(seg.residency->frames()) +
+                                   " frames (no ring: its routed experts run on the next segment; wide arena " +
+                                   std::to_string(wide_frames) + "; walk area " + std::to_string(walk_frames) + ")",
+                               DiagnosticLevel::Debug);
+                    return false; // nothing streams through it
+                }
+                const std::uint32_t evicted = wide_frames + walk_frames;
+                const std::uint32_t widened = std::min(E, most + (evicted + layers - 1) / layers);
+                const bool full = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
+                // A split's segment whose lendable frames do not hold the walk area beside full halves
+                // (a 16 GB card at a long context, two segments sharing one GPU) squeezes the halves
+                // instead of giving up the walk: a layer's experts beyond its half are staged per chunk,
+                // as any miss, and the rest still cross the link once per span. Without the walk, every
+                // call of the prompt would stream all of them on every segment.
+                const std::uint32_t room =
+                    lendable > wide_frames + walk_frames ? lendable - wide_frames - walk_frames : 0U;
+                const bool squeezed =
+                    walk_frames > 0 && !full && segments_.size() > 1 && room >= 2 * kStreamHalfMin + 1 &&
+                    seg.expert_stream->slots_in(static_cast<std::size_t>(room) * stride) >= 2 * kStreamHalfMin;
+                const bool walk          = full || squeezed;
+                const std::uint32_t half = full       ? widened
+                                           : squeezed ? std::min(widened, (room - 1) / 2)
+                                                      : std::min(E, most + (wide_frames + layers - 1) / layers);
+                const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
+                if (half == 0 ||
+                    seg.expert_stream->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
+                    return false;
+                }
+                // The ring's writers: the segment's expert stream and, with the MoE offload, the stream of
+                // the previous segment's layers.
+                std::vector<cudaStream_t> writers{seg.expert_stream->stream()};
+                if (seg.remote_stream) { writers.push_back(seg.remote_stream->stream()); }
+                const std::uint32_t count = ring + wide_frames + (walk ? walk_frames : 0U);
+                const auto lease          = seg.residency->try_lend(count, seg.device->stream, writers);
+                if (!lease) {
+                    if (retry) { return false; }
+                    lendable = std::min(lendable, seg.residency->longest_run());
+                    continue;
+                }
+                seg.stream_lease        = *lease;
+                seg.stream_ring_bytes   = static_cast<std::size_t>(ring) * stride;
                 seg.stream_wide_bytes   = static_cast<std::size_t>(wide_frames) * stride;
-                seg.stream_walk_bytes   = static_cast<std::size_t>(walk_frames) * stride;
+                seg.stream_walk_bytes   = walk ? static_cast<std::size_t>(walk_frames) * stride : 0;
                 seg.stream_at_lease     = seg.expert_stream->stats();
                 seg.split_at_lease      = seg.forward->split_stats();
                 seg.prefetched_at_lease = walk_.prefetched_chunks;
                 diagnostic(segment_name(seg) + "prefill stream lease: " + std::to_string(seg.stream_lease.count) +
-                               " of " + std::to_string(seg.residency->frames()) + " frames (no ring: its routed experts "
-                               "run on the next segment; wide arena " + std::to_string(wide_frames) + "; walk area " +
-                               std::to_string(walk_frames) + ")",
+                               " of " + std::to_string(seg.residency->frames()) + " frames (ring " +
+                               std::to_string(ring) + " for halves of " + std::to_string(half) +
+                               ", the most non-resident experts of a layer " + std::to_string(most) +
+                               "; wide arena " + std::to_string(wide_frames) + "; walk area " +
+                               std::to_string(walk ? walk_frames : 0U) +
+                               (walk_frames > 0 && !walk ? " (not lendable)"
+                                : squeezed               ? ", the halves squeezed"
+                                                         : "") +
+                               (retry ? "; sized by the longest run of frames, " + std::to_string(lendable) +
+                                            ", other leases splitting the rest"
+                                      : std::string()) +
+                               ")",
                            DiagnosticLevel::Debug);
-                return false; // nothing streams through it
+                break;
             }
-            const std::uint32_t evicted = wide_frames + walk_frames;
-            const std::uint32_t widened = std::min(E, most + (evicted + layers - 1) / layers);
-            const bool full = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
-            // A split's segment whose lendable frames do not hold the walk area beside full halves
-            // (a 16 GB card at a long context, two segments sharing one GPU) squeezes the halves
-            // instead of giving up the walk: a layer's experts beyond its half are staged per chunk,
-            // as any miss, and the rest still cross the link once per span. Without the walk, every
-            // call of the prompt would stream all of them on every segment.
-            const std::uint32_t room = lendable > wide_frames + walk_frames ? lendable - wide_frames - walk_frames : 0U;
-            const bool squeezed      = walk_frames > 0 && !full && segments_.size() > 1 && room >= 2 * kStreamHalfMin + 1 &&
-                                  seg.expert_stream->slots_in(static_cast<std::size_t>(room) * stride) >= 2 * kStreamHalfMin;
-            const bool walk          = full || squeezed;
-            const std::uint32_t half = full       ? widened
-                                       : squeezed ? std::min(widened, (room - 1) / 2)
-                                                  : std::min(E, most + (wide_frames + layers - 1) / layers);
-            const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
-            if (half == 0 || seg.expert_stream->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
-                return false;
-            }
-            // The ring's writers: the segment's expert stream and, with the MoE offload, the stream of the
-            // previous segment's layers.
-            std::vector<cudaStream_t> writers{seg.expert_stream->stream()};
-            if (seg.remote_stream) { writers.push_back(seg.remote_stream->stream()); }
-            seg.stream_lease =
-                seg.residency->lend(ring + wide_frames + (walk ? walk_frames : 0U), seg.device->stream, writers);
-            seg.stream_ring_bytes   = static_cast<std::size_t>(ring) * stride;
-            seg.stream_wide_bytes   = static_cast<std::size_t>(wide_frames) * stride;
-            seg.stream_walk_bytes   = walk ? static_cast<std::size_t>(walk_frames) * stride : 0;
-            seg.stream_at_lease     = seg.expert_stream->stats();
-            seg.split_at_lease      = seg.forward->split_stats();
-            seg.prefetched_at_lease = walk_.prefetched_chunks;
-            diagnostic(segment_name(seg) + "prefill stream lease: " + std::to_string(seg.stream_lease.count) +
-                           " of " + std::to_string(seg.residency->frames()) + " frames (ring " + std::to_string(ring) +
-                           " for halves of " + std::to_string(half) + ", the most non-resident experts of a layer " +
-                           std::to_string(most) + "; wide arena " + std::to_string(wide_frames) + "; walk area " +
-                           std::to_string(walk ? walk_frames : 0U) +
-                           (walk_frames > 0 && !walk ? " (not lendable)" : squeezed ? ", the halves squeezed" : "") + ")",
-                       DiagnosticLevel::Debug);
         }
         return seg.stream_ring_bytes > 0; // a held lease without a ring streams nothing
     }
@@ -4297,9 +4333,13 @@ private:
                 const std::uint64_t stride = seg.residency->frame_stride();
                 const auto frames          = static_cast<std::uint32_t>((seg.wide_work + stride - 1) / stride);
                 if (seg.residency->frames() > 0 && frames < seg.residency->lendable()) {
+                    // Nothing when other leases split the frames (another lane's Vision leases).
                     const cudaStream_t writers[] = {seg.device->stream};
-                    seg.work_lease = seg.residency->lend(frames, seg.device->stream, writers);
-                } else {
+                    if (auto lease = seg.residency->try_lend(frames, seg.device->stream, writers)) {
+                        seg.work_lease = *lease;
+                    }
+                }
+                if (!seg.work_lease.valid()) {
                     diagnostic("the prefill workspace could not be lent from the expert cache; " +
                                    std::to_string(seg.wide_work >> 20) + " MiB are allocated for the prompt",
                                DiagnosticLevel::Warning);
@@ -5981,6 +6021,7 @@ private:
     std::uint64_t next_transaction_    = 0;
     std::uint64_t pending_transaction_ = 0;
     std::uint64_t revision_            = 1;
+    std::uint64_t prefill_steps_       = 0; // prefill steps of every lane (a waiting Vision lend's progress)
     // ---------------------------------------------------------------- vision (vision_program.cpp)
     // The segment that runs the Vision tower (vision_tower_segment; INFERNIX_SPLIT_VISION), and on a
     // layer split, per segment index, the pinned crossing of the handoff from the tower's GPU into a
@@ -5999,7 +6040,12 @@ private:
     void vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
                         const qwen3_5::PreparedPromptData& prompt);
     [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }
-    void vision_step(Lane& lane);
+    // One step of the lane's encode; false when it made none (vision_lend waits).
+    [[nodiscard]] bool vision_step(Lane& lane, std::uint32_t index);
+    // Before the encode: lends the tower's handoff (and window) and each reading segment's copy on
+    // another GPU, each at the bottom of its pool; false, lending nothing, while that would split a
+    // pool that another prefilling lane's leases will free.
+    [[nodiscard]] bool vision_lend(LaneVision& v, std::uint32_t index);
     // After the encode: the handoff's copy into each reading segment on another GPU.
     void vision_mirror(LaneVision& v);
     // The handoff memory `seg` reads: its copy, or the tower's handoff on the tower's GPU.

@@ -4671,10 +4671,10 @@ The rest is the lending API.
 | Component | Change |
 |---|---|
 | `FramePool`, `LfruPolicy` (`program/expert_cache/expert_cache.{h,cpp}`, CUDA-free) | `FramePool`: state `kLoaned`, `lend(first, count)` (free frames only; the controller evicts held ones first), `give_back(first, count)`, `loaned_count()`. `LfruPolicy`: `erase` public as `evict(key)`; `set_capacity(n, victims&)` shrinks by evicting the lowest-score residents, or grows. |
-| `CacheController` | Maintains `frame_key_[frame]` on load and evict. `choose_run(count, busy)`: the contiguous run with the minimum summed LFRU score, by sliding window over ~9,400 frames (~10 µs, estimated); free frames score 0, **loaned frames are ineligible**, busy frames (targets of in-flight loads) are avoided while a run without them exists. `lend`: policy `evict` plus an `Absent` entry write per held key, `set_capacity(capacity − count)`, frames to `kLoaned`. `give_back`: frames to free, `set_capacity(+count)`, `drain_queue`. |
+| `CacheController` | Maintains `frame_key_[frame]` on load and evict. `choose_run(count, busy)`: the contiguous run with the minimum summed LFRU score, by sliding window over ~9,400 frames (~10 µs, estimated); free frames score 0, **loaned frames are ineligible**, busy frames (targets of in-flight loads) are avoided while a run without them exists; with `at_start` (a lease held across a prompt's calls, multi-GPU "On a layer split") the lowest run free of other leases instead. `longest_run(back, taken)`: the longest run a lease could take, with leases about to come back counted free and one about to be made counted taken. `lend`: policy `evict` plus an `Absent` entry write per held key, `set_capacity(capacity − count)`, frames to `kLoaned`. `give_back`: frames to free, `set_capacity(+count)`, `drain_queue`. |
 | No pending frames at a boundary | `after_round` always calls `on_quiescent`, with slack 0 and `rounds_in_flight = 1` (§9.5 as built); `lend` asserts `pending_count() == 0` |
 | **Load serial (ABA fix)** | A host `std::vector<std::uint64_t> load_serial_` per key, set when a copy is issued. `complete_load(key, frame, serial)` is true only if the entry is `Ready` and frame and serial both match. `Batch.loads` becomes `(key, frame, serial)` and `before_round` calls `complete_load` instead of the state-and-frame test, which also closes the case without lending. |
-| `ExpertResidency::lend(count, compute, std::span<const cudaStream_t> writers) → FrameLease` | Busy bitmap from `in_flight_`; `choose_run`, `controller.lend`; apply the `Absent` writes to `table_host_` and `upload_table(compute)`; for every in-flight batch with a target in the run, `cudaStreamWaitEvent` on compute and each writer (normally none, thanks to the run choice, so the window does not queue behind the ~77 ms backlog); returns `{first, count, DeviceSpan(frame_base + first·stride, count·stride)}` |
+| `ExpertResidency::lend(count, compute, std::span<const cudaStream_t> writers) → FrameLease` | (`try_lend`: nothing instead of throwing when no run exists; `lend_fit`: whether an `at_start` lease can be made and keeps the rest in one run.) Busy bitmap from `in_flight_`; `choose_run`, `controller.lend`; apply the `Absent` writes to `table_host_` and `upload_table(compute)`; for every in-flight batch with a target in the run, `cudaStreamWaitEvent` on compute and each writer (normally none, thanks to the run choice, so the window does not queue behind the ~77 ms backlog); returns `{first, count, DeviceSpan(frame_base + first·stride, count·stride)}` |
 | `ExpertResidency::give_back(lease, compute)` | The caller guarantees compute is ordered after every access. Loads released by `drain_queue` go through the `issue(commands, compute)` path of `after_round`: `table_ready_` on compute, then the copy stream waits. |
 | Accounting, graphs | `lendable()` = frames − loaned − floor; stats gain `lent_frames`, `lend_evictions`. Decode graphs reach frames through `frame_base` and per-layer tables (data), so lending invalidates no graph. |
 
@@ -4804,8 +4804,9 @@ other rates are estimates.
   (stream-bound: 898 MB at 3.1 GB/s), so the 5080 takes it.
 - **Lending.** The tower's segment lends the handoff (W) or handoff and window (L) from its own
   cache and runs placement W in its own prefill workspace, as on one GPU, under its `SegmentWork`.
-  The handoff's lease starts the pool (`CacheController::choose_run(…, at_start)`; the cheapest run
-  when the start holds another lease), because it stays lent through the prompt's calls and the
+  The handoff's lease starts the pool (`CacheController::choose_run(…, at_start)`; with other
+  leases at the start, the first fit past them: "Several media prompts" below), because it stays
+  lent through the prompt's calls and the
   prompt's stream lease needs one contiguous run of most of the frames: 1,911 of 3,447 on the
   5080 head at K = 28, 1,656 of 2,208 on the 5080 alone, 1,667 of 2,225 on the `0,0` test head. A
   one-frame lease where the cheapest frame happened to be split the `0,0` head so that no such run
@@ -4817,7 +4818,8 @@ other rates are estimates.
   two segments' work never overlaps on one GPU (`SegmentWork`), so its next call follows the encode,
   and the release follows its last call before the frames go back. A reader on another GPU gets its
   own copy once the encode ends (`vision_mirror`): `⌈5,120·V / stride⌉` frames its own cache lends
-  (also at the start), filled through a `BulkHandoff` per GPU pair (4 × 4 MiB pinned ring) from
+  (also at the start, lent with the handoff by `vision_lend`), filled through a `BulkHandoff` per
+  GPU pair (4 × 4 MiB pinned ring) from
   the tower's stream to the reader's (cross-device event waits, no host wait), given back with the
   handoff. `stage_vision` / `stage_mtp_vision` (and the layer walk's per-chunk copies) point each
   segment at its copy (`vision_memory`). The copy of a 384-token image is 1.9 MiB (≈ 0.6 ms on the
@@ -4832,6 +4834,58 @@ other rates are estimates.
   refill in its first decode round instead, whose route download queues behind it).
 - **Admission.** `feasible` requires the tower's lendable frames for the window and each copy's
   on its reader (a quarter of each cache is never lent).
+- **Several media prompts** (`--max-concurrency` 2 or more; review fix, 2026-10-12). The handoff
+  and the copies are held until the prompt's last call, so a second media prompt's encode lends
+  while the first one's leases hold the start of the pools. `choose_run(…, at_start)` then fell back
+  to the cheapest run, which can be anywhere: the next lend that needs one run of most of a pool's
+  frames (the first prompt's next walk span, whose stream lease the second one's encode had
+  returned, or the second prompt's own first call) found none, `ExpertResidency::lend` threw
+  `std::logic_error`, and the engine loop failed every request and stopped (an error during a
+  binding is not recovered per request). The 5080 alone was exposed the same way. Three parts:
+  - **First fit at the bottom.** `at_start` takes the lowest run free of other leases (busy frames
+    included, as before): the leases of the prompts in flight stack at the bottom of each pool, and
+    one that fits a hole a returned lease left takes it. With nothing else lent this is frame 0, as
+    before.
+  - **Lend once, or wait** (`ProgramImpl::vision_lend`). All of an encode's leases are lent at its
+    first step: the tower's handoff and window and each reader's copy (the copy's lend moved from
+    the encode's end). They are lent when `ExpertResidency::lend_fit` finds, for every pool, that
+    the lease leaves the frames still lendable after it in one run with that pool's stream and
+    wide leases counted as coming back (`LendFit::Keeps`; `CacheController::longest_run` with the
+    runs coming back free and the new lease taken). Otherwise the stream and wide leases of those
+    pools go back first (between calls nothing reads them; a layer walk's span keeps them), and if a
+    lease would still split a pool (`Splits`) or cannot be made at all (`None`) while another lane
+    prefills, the step lends nothing: `poll_context` reports no progress and the engine polls again
+    at its next boundaries, after that lane's calls (its handoff and copies go back with its last
+    call). A lease that would split waits at most `kVisionWaitPolls` = 256 polls without any prefill
+    step, then is lent anyway (a lane whose prefill cannot run during a binding, such as a capture
+    waiting for a reclaim, must not hold the encode); one that cannot be made waits, with a Warning
+    after 256 such polls. With no other lane prefilling nothing else is lent, so the leases fit.
+  - **Stream and wide leases never throw on a split pool.** `stream_chunk` sizes its lease again by
+    the longest run when `ExpertResidency::try_lend` finds none (squeezed halves, no walk area, or no
+    lease: the chunk stages its misses), and `enter_wide` falls back to its temporary allocation.
+  - One media prompt at a time is unchanged: the previous prompt's leases went back with its last
+    call, so every pool is whole when the encode starts and the leases land at frame 0 as before;
+    the copy is lent before the encode instead of after it, with nothing run on its GPU in between.
+  - Verified (`C:\AI\infernix\wave6-conc*.sh`, `runs/w6c`; `vision_conc.py`: seven pairs of
+    concurrent requests under `--max-concurrency 2`, an image with 32K tokens of text and a second
+    image sent 0.3-3.5 s later, two images at once, a video with 32K tokens and two images, an
+    image with 32K tokens and a video with 16K tokens 0.5 s later). The b8ff7ba build on `0,0`
+    K = 28 failed the last pair: the video's window exceeded `lendable()` while the first prompt's
+    leases were held ("cannot lend that many frames"), both requests got HTTP 500 and the server
+    stopped; on `0,1` and the 5080 alone it passed that run by chance. This build answers all 14
+    requests on `0,1` K = 28, `0,0` K = 28 (12K- and 32K-token prompts) and the 5080 alone, and
+    stays up; on `0,0` the encode waited (`None`: the head's stream lease held 1,553-1,648 of
+    2,072 frames through the other prompt's walk span) 5 times with 12K-token prompts and once
+    with 32K, in the pair that failed before; no lease was lent split, no stream lease resized.
+    Each request's time to first token is b8ff7ba's within 0.5 % on `0,0`, 2.3 % on `0,1` and 1 %
+    on the 5080 alone (4 % for the two images sent together). One prompt at a
+    time is unchanged: Vision and text replies at 70 SMs identical between `0,1`, `0,0` and
+    `--device 0` and to b8ff7ba's, the CLI's image + video ids and per-call logits hashes equal
+    (and equal to b8ff7ba's), the 5080's greedy ids equal to the reference (plain and MTP),
+    forward logits byte-equal (perplexity 3.6792), ctests `split_vision` 38 ok and
+    `split_vision_two_gpu` 21 ok, unit 4/4 and mgpu 30/30; the production 20-turn conversation
+    with `--vision` gives md5 `fbaab9f6…`, 83.0 tok/s over the second half (88.8 on its clean
+    turns) and an image TTFT of 2.56 s (2.58 s before).
 - **Prefix cache.** Unchanged: the block keys and cumulative Vision extras are the frontend's, a
   resume encodes (and copies) only the items past its frontier, and a frontier never lies inside an
   item.

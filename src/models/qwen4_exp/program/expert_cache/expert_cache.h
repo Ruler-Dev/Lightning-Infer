@@ -242,12 +242,22 @@ public:
     // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
     // held experts have the minimum summed LFRU score (free frames score 0); lent frames are
     // ineligible, and runs over `busy` frames (targets of loads still in flight) are avoided while a
-    // run without them exists. Nothing when no run fits. With `at_start`, the run [0, count) when
-    // none of its frames is lent or retiring (busy ones included), else the cheapest run: a lease
-    // held across a prompt's calls (the Vision handoff) then leaves every other lendable frame in one
-    // contiguous run, which the prompt's stream lease may need most of.
+    // run without them exists. Nothing when no run fits. With `at_start`, the lowest run whose
+    // frames are neither lent nor retiring (busy ones included): [0, count) when no other lease
+    // holds the start, else right after the leases there (first fit). Leases held across a prompt's
+    // calls (the Vision handoffs and their copies, one per media prompt in flight) so stay together
+    // at the bottom and leave every other lendable frame in one contiguous run, which a prompt's
+    // stream lease may need most of.
     [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy,
                                                           bool at_start = false) const;
+    // A run of frames [first, first + count).
+    struct Run {
+        std::uint32_t first = 0, count = 0;
+    };
+    // The longest run of frames a lease could take now (none lent or retiring, busy ones included),
+    // counting the `back` runs as free (leases about to come back) and `taken` as lent (a lease
+    // about to be made).
+    [[nodiscard]] std::uint32_t longest_run(std::span<const Run> back = {}, Run taken = {}) const;
     // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
     // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
     // evicted elsewhere). Returns the number of evicted experts. With `refill`, the evicted experts

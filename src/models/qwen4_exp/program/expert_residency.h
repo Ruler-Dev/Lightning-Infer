@@ -51,6 +51,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -141,10 +142,27 @@ public:
     // Between rounds (no round in flight): evicts the experts of the cheapest run of `count` frames
     // (avoiding frames that in-flight promotions target while it can), uploads the table on
     // `compute`, and makes `compute` and every `writers` stream wait for each in-flight promotion
-    // batch that targets the run. `at_start`: the run at the pool's start when it is free of other
-    // leases (CacheController::choose_run), for a lease held across a prompt's calls.
+    // batch that targets the run. `at_start`: the lowest run free of other leases, the pool's start
+    // when nothing else is lent there (CacheController::choose_run), for a lease held across a
+    // prompt's calls. Throws when no run of `count` frames exists.
     FrameLease lend(std::uint32_t count, cudaStream_t compute, std::span<const cudaStream_t> writers,
                     bool at_start = false);
+    // lend, or nothing (nothing lent) when other leases split the frames so that no run of `count`
+    // exists; longest_run then tells the longest run a lease can take.
+    [[nodiscard]] std::optional<FrameLease> try_lend(std::uint32_t count, cudaStream_t compute,
+                                                     std::span<const cudaStream_t> writers, bool at_start = false);
+    // The longest run of frames a lease can take now; exact after a lend or a lend_fit, which settle
+    // the cache first (otherwise frames still retiring count as taken).
+    [[nodiscard]] std::uint32_t longest_run() const;
+    // Whether lend(count, ..., at_start = true) can be made now (None: more than lendable, or no
+    // run), and whether it then leaves the frames still lendable after it in one run once the
+    // `transient` leases are back (Keeps; else Splits). The transient leases are a prompt's stream
+    // and wide leases, which return before a later lend needs their frames: with Keeps, a later
+    // lease of any lendable size (a prompt's stream lease) still finds a run (design §19.3.2 "On a
+    // layer split"). First settles the cache as lend does (deferred promotions issued on `compute`,
+    // demotions finished, landed promotions published, landing reservations released).
+    enum class LendFit : std::uint8_t { None, Splits, Keeps };
+    [[nodiscard]] LendFit lend_fit(std::uint32_t count, cudaStream_t compute, std::span<const FrameLease> transient);
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);
@@ -247,6 +265,11 @@ private:
     // Tier mode: completes the demotions whose copies finished (all of them, waiting, with `wait`):
     // publishes their slots (T7), frees their frames and loads queued experts into them.
     void finish_demotions(cudaStream_t compute, bool wait);
+    // A lend's first step: deferred promotions issued (their frames count as busy), demotions
+    // finished, landed promotions published, landing reservations released.
+    void settle_for_lend(cudaStream_t compute);
+    // The frames that in-flight promotions target.
+    [[nodiscard]] std::vector<std::uint8_t> busy_frames() const;
 
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;

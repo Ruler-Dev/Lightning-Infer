@@ -538,8 +538,11 @@ void test_lending_refill() {
 // A lease held across a prompt's calls starts the pool (choose_run at_start, the Vision handoff):
 // a one-frame lease where the cheapest frame sits can split the pool so that no run of most of its
 // frames remains (the prompt's stream lease on a layer split's 16 GB head needs over half of them);
-// at the start, every other frame stays one run. A start that holds a lent frame falls back to the
-// cheapest run.
+// at the start, every other frame stays one run. With the start lent (another media prompt's lease,
+// several prompts in flight), at_start takes the first fit past it, never the cheapest run: the
+// leases stack at the bottom, and one that fits a hole a returned lease left takes it. longest_run
+// tells the run a later lease can take, with leases about to come back counted free and one about
+// to be made counted taken (ExpertResidency::lend_fit).
 void test_lending_at_start() {
     constexpr std::uint32_t kKeys = 64, kFrames = 8;
     CacheController cache(kKeys, kFrames, 0, 1);
@@ -569,10 +572,31 @@ void test_lending_at_start() {
     cmds.clear();
     check(cache.choose_run(kFrames - 1, none) == std::optional<std::uint32_t>(1),
           "after a lease at the start every other frame is one run");
-    const auto fallback = cache.choose_run(1, none, true);
-    check(fallback.has_value() && *fallback != 0, "a start holding a lent frame falls back to the cheapest run");
-    cache.give_back(0, 1, cmds);
+    check(cache.choose_run(1, none, true) == std::optional<std::uint32_t>(1),
+          "with the start lent, at_start takes the first fit past it (not the cheapest frame, 4)");
+    check(cache.longest_run() == kFrames - 1, "longest_run: every frame past the lease");
+    cache.lend(1, 2, cmds); // a second media prompt's lease stacks on the first
     cmds.clear();
+    check(cache.longest_run() == kFrames - 3, "two leases at the bottom leave the rest in one run");
+    cache.give_back(0, 1, cmds); // the first prompt ends
+    cmds.clear();
+    check(cache.choose_run(1, none, true) == std::optional<std::uint32_t>(0),
+          "a lease that fits the hole a returned one left takes it");
+    check(cache.choose_run(2, none, true) == std::optional<std::uint32_t>(3),
+          "a larger one takes the first fit past the leases");
+    check(cache.longest_run({}, {3, 2}) == kFrames - 5, "longest_run with a lease about to be made");
+    // A lease inside the pool (a prompt's stream lease) splits it; counted as coming back, it joins
+    // its neighbours again.
+    cache.lend(5, 1, cmds);
+    cmds.clear();
+    check(cache.longest_run() == 2, "a lease inside the pool splits the rest");
+    const CacheController::Run back[] = {{5, 1}};
+    check(cache.longest_run(back) == kFrames - 3, "a lease counted as coming back joins its neighbours");
+    check(!cache.choose_run(3, none, true).has_value(), "no run of three frames while the pool is split");
+    cache.give_back(5, 1, cmds);
+    cache.give_back(1, 2, cmds);
+    cmds.clear();
+    check(cache.longest_run() == kFrames, "every frame back: one run");
     cache.lend(4, 1, cmds);
     cmds.clear();
     check(!cache.choose_run(kFrames - 1, none).has_value(), "a lease inside the pool splits it");

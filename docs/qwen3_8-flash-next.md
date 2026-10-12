@@ -157,7 +157,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
   frames only while it encodes (`--vision-offload auto`). On a layer split it runs on the GPU with
   the faster PCIe link and the other GPU gets a copy of the image embeddings
-  ([layer split](cli.md#layer-split)).
+  ([layer split](cli.md#layer-split)). With `--max-concurrency` 2 or more, a media prompt's encode
+  can wait until a concurrent prompt's prefill gives its borrowed frames back.
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - **Warm start.** The engine saves the expert cache's state (which experts it holds and how often each
   was used) to `<artifact>.expert-state` when it stops and every 10 minutes between requests. The
