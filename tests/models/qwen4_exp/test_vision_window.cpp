@@ -4,7 +4,8 @@
 // boundary, a chunk with no image token, the MTP cell mapping (cell c takes token c + 1, so a
 // chunk's last cell can take the next chunk's first image token); placement W (one step, the
 // handoff only lent) against L (handoff and window lent, several layers per step); items inside the
-// reused prefix are not encoded, and a reused prefix ending inside an item is refused.
+// reused prefix are not encoded, and a reused prefix ending inside an item is refused; the segment
+// of a layer split that runs the tower (vision_tower_segment).
 
 #include "models/qwen4_exp/program/vision_window.h"
 
@@ -103,6 +104,20 @@ int main() {
             (void)q4::plan_vision_window(two, 40, 1, 0, 512ULL << 20, kFrame, 2560, 1152, 27);
         } catch (const std::logic_error&) { threw = true; }
         check(threw, "a reused prefix ending inside an item is refused");
+
+        // The tower's segment of a layer split: a resident tower stays with the embedding; an
+        // offloaded one goes to the fastest link, the head among links within 10 % of it.
+        const auto tower = [](std::vector<double> rates, bool offload) {
+            return q4::vision_tower_segment(rates, offload);
+        };
+        check(tower({28.4e9}, true) == 0, "one segment runs the tower");
+        check(tower({3.1e9, 28.4e9}, false) == 0, "a resident tower runs on the first segment");
+        check(tower({3.1e9, 28.4e9}, true) == 1, "an offloaded tower runs on the fast link's segment (the head)");
+        check(tower({28.4e9, 3.1e9}, true) == 0, "an offloaded tower runs on the fast link's segment (the first)");
+        check(tower({3.12e9, 3.05e9}, true) == 1, "two probes of one link: the head");
+        check(tower({28.4e9, 26.0e9}, true) == 1, "a link within 10 % of the fastest counts as equal");
+        check(tower({3.1e9, 28.4e9, 27.9e9}, true) == 2, "of three, the last among the fastest");
+        check(tower({3.1e9, 28.4e9, 7.1e9}, true) == 1, "of three, the fastest when the head's is slow");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

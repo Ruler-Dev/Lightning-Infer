@@ -570,9 +570,17 @@ std::optional<std::uint32_t> CacheController::frame_key(std::uint32_t frame) con
     return frame_key_[frame];
 }
 
-std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const {
+std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, std::span<const std::uint8_t> busy,
+                                                        bool at_start) const {
     const std::uint32_t n = frames_.backed();
     if (count == 0 || count > n) { return std::nullopt; }
+    if (at_start) {
+        bool whole = true;
+        for (std::uint32_t f = 0; f < count && whole; ++f) {
+            whole = !frames_.is_loaned(f) && (frames_.is_free(f) || frame_key_[f] != kNoKey);
+        }
+        if (whole) { return 0U; }
+    }
     // Sliding window over the backed frames: the summed score of held experts (free frames 0),
     // with lent and retiring frames and, in the first pass, busy frames breaking the window.
     std::optional<std::uint32_t> best;

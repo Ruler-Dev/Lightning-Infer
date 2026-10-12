@@ -35,6 +35,13 @@
 // E.g. --prompts 12388,73828 --context 81920 --walk-modes --prompt-decode 8: 3 x 4096 + 100 tokens
 // (one span, then a narrow call) and 18 x 4096 + 100 (two spans: 16 calls at kWalkMaxTokens, 2).
 //
+// --vision DIR (the example media, examples/cli/media) enables Vision and adds chat requests with
+// media, each generating up to --vision-decode tokens (default 24): one image, two images, an image
+// and a video. The split's ids and per-call logits must equal the unsplit run's. The tower runs on the
+// segment the Program places it on (the head on one GPU or on the faster link); --vision-placements
+// also runs each split with it on the first segment (INFERNIX_SPLIT_VISION=first), so both
+// directions of the handoff's copy between two GPUs are compared.
+//
 // Two GPUs: --devices 0,1 --reference 0 with INFERNIX_NUMERICS_SMS set to the smaller GPU's SM
 // count (the same launch decompositions on both). Skips (77) unless INFERNIX_QWEN4_ARTIFACT names
 // a Qwen4Exp artifact. Each Engine pins the expert banks (about 64 GiB of Host RAM); they run one
@@ -44,6 +51,7 @@
 //   infernix_qwen4_exp_split_prefill_real_test [--devices A,B] [--reference D] [--splits K,...]
 //       [--prompts N,...] [--decode N] [--chunk N] [--context N] [--plain] [--no-forced] [--no-cancel]
 //       [--long] [--pair] [--handoff event|gate] [--timeout] [--walk-modes] [--prompt-decode N] [--work DIR]
+//       [--vision DIR] [--vision-placements] [--vision-decode N]
 
 #include "models/qwen4_exp/program/program.h"
 #include "infernix/engine.h"
@@ -58,6 +66,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -89,6 +98,9 @@ struct Options {
     bool walk_modes       = false;
     std::uint32_t prompt_decode = 1;
     fs::path work         = fs::temp_directory_path() / "infernix_split_prefill";
+    std::optional<fs::path> vision; // the example media's directory
+    bool vision_placements      = false;
+    std::uint32_t vision_decode = 24;
 };
 
 std::vector<std::uint32_t> parse_list(const std::string& text) {
@@ -147,6 +159,13 @@ Options parse(int argc, char** argv) {
             if (o.prompt_decode == 0) { throw std::invalid_argument("--prompt-decode needs N > 0"); }
         } else if (arg == "--work") {
             o.work = value();
+        } else if (arg == "--vision") {
+            o.vision = fs::path(value());
+        } else if (arg == "--vision-placements") {
+            o.vision_placements = true;
+        } else if (arg == "--vision-decode") {
+            o.vision_decode = static_cast<std::uint32_t>(std::stoul(value()));
+            if (o.vision_decode == 0) { throw std::invalid_argument("--vision-decode needs N > 0"); }
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
@@ -156,6 +175,7 @@ Options parse(int argc, char** argv) {
         throw std::invalid_argument("--timeout needs --handoff gate and --decode N > 0");
     }
     if (o.pair && o.decode == 0) { throw std::invalid_argument("--pair needs --decode N > 0"); }
+    if (o.vision_placements && !o.vision) { throw std::invalid_argument("--vision-placements needs --vision DIR"); }
     return o;
 }
 
@@ -183,8 +203,38 @@ struct Run {
     std::optional<Outcome> forced;
     std::optional<Outcome> cancelled, after_cancel;
     std::optional<Outcome> long_prompt;
+    std::map<std::string, Outcome> media; // --vision: by case name
     std::vector<std::string> diagnostics;
 };
+
+// A chat request with media (--vision): its files in the example media directory and its question.
+struct VisionCase {
+    std::string name;
+    std::vector<std::pair<infernix::MediaKind, std::string>> media;
+    std::string question;
+};
+
+std::vector<VisionCase> vision_cases() {
+    using infernix::MediaKind;
+    return {{"one image", {{MediaKind::Image, "visual_chart.png"}},
+             "Read the chart's title, count the red circles and say on which side of the green triangle the blue "
+             "square is."},
+            {"two images", {{MediaKind::Image, "compare_left.png"}, {MediaKind::Image, "compare_right.png"}},
+             "How many red circles does each image have, and which yellow shape does the right one add?"},
+            {"image and video", {{MediaKind::Image, "visual_chart.png"}, {MediaKind::Video, "temporal_events.mp4"}},
+             "Give the chart title's first word and the number in the video's END marker, joined by a hyphen."}};
+}
+
+infernix::OwnedMedia load_media(const fs::path& file, infernix::MediaKind kind) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) { throw std::runtime_error("cannot read " + file.string()); }
+    infernix::OwnedMedia out;
+    out.kind        = kind;
+    out.bytes       = std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    out.media_type  = kind == infernix::MediaKind::Image ? "image/png" : "video/mp4";
+    out.source_name = file.string();
+    return out;
+}
 
 // Reads the hash file's lines past the first `seen`.
 std::vector<std::string> new_lines(const fs::path& file, std::size_t& seen) {
@@ -241,6 +291,7 @@ Run run_engine(const Options& o, const char* artifact, const char* ngram, const 
     options.kv_cache              = infernix::KvCacheStorage::Int8Group64;
     options.kv_capacity           = infernix::KvCapacityPolicy::explicit_capacity(o.context);
     options.context_cache.enabled = false;
+    options.enable_vision         = o.vision.has_value();
     if (o.mtp) {
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 4;
@@ -356,6 +407,31 @@ Run run_engine(const Options& o, const char* artifact, const char* ngram, const 
             run.cancelled = std::move(cancelled);
             std::printf("  cancelled prompt: %zu of its calls ran before the cancel\n", run.cancelled->lines.size());
         }
+        if (o.vision) {
+            for (const VisionCase& c : vision_cases()) {
+                infernix::PromptInput input;
+                infernix::ChatMessage message;
+                message.role = infernix::ChatRole::User;
+                for (const auto& [kind, file] : c.media) {
+                    message.parts.push_back(
+                        {.kind = infernix::MessagePartKind::Media, .media = load_media(*o.vision / file, kind)});
+                }
+                message.parts.push_back({.kind = infernix::MessagePartKind::Text, .text = c.question});
+                input.messages.push_back(std::move(message));
+                input.options.enable_thinking = false;
+                const auto started = std::chrono::steady_clock::now();
+                Outcome out;
+                try {
+                    out.ids = engine.generate(engine.prepare(std::move(input)), greedy(o.vision_decode)).generated_token_ids;
+                } catch (const std::exception& error) { out.error = error.what(); }
+                out.lines = new_lines(hash_file, seen);
+                std::printf("  %s: %zu tokens, %zu calls and rounds, %.1f s%s\n", c.name.c_str(), out.ids.size(),
+                            out.lines.size(),
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                            out.error.empty() ? "" : (", failed: " + out.error).c_str());
+                run.media[c.name] = std::move(out);
+            }
+        }
         if (o.long_prompt) {
             const auto started = std::chrono::steady_clock::now();
             run.long_prompt =
@@ -452,7 +528,7 @@ int main(int argc, char** argv) {
             std::max(o.long_prompt ? 40000U : 0U, *std::max_element(o.prompts.begin(), o.prompts.end()));
         if (longest >= o.context) { throw std::invalid_argument("a prompt does not fit in --context"); }
 
-        std::printf("reference: device %d, unsplit\n", reference_device);
+        std::printf("reference: device %d, unsplit%s\n", reference_device, o.vision ? ", with Vision" : "");
         // The prompts' tokens: the corpus through the reference Engine's tokenizer (run_engine).
         std::vector<infernix::TokenId> tokens;
         const Run reference =
@@ -465,7 +541,15 @@ int main(int argc, char** argv) {
         }
 
         if (o.walk_modes) { print_walks(reference.diagnostics); }
-        // (K, mode): 0 the default (layer walk with the MoE offload), 1 the walk without it, 2 chunk-major.
+        for (const VisionCase& c : o.vision ? vision_cases() : std::vector<VisionCase>{}) {
+            const Outcome& want = reference.media.at(c.name);
+            // A request may end at a stop token before --vision-decode tokens.
+            check(want.error.empty() && !want.ids.empty() && want.ids.size() <= o.vision_decode && !want.lines.empty(),
+                  "reference: the " + c.name + " request gives " + std::to_string(want.ids.size()) +
+                      " token(s) and its calls' logits" + (want.error.empty() ? "" : " (failed: " + want.error + ")"));
+        }
+        // (K, mode): 0 the default (layer walk with the MoE offload), 1 the walk without it, 2 chunk-major,
+        // 3 the default with the Vision tower on the first segment.
         std::vector<std::pair<std::uint32_t, int>> runs;
         for (const std::uint32_t k : o.splits) {
             runs.emplace_back(k, 0);
@@ -473,22 +557,52 @@ int main(int argc, char** argv) {
                 runs.emplace_back(k, 1);
                 runs.emplace_back(k, 2);
             }
+            if (o.vision_placements) { runs.emplace_back(k, 3); }
         }
-        const char* const mode_names[] = {" (layer walk, MoE offload)", " (layer walk)", " (chunk-major)"};
-        const char* const mode_files[] = {"", "-walk", "-chunk"};
+        const char* const mode_names[] = {" (layer walk, MoE offload)", " (layer walk)", " (chunk-major)",
+                                          " (Vision tower on the first segment)"};
+        const char* const mode_files[] = {"", "-walk", "-chunk", "-vision-first"};
         std::map<std::uint32_t, Run> walked; // per K, the default run (--walk-modes)
         for (const auto& [k, mode] : runs) {
             const bool walking     = mode == 0;
             const std::string name = "--devices " + std::to_string(o.devices[0]) + "," + std::to_string(o.devices[1]) +
-                                     " --layer-split " + std::to_string(k) + (o.walk_modes ? mode_names[mode] : "");
+                                     " --layer-split " + std::to_string(k) +
+                                     (o.walk_modes || o.vision_placements ? mode_names[mode] : "");
             std::printf("%s\n", name.c_str());
             set_variable("INFERNIX_SPLIT_WALK", mode == 2 ? "0" : "");
             set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", mode == 1 ? "0" : "");
+            set_variable("INFERNIX_SPLIT_VISION", mode == 3 ? "first" : "");
             const Run split = run_engine(o, artifact, ngram, o.devices, k,
                                          o.work / ("split-" + std::to_string(k) + mode_files[mode] + ".hash"), tokens);
             set_variable("INFERNIX_SPLIT_WALK", "");
             set_variable("INFERNIX_SPLIT_MOE_OFFLOAD", "");
+            set_variable("INFERNIX_SPLIT_VISION", "");
             if (o.walk_modes) { print_walks(split.diagnostics); }
+            if (o.vision) {
+                std::string tower;
+                for (const std::string& line : split.diagnostics) {
+                    if (line.find("runs the Vision tower") != std::string::npos ||
+                        line.find("Vision handoff of") != std::string::npos) {
+                        std::printf("  [vision] %s\n", line.c_str());
+                        if (tower.empty() && line.find("runs the Vision tower") != std::string::npos) { tower = line; }
+                    }
+                }
+                if (mode == 3) {
+                    check(tower.rfind("segment 0 ", 0) == 0, name + ": the Vision tower runs on the first segment");
+                }
+                for (const VisionCase& c : vision_cases()) {
+                    const Outcome& want = reference.media.at(c.name);
+                    const Outcome& got  = split.media.at(c.name);
+                    check(got.error.empty() && got.ids == want.ids && !want.ids.empty(),
+                          name + ": the " + c.name + " request generates the unsplit run's " +
+                              std::to_string(want.ids.size()) + " tokens" +
+                              (got.error.empty() ? "" : " (failed: " + got.error + ")"));
+                    check(same_logits(want.lines, got.lines),
+                          name + ": the " + c.name + " request's calls and rounds have the unsplit run's logits (" +
+                              std::to_string(got.lines.size()) + " lines vs " + std::to_string(want.lines.size()) +
+                              ", last: " + first_line(got) + " vs " + first_line(want) + ")");
+                }
+            }
             for (const std::uint32_t n : o.prompts) {
                 const Outcome& want = reference.prompts.at(n);
                 const Outcome& got  = split.prompts.at(n);

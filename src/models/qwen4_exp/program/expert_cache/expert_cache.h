@@ -242,8 +242,12 @@ public:
     // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
     // held experts have the minimum summed LFRU score (free frames score 0); lent frames are
     // ineligible, and runs over `busy` frames (targets of loads still in flight) are avoided while a
-    // run without them exists. Nothing when no run fits.
-    [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const;
+    // run without them exists. Nothing when no run fits. With `at_start`, the run [0, count) when
+    // none of its frames is lent or retiring (busy ones included), else the cheapest run: a lease
+    // held across a prompt's calls (the Vision handoff) then leaves every other lendable frame in one
+    // contiguous run, which the prompt's stream lease may need most of.
+    [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy,
+                                                          bool at_start = false) const;
     // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
     // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
     // evicted elsewhere). Returns the number of evicted experts. With `refill`, the evicted experts

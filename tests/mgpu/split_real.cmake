@@ -63,6 +63,30 @@ set_tests_properties(infernix_qwen4_exp_split_gate_two_gpu_real_test PROPERTIES
   LABELS "gpu;real"
   TIMEOUT 3600
   ENVIRONMENT "INFERNIX_NUMERICS_SMS=70")
+# Vision across a split: chat requests with one image, two images, and an image and a video, each
+# generating up to 24 tokens, give the unsplit Engine's ids and per-call logits, with the tower
+# where the Program places it (the head: on one GPU, or on the faster link) and on the first
+# segment (INFERNIX_SPLIT_VISION=first). On two contexts of device 0 at K = 1 and 28 (the other segment reads
+# the handoff in place), and across two GPUs at K = 28 at 70 SMs (the handoff copied to the other GPU
+# through pinned memory, in both directions).
+add_test(NAME infernix_qwen4_exp_split_vision_real_test
+  COMMAND infernix_qwen4_exp_split_prefill_real_test --splits 1,28 --prompts 1 --decode 0 --no-forced
+          --no-cancel --vision "${PROJECT_SOURCE_DIR}/examples/cli/media" --vision-placements)
+set_tests_properties(infernix_qwen4_exp_split_vision_real_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 3600)
+add_test(NAME infernix_qwen4_exp_split_vision_two_gpu_real_test
+  COMMAND infernix_qwen4_exp_split_prefill_real_test --devices 0,1 --reference 0 --splits 28 --prompts 1
+          --decode 0 --no-forced --no-cancel --vision "${PROJECT_SOURCE_DIR}/examples/cli/media"
+          --vision-placements)
+set_tests_properties(infernix_qwen4_exp_split_vision_two_gpu_real_test PROPERTIES
+  SKIP_RETURN_CODE 77
+  RUN_SERIAL TRUE
+  LABELS "gpu;real"
+  TIMEOUT 3600
+  ENVIRONMENT "INFERNIX_NUMERICS_SMS=70")
 # The hybrid prefix cache across a split at K = 24 on two contexts of device 0 (multi-GPU WP15):
 # every scenario of the prefix-cache test (tap, Host-block and endpoint resumes, X3/X5/X6, a resumed
 # readout, coalescing, prefetch, the Host tier's file) on the unsplit Engine and on the split, whose

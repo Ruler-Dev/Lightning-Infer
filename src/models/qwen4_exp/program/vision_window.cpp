@@ -56,6 +56,15 @@ VisionWindowPlan plan_vision_window(std::span<const VisionWindowItem> items, std
     return plan;
 }
 
+std::size_t vision_tower_segment(std::span<const double> link_rates, bool offload) {
+    if (!offload || link_rates.size() <= 1) { return 0; }
+    const double fastest = *std::max_element(link_rates.begin(), link_rates.end());
+    for (std::size_t s = link_rates.size(); s-- > 0;) {
+        if (link_rates[s] >= kVisionLinkTie * fastest) { return s; }
+    }
+    return link_rates.size() - 1; // unreachable: the fastest link itself qualifies
+}
+
 VisualSlice visual_slice(std::span<const std::uint32_t> visual, std::uint32_t a, std::uint32_t b, std::uint32_t base,
                          std::span<std::int32_t> columns) {
     const auto lo = std::lower_bound(visual.begin(), visual.end(), a);

@@ -18,8 +18,10 @@ inline constexpr bool kSplitDecode = true;
 // segment copies its own KV planes and state on its own streams; records and files keep the whole
 // model's layout, so they are interchangeable with an unsplit run's).
 inline constexpr bool kSplitPrefixCache = true;
-// Vision input.
-inline constexpr bool kSplitVision = false;
+// Vision input: the tower runs on one segment (an offloaded tower on the fastest link's, a resident
+// one on the first), and the segments that read its embeddings on another GPU get a copy through
+// pinned memory (design §19.3.2, "On a layer split").
+inline constexpr bool kSplitVision = true;
 // The SSD expert tier (the experts not in Host RAM are read from the artifact on use).
 inline constexpr bool kSplitExpertTier = false;
 

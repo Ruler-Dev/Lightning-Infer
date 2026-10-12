@@ -130,13 +130,12 @@ int check_device_options() {
     } else {
         failures += check(validation_error(qwen4, Architecture::Qwen4Exp).empty(),
                           "a Qwen4Exp layer split was refused");
-        if (!split::kSplitVision) {
-            infernix::EngineOptions vision = qwen4;
-            vision.enable_vision           = true;
-            failures +=
-                check(contains(validation_error(vision, Architecture::Qwen4Exp), "--vision"),
-                      "a layer split accepted vision before it supports it");
-        }
+        // Vision runs across the split (the tower on one GPU, its embeddings copied to the others).
+        static_assert(split::kSplitVision);
+        infernix::EngineOptions vision = qwen4;
+        vision.enable_vision           = true;
+        failures += check(validation_error(vision, Architecture::Qwen4Exp).empty(),
+                          "a layer split refused --vision");
         // The gate handoff needs two GPUs; on one the event handoff runs.
         infernix::EngineOptions gated = qwen4;
         gated.split_handoff           = infernix::SplitHandoff::Gate;

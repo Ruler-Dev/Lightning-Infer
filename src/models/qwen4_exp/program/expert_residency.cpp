@@ -613,7 +613,7 @@ std::uint32_t ExpertResidency::lendable() const noexcept {
 }
 
 ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
-                                                  std::span<const cudaStream_t> writers) {
+                                                  std::span<const cudaStream_t> writers, bool at_start) {
     if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
     issue_deferred(compute);         // their frames count as busy below
     finish_demotions(compute, true); // a held frame must not be lent
@@ -625,7 +625,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
             if (load.frame < frames_) { busy[load.frame] = 1; }
         }
     }
-    const auto first = controller_->choose_run(count, busy);
+    const auto first = controller_->choose_run(count, busy, at_start);
     if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
     commands_.clear();
     stats_.lend_evictions += controller_->lend(*first, count, commands_, refill_lent_);

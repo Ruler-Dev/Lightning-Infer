@@ -141,8 +141,10 @@ public:
     // Between rounds (no round in flight): evicts the experts of the cheapest run of `count` frames
     // (avoiding frames that in-flight promotions target while it can), uploads the table on
     // `compute`, and makes `compute` and every `writers` stream wait for each in-flight promotion
-    // batch that targets the run.
-    FrameLease lend(std::uint32_t count, cudaStream_t compute, std::span<const cudaStream_t> writers);
+    // batch that targets the run. `at_start`: the run at the pool's start when it is free of other
+    // leases (CacheController::choose_run), for a lease held across a prompt's calls.
+    FrameLease lend(std::uint32_t count, cudaStream_t compute, std::span<const cudaStream_t> writers,
+                    bool at_start = false);
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);

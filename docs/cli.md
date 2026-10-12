@@ -434,7 +434,19 @@ keep the whole model's layout, so a file saved by an unsplit run loads into a sp
 reverse. A resumed request keeps the split's exactness: with the same launch decompositions it
 gives the unsplit run's bits.
 
-A split refuses, until each is supported, `--vision`, the
+`--vision` runs across the split. The vision tower stays in pinned RAM (`--vision-offload auto`) and
+streams its 0.9 GB of weights over the PCIe link of the GPU that runs it at every encode, so it runs
+on the GPU with the faster link: `B` on an RTX PRO 4000 (`A`, PCIe 3.0 x4) + RTX 5080 (`B`) split, and
+`B` on `--devices A,A`. That GPU's expert cache lends the encode's memory and the image embeddings'
+buffer, as on one GPU. The other GPU's first layers take the embeddings (5 KiB per image token)
+from a copy made once through pinned memory after the encode, in frames its own cache lends until
+the prompt's last call. A resident tower (`--vision-offload off`) runs on `A`, where the load places
+it, and `B`'s MTP drafter then gets its copy of the embeddings the same way. Media in a
+reused prefix is not encoded again, as on one GPU. Replies are the unsplit run's bit for bit under
+the same conditions as text. `INFERNIX_SPLIT_VISION=first|last` (a measurement knob) places an
+offloaded tower on `A` or on `B`.
+
+A split refuses, until each is supported, the
 [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier),
 which needs every expert in Host RAM, and `--layer-split auto` (the default with two devices) or
 `@FILE`, which need the split planner: pass `--layer-split K`, with `1 <= K < 48`. `--devices A`

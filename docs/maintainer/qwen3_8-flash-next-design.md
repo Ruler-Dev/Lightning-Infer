@@ -2663,6 +2663,12 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   link carries ~10 KiB per token per layer instead of every non-resident expert (§19.3.8, "F4 on a
   layer split"). `test_split_prefill_real --walk-modes` checks the bits against
   the unsplit run and chunk-major.
+- **Layer split** (Vision, §19.3.2 "On a layer split"). `test_split_prefill_real --vision DIR
+  [--vision-placements]` adds chat requests with one image, two images, and an image and a video
+  (up to 24 tokens each, MTP) and compares their ids and per-call logits hashes with the unsplit
+  Engine, with the tower where the Program places it and on the first segment: ctests
+  `infernix_qwen4_exp_split_vision_real_test` (two contexts of device 0, K = 1 and 28) and
+  `infernix_qwen4_exp_split_vision_two_gpu_real_test` (`--devices 0,1`, K = 28, 70 SMs).
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
 - **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
@@ -4778,6 +4784,93 @@ other rates are estimates.
   correctly; ids identical with offload on and off and between plain and MTP. **Open:** the encode
   window takes 1.4 s for either image with offload on or off, against ~10-40 ms estimated; being
   diagnosed (eager module loading and an nsys trace).
+
+#### On a layer split (multi-GPU, 2026-10-12)
+
+`kSplitVision` is on: `--vision` runs on `--devices A,B --layer-split K`
+(`program/vision_program.cpp`, `vision_window.{h,cpp}`; the load is unchanged).
+
+- **Where the tower runs** (`vision_tower_segment`, `ProgramImpl::place_vision`, after each
+  segment's link is measured). An offloaded tower streams its 897.9 MB of weights from pinned RAM
+  over the link of the GPU that runs it at every encode window, so it runs on the segment with the
+  fastest measured link; links within 10 % (`kVisionLinkTie`) count as equal and the last segment
+  wins among them (`--devices A,A`: the head). A resident tower (`--vision-offload off`) runs on the
+  first segment, where the load places its weights. The tower's Parameters stay the first
+  segment's: with offload they are views of the portable pinned block, which
+  `VisionWeightStream::window_weights` rebases into the tower GPU's staging, so the load does not
+  change. `INFERNIX_SPLIT_VISION=first|last` (a measurement knob) forces the placement. Measured on
+  the RTX PRO 4000 (`A`, x4) + RTX 5080 (`B`) at K = 28, one 384-token image (1,536 patches),
+  production flags: the tower's GPU time is 34-36 ms on the 5080 and 294-304 ms on the PRO 4000
+  (stream-bound: 898 MB at 3.1 GB/s), so the 5080 takes it.
+- **Lending.** The tower's segment lends the handoff (W) or handoff and window (L) from its own
+  cache and runs placement W in its own prefill workspace, as on one GPU, under its `SegmentWork`.
+  The handoff's lease starts the pool (`CacheController::choose_run(…, at_start)`; the cheapest run
+  when the start holds another lease), because it stays lent through the prompt's calls and the
+  prompt's stream lease needs one contiguous run of most of the frames: 1,911 of 3,447 on the
+  5080 head at K = 28, 1,656 of 2,208 on the 5080 alone, 1,667 of 2,225 on the `0,0` test head. A
+  one-frame lease where the cheapest frame happened to be split the `0,0` head so that no such run
+  remained: the walk's lend threw and the request failed (found by the `0,0` equality run; a
+  one-frame lease in the middle half of the pool fails so on the 5080 alone, in its middle 11 % on
+  the split's 5080 head).
+- **Readers.** The handoff BF16 [2560, V] is read by the first segment's scatter (before the HC
+  expand) and, with MTP, by the head's prompt cells. A reader on the tower's GPU reads it in place:
+  two segments' work never overlaps on one GPU (`SegmentWork`), so its next call follows the encode,
+  and the release follows its last call before the frames go back. A reader on another GPU gets its
+  own copy once the encode ends (`vision_mirror`): `⌈5,120·V / stride⌉` frames its own cache lends
+  (also at the start), filled through a `BulkHandoff` per GPU pair (4 × 4 MiB pinned ring) from
+  the tower's stream to the reader's (cross-device event waits, no host wait), given back with the
+  handoff. `stage_vision` / `stage_mtp_vision` (and the layer walk's per-chunk copies) point each
+  segment at its copy (`vision_memory`). The copy of a 384-token image is 1.9 MiB (≈ 0.6 ms on the
+  x4 link).
+- **Release order.** The handoff goes back once the prompt's last call is enqueued and before the
+  stream leases: the RTX PRO 4000's cache refills the 773 frames its stream lease held (2 GB through
+  its x4 link, 0.6 s), and with the handoff's give-back after that refill was queued, the first
+  token's synchronization of the PRO 4000 ended with the refill's last copy (an nsys trace: the
+  sampling's `cudaStreamSynchronize` of the PRO 4000's compute stream lasted 626 and 643 ms, with
+  only the refill's copies running), which cost every image prompt 0.64 s of TTFT. Released first,
+  the image prompt behaves as a text prompt does (incidental, not changed: a text prompt pays that
+  refill in its first decode round instead, whose route download queues behind it).
+- **Admission.** `feasible` requires the tower's lendable frames for the window and each copy's
+  on its reader (a quarter of each cache is never lent).
+- **Prefix cache.** Unchanged: the block keys and cumulative Vision extras are the frontend's, a
+  resume encodes (and copies) only the items past its frontier, and a frontier never lies inside an
+  item.
+- **Telemetry.** The tower's GPU time comes from two events on the tower's stream, read when the
+  handoff is released after the host waits for the stop event: the prompt's last call may be
+  enqueued right behind the encode (one call, no synchronization in between), and the former read
+  (`CudaEventTimer::elapsed_ms` under `CUDA_CHECK`) aborted the process with `cudaErrorNotReady`
+  there; the failed lend above reached it through the lane's release.
+- **Exactness** (`INFERNIX_NUMERICS_SMS=70`, `infernix-serve --vision`, prefix cache on,
+  temperature 0): one image (chart, natural scene), two images, an image and a video, a video, and
+  a three-turn conversation that re-sends the chart (461 of 468 prompt tokens cached, no encode)
+  and then adds a new image (only it encoded): the replies of `--devices 0,1 --layer-split 28` and
+  `--devices 0,0 --layer-split 28` are byte-identical to `--device 0`'s (15,010 bytes, 8 requests),
+  and a six-turn text conversation on the same servers is byte-identical to `--device 0` without
+  `--vision`. The CLI's image and video prompt (MTP) gives `--device 0`'s ids and per-call logits
+  hashes on `0,1`, and the split ctests compare every call's logits with the tower on either
+  segment, both copy directions included.
+- **Costs while idle.** None on the GPUs: no frame, workspace or buffer is held between media
+  prompts (the startup frame counts with `--vision` equal those without). Pinned host memory: the
+  tower's 856 MiB (as on one GPU) and the copy's 16 MiB ring.
+- **Measured** (production flags, K = 28; the chart image, 493 prompt tokens of which 384 image
+  tokens, five requests, each followed by a 620-token text prompt; medians, `runs/w6v`): TTFT on the
+  split 2.58 s for the image and 2.54 s for the text (tower on the 5080); with the tower on the PRO
+  4000 (`INFERNIX_SPLIT_VISION=first`) 2.85 and 2.52 s; on the RTX 5080 alone 2.28 and 2.06 s (an
+  earlier run on the build before the release-order change: 2.68 and 2.38 s). Most of the split's
+  TTFT is the prompt's one layer-walk span (2.41-2.45 s wall, 1.5 s of it on the PRO 4000), for an
+  image as for text; before the release-order change its image TTFT was 3.21 s (3.48 s with the
+  tower on the PRO 4000). The first
+  encode after the 20-turn conversation took 257 ms of GPU time (cold), the next ones 32-35 ms.
+  Decode with `--vision` (the 20-turn `bench_conversation.py`, ~49.5K tokens; replies identical,
+  md5 `fbaab9f6…`, in every run): over the second-half turns whose n-gram reads were normal in both
+  runs, 89.2 tok/s against 89.3 for a run without `--vision` started just before it (turns 16-19)
+  and 88.0 against 88.0 for the wave-5 run with the most such turns (11, 16-19); the second-half
+  means over all turns, 80.4 against 81.6 and wave 5's 79.2-82.8, are set by the slow n-gram reads
+  on C:. Two earlier runs with `--vision` were 1-2 % and 4-5 % slower on such turns: in both the
+  driver placed part of the RTX 5080's expert frames in system memory at startup (2,791 and 3,228
+  of 3,447 frames to start, 3,291 and 3,176 at the end against 3,327); the run without `--vision`
+  that night started with 3,276 the same way, so it is the desktop's VRAM use on that GPU, not
+  Vision.
 
 #### Steps
 

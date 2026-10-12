@@ -868,9 +868,9 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     }
     walk_.span.active = false;
     host_lanes_[0]    = static_cast<std::int32_t>(index);
+    if (last && lane.vision) { vision_release(lane); } // ahead of the stream leases (vision_release)
     if (last && !prefilling_besides(index)) { return_leases(); }
     prefix_after_prefill_call(lane, index, last);
-    if (last && lane.vision) { vision_release(lane); }
     if (!last) {
         {
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);

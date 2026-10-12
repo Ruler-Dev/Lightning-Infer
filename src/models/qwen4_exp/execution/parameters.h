@@ -6,7 +6,10 @@
 //
 // Layer split: each segment has its own Parameters over its layer range, built on its device (the
 // expert scales are its only allocation); the head segment's also hold the head, the MTP drafter
-// and the draft head, the first segment's the Vision tower. Tables stay indexed by decoder layer.
+// and the draft head, the first segment's the Vision tower. An offloaded tower's parameters are
+// views of pinned host memory every GPU reads, so the Program may run it on another segment (the
+// one with the fastest link, design §19.3.2 "On a layer split"). Tables stay indexed by decoder
+// layer.
 
 #include "core/arena.h"
 #include "core/tensor.h"

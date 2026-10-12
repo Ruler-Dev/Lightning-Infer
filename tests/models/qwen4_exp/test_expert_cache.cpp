@@ -535,6 +535,52 @@ void test_lending_refill() {
     }
 }
 
+// A lease held across a prompt's calls starts the pool (choose_run at_start, the Vision handoff):
+// a one-frame lease where the cheapest frame sits can split the pool so that no run of most of its
+// frames remains (the prompt's stream lease on a layer split's 16 GB head needs over half of them);
+// at the start, every other frame stays one run. A start that holds a lent frame falls back to the
+// cheapest run.
+void test_lending_at_start() {
+    constexpr std::uint32_t kKeys = 64, kFrames = 8;
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> ranked;
+    for (std::uint32_t k = 0; k < kFrames; ++k) { ranked.push_back(k); }
+    check(cache.seed(ranked, {}, cmds) == kFrames, "the warm start fills every frame");
+    cmds.clear();
+    // Frame 4's expert is routed least, so the cheapest single frame lies inside the pool.
+    std::uint64_t round = 0;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        const auto key = cache.frame_key(k);
+        if (!key || k == 4) { continue; }
+        for (int use = 0; use < 4; ++use) {
+            const std::uint32_t group[] = {*key};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+            cmds.clear();
+        }
+    }
+    const std::vector<std::uint8_t> none(kFrames, 0);
+    check(cache.choose_run(1, none) == std::optional<std::uint32_t>(4), "the cheapest frame is inside the pool");
+    check(cache.choose_run(1, none, true) == std::optional<std::uint32_t>(0), "at_start takes the pool's first frame");
+    check(cache.choose_run(2, std::vector<std::uint8_t>(kFrames, 1), true) == std::optional<std::uint32_t>(0),
+          "at_start takes busy frames (the lease waits for their loads)");
+    cache.lend(0, 1, cmds);
+    cmds.clear();
+    check(cache.choose_run(kFrames - 1, none) == std::optional<std::uint32_t>(1),
+          "after a lease at the start every other frame is one run");
+    const auto fallback = cache.choose_run(1, none, true);
+    check(fallback.has_value() && *fallback != 0, "a start holding a lent frame falls back to the cheapest run");
+    cache.give_back(0, 1, cmds);
+    cmds.clear();
+    cache.lend(4, 1, cmds);
+    cmds.clear();
+    check(!cache.choose_run(kFrames - 1, none).has_value(), "a lease inside the pool splits it");
+    cache.give_back(4, 1, cmds);
+    cmds.clear();
+    check(cache.loaned_frames() == 0, "every frame is back");
+}
+
 // Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
 // free frames while the policy has capacity (frames - slack), skipping keys already resident or out
 // of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
@@ -790,6 +836,7 @@ int main() {
     test_load_serials();
     test_lending();
     test_lending_refill();
+    test_lending_at_start();
     test_seed();
     test_landing();
     test_state_file();

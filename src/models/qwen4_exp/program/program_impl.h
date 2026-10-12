@@ -164,8 +164,24 @@ struct QuoteImpl {
     std::shared_ptr<const VisionAdmission> vision;
 };
 
+// The encode window's GPU time (Lane::vision_seconds): two events on the tower's stream around the
+// pass, read when the handoff is released. The prompt's last call may be enqueued right behind the
+// encode, so the read waits for the stop event, and a failed wait or read leaves the time at 0.
+struct VisionTimer {
+    VisionTimer() = default;
+    VisionTimer(const VisionTimer&)            = delete;
+    VisionTimer& operator=(const VisionTimer&) = delete;
+    ~VisionTimer() {
+        for (cudaEvent_t event : {start, stop}) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); }
+        }
+    }
+    cudaEvent_t start = nullptr, stop = nullptr;
+};
+
 // A media prompt's encode window and handoff (design §19.3.2): filled at reserve, encoded over
-// admission steps, released once the prompt's last call is enqueued or the lane is released.
+// admission steps, released once the prompt's last call is enqueued or the lane is released. The
+// window, the lease and the handoff are the tower's segment's (ProgramImpl::vision_seg).
 struct LaneVision {
     std::shared_ptr<const VisionAdmission> admission;
     qwen3_5::VisionControl control;            // the encoded items' controls
@@ -173,11 +189,19 @@ struct LaneVision {
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
     ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
     Tensor handoff;                            // BF16 [out, V_encoded]
+    // A layer split: the handoff's copy for each segment that reads it (the first segment's scatter,
+    // the head's MTP prompt cells) on another GPU than the tower, in frames its own cache lends,
+    // filled through the pinned crossing once the encode ends (ProgramImpl::vision_mirror).
+    struct Mirror {
+        std::size_t segment = 0;
+        ExpertResidency::FrameLease lease;
+    };
+    std::vector<Mirror> mirrors;
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
     std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
     std::unique_ptr<qwen3_5::execution::VisionPassLayout> layout;
     std::unique_ptr<qwen3_5::execution::VisionTowerPass> pass;
-    std::optional<CudaEventTimer> timer;
+    std::unique_ptr<VisionTimer> timer;
     bool encoded = false;
 };
 
@@ -758,6 +782,8 @@ public:
             }
         }
         apply_link_costs();
+        // After the links are measured: the tower runs where its weights stream fastest.
+        place_vision();
         if (decode_promotions_ != DecodePromotions::On) {
             diagnostic(std::string("expert cache: decode promotions ") +
                        (decode_promotions_ == DecodePromotions::Off ? "off" : "only until the frames fill") +
@@ -1689,9 +1715,7 @@ public:
     }
 
     bool feasible(const RequestBasePlan& base) const noexcept {
-        // A window lends at most what serving never gives up (a quarter of the frames stays).
-        const std::uint32_t lendable = first().residency->frames() - first().residency->frames() / 4;
-        const bool frames = !base.impl_ || !base.impl_->vision || base.impl_->vision->window.frames <= lendable;
+        const bool frames = !base.impl_ || !base.impl_->vision || vision_fits(base.impl_->vision->window);
         return base.impl_ != nullptr && frames && base.impl_->pages <= head().pool->capacity_pages() &&
                base.impl_->pages <= static_cast<std::uint32_t>(pages_per_row_);
     }
@@ -2306,11 +2330,12 @@ public:
         prefix_.next_waits = prefix_waits(lane);
         run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width),
             /*stream=*/!walk_.span.active);
+        // The handoff is read only by the prompt's calls: it returns once the last is enqueued, ahead of
+        // the stream leases (vision_release).
+        if (last && lane.vision) { vision_release(lane); }
         if (last && !prefilling_besides(index)) { return_leases(); }
         lane.state_tokens += static_cast<std::uint32_t>(width);
         prefix_after_prefill_call(lane, index, last);
-        // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
-        if (last && lane.vision) { vision_release(lane); }
         if (!last) {
             {
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
@@ -5957,6 +5982,17 @@ private:
     std::uint64_t pending_transaction_ = 0;
     std::uint64_t revision_            = 1;
     // ---------------------------------------------------------------- vision (vision_program.cpp)
+    // The segment that runs the Vision tower (vision_tower_segment; INFERNIX_SPLIT_VISION), and on a
+    // layer split, per segment index, the pinned crossing of the handoff from the tower's GPU into a
+    // reading segment on another GPU (null elsewhere). Set by place_vision at construction.
+    std::size_t vision_segment_ = 0;
+    std::vector<std::unique_ptr<BulkHandoff>> vision_bulk_;
+    DeviceSegment& vision_seg() noexcept { return *segments_[vision_segment_]; }
+    const DeviceSegment& vision_seg() const noexcept { return *segments_[vision_segment_]; }
+    void place_vision();
+    // Whether the caches can ever lend a window's frames: the tower's its handoff and window, each
+    // reading segment's on another GPU its copy of the handoff (a quarter of each cache is never lent).
+    [[nodiscard]] bool vision_fits(const VisionWindowPlan& window) const noexcept;
     // The encode window of the items ending past the reused prefix [0, reused).
     [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen3_5::PreparedPromptData& prompt,
                                                                      std::uint32_t reused = 0) const;
@@ -5964,6 +6000,10 @@ private:
                         const qwen3_5::PreparedPromptData& prompt);
     [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }
     void vision_step(Lane& lane);
+    // After the encode: the handoff's copy into each reading segment on another GPU.
+    void vision_mirror(LaneVision& v);
+    // The handoff memory `seg` reads: its copy, or the tower's handoff on the tower's GPU.
+    [[nodiscard]] std::byte* vision_memory(const LaneVision& v, const DeviceSegment& seg) const;
     void vision_release(Lane& lane) noexcept;
     // The image columns of a prefill call [begin, begin + width), staged into the io; null without any.
     const execution::VisionInput* stage_vision(Lane& lane, std::uint32_t begin, std::int32_t width);

@@ -155,7 +155,9 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
   and 98.7 exempt (design §19.3.19).
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
-  frames only while it encodes (`--vision-offload auto`).
+  frames only while it encodes (`--vision-offload auto`). On a layer split it runs on the GPU with
+  the faster PCIe link and the other GPU gets a copy of the image embeddings
+  ([layer split](cli.md#layer-split)).
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - **Warm start.** The engine saves the expert cache's state (which experts it holds and how often each
   was used) to `<artifact>.expert-state` when it stops and every 10 minutes between requests. The

@@ -52,6 +52,16 @@ struct VisionWindowPlan {
 // The estimated tower time of items with these patch counts.
 [[nodiscard]] double vision_seconds(std::span<const std::uint32_t> patches, std::uint32_t hidden);
 
+// The segment of a layer split that runs the Vision tower (design §19.3.2, "On a layer split"),
+// given each segment's measured host-to-device link rate in bytes per second, in segment order. A
+// resident tower (`offload` false) runs where the load placed its weights, with the embedding:
+// segment 0. An offloaded tower streams its ~0.9 GB of weights over the link of the device that
+// runs it at every encode, so it runs on the segment with the fastest link; a link within
+// kVisionLinkTie of the fastest counts as equally fast, and among those the last segment (the head,
+// whose MTP prompt cells also read the embeddings) wins. One segment: 0.
+inline constexpr double kVisionLinkTie = 0.9;
+[[nodiscard]] std::size_t vision_tower_segment(std::span<const double> link_rates, bool offload);
+
 // The visual tokens of a lane: every encoded item's visual token positions, ascending; handoff
 // column c holds the embedding of token visual[c].
 struct VisualSlice {

@@ -74,9 +74,8 @@ void validate_devices(const EngineOptions& options, models::Architecture archite
         throw std::invalid_argument("a layer split across devices (--devices a,b) is not available "
                                     "yet; run on one device (--device N)");
     }
-    if (options.enable_vision && !models::qwen4_exp::kSplitVision) {
-        throw std::invalid_argument("a layer split across devices does not support --vision");
-    }
+    // Vision runs across the split: the tower on one GPU, its embeddings copied to the others that read them.
+    static_assert(models::qwen4_exp::kSplitVision);
     // On one GPU a waiting gate can keep the sending segment's work from running until it expires.
     if (devices[0] == devices[1] && options.split_handoff == SplitHandoff::Gate) {
         throw std::invalid_argument("--split-handoff gate needs the layer split on two different GPUs; a split "
