@@ -49,7 +49,7 @@ Generation uses one GPU, one resident model, one to eight resident execution lan
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Snapshot/Replay recovery,
 and one compact decode batch per round.
 Generation and offline CausalScoring use the same public `.infernix` Engine route. Delivered
-capabilities and commands are documented in `README.md`, the product guides, and executable
+capabilities and commands are documented in `README.infernix.md` (fork overview in `README.md`), the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous
 batching, and priority/QoS require an explicit product change. Another training instance or mixture
 of existing representations does not require a checkpoint-specific execution registration.
@@ -174,7 +174,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 | Decision | Entry point |
 |---|---|
-| Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
+| Product capabilities and exact commands | `README.infernix.md`, `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
 | Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
 | Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |

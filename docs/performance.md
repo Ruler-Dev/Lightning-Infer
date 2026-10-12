@@ -22,7 +22,7 @@ not product support. C is configured request concurrency; K is the number of dra
 | Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
 Qwen3.8-Flash-Next has no row: its published figures are the README's
-[comparison with Strata](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata), measured with that
+[comparison with Strata](../README.infernix.md#qwen38-flash-next-nvfp4-infernix-vs-strata), measured with that
 section's client-side method rather than this page's, and its own guide's
 [performance notes](qwen3_8-flash-next.md#performance).
 
@@ -51,7 +51,7 @@ and [Qwen3.8 completion outcomes](performance/qwen3.8-27b.md#completion-outcomes
 - [Serving benchmark runners](../tools/bench/README.md#serving-corpus-benchmark): usage and local report files.
 - [Engine and Op benchmarks](../bench/README.md): their separate measurement scopes and commands.
 - [Capability evaluation](../eval/README.md): evaluation workflow; published scores live in the
-  [model cards](README.md#model-artifacts), with the README's [benchmark summary](../README.md#benchmarks).
+  [model cards](README.md#model-artifacts), with the README's [benchmark summary](../README.infernix.md#benchmarks).
 - [Perplexity](perplexity.md): offline causal-scoring measurement and comparison rules.
 
 Model pages are the detailed result authority. README and model-card performance tables are

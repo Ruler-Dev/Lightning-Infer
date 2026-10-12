@@ -1,7 +1,7 @@
 # Infernix CLI
 
 `build/apps/infernix` runs one request against one v3 `.infernix` (or `.ninfer`) artifact. Build Infernix and
-download an artifact using the [project README](../README.md) before following this guide.
+download an artifact using the [project README](../README.infernix.md) before following this guide.
 
 The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
 

@@ -1,6 +1,6 @@
 # Infernix documentation
 
-Start with the [project README](../README.md) to build Infernix, download a published artifact, and
+Start with the [project README](../README.infernix.md) to build Infernix, download a published artifact, and
 run the CLI or HTTP server.
 
 ## User guides
