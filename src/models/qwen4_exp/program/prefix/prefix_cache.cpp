@@ -274,7 +274,7 @@ pc::InsertResult PrefixCache::insert_block(pc::NodeRef parent, std::uint64_t loo
     const std::uint32_t id = allocate_block_id(std::move(lease));
     pc::InsertResult result;
     try {
-        result = index_->insert_block(parent, lookup_hash, tokens, extra, id, attach);
+        result = index_->insert_block(parent, lookup_hash, tokens, extra, id, attach, true);
     } catch (...) {
         lease = std::move(*blocks_[id]);
         blocks_[id].reset();
@@ -318,7 +318,7 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, std::span<const
     const std::vector<std::int32_t> tail_page =
         tail ? KVExecutionTablePool::indices_of(std::span<const DeviceKVPageHandle>(&*capture.tail_page, 1))
              : std::vector<std::int32_t>{};
-    auto image = index_->reserve_host_image(tail, capture.claim);
+    auto image = index_->reserve_host_image(tail, capture.claim, true);
     if (!image) {
         ++counters_.taps_skipped;
         return false;
@@ -397,7 +397,10 @@ void PrefixCache::write_blocks(std::span<const pc::NodeRef> nodes, std::span<con
         const pc::NodeView view = index_->node(node);
         if (view.device != pc::CopyState::Resident || view.host != pc::CopyState::Absent) { continue; }
         index_->pin_node(node);
-        const auto slab_id = index_->begin_host_fill(node);
+        // A block's Host copy serves only the snapshots on its path: it takes free slabs, dead KV
+        // and superseded snapshots, never a retained snapshot (the lineage's resume source when
+        // its endpoint did not fit). Blocks the Host tier cannot back stay on the Device.
+        const auto slab_id = index_->begin_host_fill(node, 0.0);
         if (!slab_id) {
             index_->unpin_node(node);
             break; // the Host tier cannot free a slab for anything worth less

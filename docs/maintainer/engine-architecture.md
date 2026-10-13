@@ -374,8 +374,21 @@ its heartbeat). The Engine fails the requests holding lanes with it, the Program
 lanes without publishing anything and empties a prefix cache the failed round may have published
 into, and queued requests keep waiting; if the Engine is binding, materializing, capturing or holding
 a paused request at that moment it fails everything instead. A service or read thread that has itself
-stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
-its cause. CUDA errors are never recoverable: the context state is unknown.
+stopped makes every later unit fail, so the Program reports that as an ordinary error with its cause.
+
+Any other worker error goes through the same recovery when the Program supports it
+(Qwen3.8-Flash-Next): the requests holding lanes fail with the error, the Program releases their
+lanes and empties the prefix cache (the failed step may have left its bookkeeping inconsistent), and
+the Engine keeps serving. With no resident request to blame, the request an admission was deciding
+on, else the FIFO head, fails instead, so a deterministic admission error cannot loop. The cleanup
+synchronizes the devices, so a sticky CUDA error (an illegal address, a lost device) fails it, and
+the Engine then fails everything as before; one request's error never leaves the Engine answering
+`unavailable` to every later request while the process stays up (the 2026-10-12 production log).
+
+A resident whose next unit cannot obtain its resources after every reclaim (cache eviction, pool
+growth, pausing every younger resident) is the oldest one with nothing left to pause: it fails
+alone with an `Unavailable` capacity error. Its sequence is aborted between rounds like a
+cancellation, so the state it reached is published to the prefix cache and a retry resumes there.
 
 Release and cleanup paths are `noexcept`, and a broken ownership invariant or a throw inside one of
 them (a page, extent or reference that a release finds missing, a release that a destructor or abort

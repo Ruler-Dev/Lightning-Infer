@@ -105,8 +105,11 @@ and HTTP records must not contain:
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
 value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational
-records never include raw `ApiError.message`, arbitrary `exception.what()`, a request body, or an
-unclassified request path. Trusted startup/configuration errors and the local one-shot CLI's own
+records never include a request body or an unclassified request path, and include raw
+`ApiError.message` or `exception.what()` only for the internal and unavailable failure classes:
+that text is the Engine's own (a worker or Program exception, a capacity condition), and a failed
+generation must name it to be diagnosable. It is appended as `| error: <text>`, on one line and
+bounded to 480 bytes; client-input, overload, timeout and upstream failures keep only their code. Trusted startup/configuration errors and the local one-shot CLI's own
 input diagnostics may retain their detailed exception text. The protocol response and request
 JSONL may retain an exact error string when their independent contracts require it.
 

@@ -175,6 +175,24 @@ std::uint64_t host_active_ns(const ThroughputReport& report) noexcept {
            monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns);
 }
 
+// The Engine-side text of an internal or unavailable failure (the exception a worker or Program
+// raised: a capacity condition, a CUDA error, a broken invariant): single line, bounded. Other
+// classes carry client-derived or upstream text and keep only their code (logging.md §5).
+void append_engine_error(std::ostringstream& out, const RequestFailure& failure) {
+    if (failure.classification != RequestFailureClass::Internal &&
+        failure.classification != RequestFailureClass::Unavailable) {
+        return;
+    }
+    if (failure.machine_message.empty()) { return; }
+    constexpr std::size_t kEngineErrorBytes = 480;
+    std::string text                        = failure.machine_message.substr(0, kEngineErrorBytes);
+    for (char& byte : text) {
+        if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+    }
+    if (failure.machine_message.size() > kEngineErrorBytes) { text += "..."; }
+    out << " | error: " << text;
+}
+
 void append_failure_fields(std::ostringstream& out, const RequestFailure& failure) {
     if (failure.http_status != 0) { out << " | HTTP " << failure.http_status; }
     if (!failure.error_code.empty()) {
@@ -182,6 +200,7 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
+    append_engine_error(out, failure);
 }
 
 } // namespace

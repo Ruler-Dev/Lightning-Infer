@@ -1016,6 +1016,35 @@ private:
         if (changed) { publish_runtime_stats(); }
     }
 
+    // The oldest resident's next unit cannot obtain its resources after every reclaim (cache
+    // eviction, pool growth, pausing younger residents): the request fails alone, as a capacity
+    // condition the client sees as unavailable. Its sequence is aborted between rounds like a
+    // cancellation, so the Program publishes the state it reached to the prefix cache and a retry
+    // resumes from there.
+    void fail_resident_for_capacity(std::uint32_t lane, const ContextResourceUsage& shortage) {
+        const auto request = slots_[lane];
+        if (!request->sequence || !request->lane || request->lane->value != lane) {
+            throw std::logic_error("capacity failure has no sequence binding");
+        }
+        const std::string message =
+            "the Engine ran out of context capacity while generating: the next unit needs state=" +
+            std::to_string(shortage.state_slots) +
+            ", main_kv=" + std::to_string(shortage.main_kv_pages) +
+            ", backend_kv=" + std::to_string(shortage.backend_kv_pages) +
+            ", host_bytes=" + std::to_string(shortage.host_bytes) +
+            " more than eviction and growth could free";
+        auto aborted                = instance_.program->abort(*request->sequence);
+        request->generation_timings = aborted.timings;
+        request->speculative_stats  = std::move(aborted.speculative);
+        complete_error(
+            request, std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, message)));
+        remove_completed_slot(lane);
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                           "req %llu: %s; the Engine keeps serving",
+                           static_cast<unsigned long long>(request->id), message.c_str());
+        publish_runtime_stats();
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
@@ -2176,7 +2205,10 @@ private:
                     // failed rows wait or yield their own lane; they cannot block ready rows.
                     // The same shortage has already exhausted cache and paused snapshots.
                     if (pause_reclaim_victim(request->id)) { break; }
-                    throw std::logic_error("oldest resident cannot obtain its legal unit");
+                    // Nothing younger is left to pause: the request cannot continue in this
+                    // Engine's capacity. It fails alone; the Engine keeps serving.
+                    fail_resident_for_capacity(lane, result.shortage);
+                    break;
                 }
                 if (oldest != lane && (!blocked || request->id > slots_[*blocked]->id)) {
                     blocked = lane;
@@ -2316,13 +2348,16 @@ private:
         publish_runtime_stats();
     }
 
-    // A unit failed with a RecoverableExecutionError (an expert record that could not be read): the
-    // requests holding lanes fail with it, the Program discards their state, and queued requests
-    // keep waiting. False when this state is not one it handles (a binding, materialization,
-    // capture or paused request in flight) or the Program's cleanup failed; the caller then fails
-    // everything, as for any other worker error.
-    bool recover_locked(const std::exception_ptr& error) noexcept {
-        if constexpr (!requires { instance_.program->recover_after_failure(); }) {
+    // A unit failed with a RecoverableExecutionError (an expert record that could not be read), or
+    // the worker raised any other error: the requests holding lanes fail with it, the Program
+    // discards their state, and queued requests keep waiting, so one request's failure never stops
+    // the Engine. `discard_cache`: the error is not one the Program raised in a known state (any
+    // other exception), so the prefix cache, which the failed step may have left inconsistent, is
+    // emptied too. False when this state is not one it handles (a binding, materialization, capture
+    // or paused request in flight) or the Program's cleanup failed (the device itself failed); the
+    // caller then fails everything.
+    bool recover_locked(const std::exception_ptr& error, bool discard_cache) noexcept {
+        if constexpr (!requires { instance_.program->recover_after_failure(discard_cache); }) {
             return false;
         } else {
             try {
@@ -2330,7 +2365,11 @@ private:
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (slots_[lane] != nullptr && slots_[lane]->capture_pending) { return false; }
                 }
-                if (!instance_.program->recover_after_failure()) { return false; }
+                if (!instance_.program->recover_after_failure(discard_cache)) { return false; }
+                // The request an admission was deciding on, if any: with no resident to blame, the
+                // error came from its admission, which would raise it again.
+                const std::shared_ptr<Request> admitting =
+                    admission_decision_ ? admission_decision_->request : nullptr;
                 admission_decision_.reset();
                 for (auto& decision : capture_decisions_) { decision.reset(); }
                 std::uint32_t failed = 0;
@@ -2340,13 +2379,27 @@ private:
                     remove_completed_slot(lane);
                     ++failed;
                 }
+                if (failed == 0) {
+                    std::shared_ptr<Request> culprit = admitting;
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        if (culprit == nullptr && !pending_.empty()) { culprit = pending_.front(); }
+                        if (culprit != nullptr) { std::erase(pending_, culprit); }
+                    }
+                    if (culprit == nullptr) {
+                        return false;
+                    } // no request to blame: nothing to recover
+                    complete_error(culprit, error);
+                    ++failed;
+                }
                 std::string what = "unknown error";
                 try {
                     std::rethrow_exception(error);
                 } catch (const std::exception& e) { what = e.what(); } catch (...) {}
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
-                                   "%s: failed %u running request(s); the Engine keeps serving",
-                                   what.c_str(), failed);
+                                   "%s: failed %u request(s)%s; the Engine keeps serving",
+                                   what.c_str(), failed,
+                                   discard_cache ? " and emptied the prefix cache" : "");
                 request_admission_check();
                 publish_runtime_stats();
                 return true;
@@ -2643,15 +2696,18 @@ private:
                 publish_runtime_stats();
             } catch (const RecoverableExecutionError&) {
                 auto error = std::current_exception();
-                if (!recover_locked(error)) {
+                if (!recover_locked(error, false)) {
                     fail_all_locked(error);
                     return;
                 }
                 executed = true;
             } catch (...) {
                 auto error = std::current_exception();
-                fail_all_locked(error);
-                return;
+                if (!recover_locked(error, true)) {
+                    fail_all_locked(error);
+                    return;
+                }
+                executed = true;
             }
             execution_lock.unlock();
             if (!executed) {

@@ -1,11 +1,13 @@
 // Engine-level recovery from a failed expert read on the real artifact (RecoverableExecutionError):
 // a fault injected into the expert error word fails the requests running in that round, the Engine
-// keeps serving, and a later request gives the same greedy ids as before the fault (the prefix cache
-// the failed round may have published into is emptied). Three requests run against two lanes, so
-// one may wait in the queue across the recovery.
+// keeps serving, and a later request gives the same greedy ids as before the fault (the prefix
+// cache the failed round may have published into is emptied). Three requests run against two lanes,
+// so one may wait in the queue across the recovery. Then an injected internal error and an injected
+// KV shortage nothing can free each fail the one request they hit while the Engine keeps serving.
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
-//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_expert_fault_real_test
+//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram]
+//   infernix_qwen4_exp_expert_fault_real_test
 
 #include "models/qwen4_exp/program/program.h"
 #include "infernix/engine.h"
@@ -117,6 +119,39 @@ int main() {
 
         const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(after == baseline, "after the recovery a request gives the baseline's ids");
+
+        // Any other worker error (here a std::logic_error raised by a unit reservation, in no known
+        // state) fails the request it hit, empties the prefix cache, and the Engine keeps serving.
+        const auto fails_with = [&](infernix::models::qwen4_exp::testing::UnitFault fault,
+                                    const std::string& text, const std::string& what) {
+            infernix::models::qwen4_exp::testing::set_unit_fault(fault, 6);
+            std::string error;
+            try {
+                (void)engine.generate(engine.prepare(story()), greedy(kTokens));
+            } catch (const std::exception& e) { error = e.what(); }
+            infernix::models::qwen4_exp::testing::set_unit_fault(
+                infernix::models::qwen4_exp::testing::UnitFault::None, 0);
+            check(error.find(text) != std::string::npos, what + " fails the request: " + error);
+            const auto next =
+                engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
+            check(next == baseline, "after " + what + " a request gives the baseline's ids");
+        };
+        fails_with(infernix::models::qwen4_exp::testing::UnitFault::Internal,
+                   "injected internal fault", "an internal error");
+        {
+            const std::lock_guard<std::mutex> lock(diagnostics_mutex);
+            bool emptied = false;
+            for (const std::string& line : diagnostics) {
+                emptied = emptied || (line.find("injected internal fault") != std::string::npos &&
+                                      line.find("emptied the prefix cache") != std::string::npos &&
+                                      line.find("the Engine keeps serving") != std::string::npos);
+            }
+            check(emptied, "the Engine reported the recovery from the internal error");
+        }
+        // The oldest resident's next unit cannot get KV pages after every reclaim: it fails alone
+        // with a capacity error (unavailable), and the Engine keeps serving.
+        fails_with(infernix::models::qwen4_exp::testing::UnitFault::KvShortage,
+                   "ran out of context capacity", "a KV shortage nothing can free");
     } catch (const std::exception& error) {
         std::printf("FAIL: %s\n", error.what());
         return 1;

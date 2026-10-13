@@ -2185,6 +2185,15 @@ public:
     // reclaims or pauses the youngest resident.
     runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
         runtime::ResourceReservation out;
+        switch (testing::take_unit_fault()) {
+        case testing::UnitFault::None:
+            break;
+        case testing::UnitFault::Internal:
+            throw std::logic_error("Qwen4Exp: injected internal fault (testing::set_unit_fault)");
+        case testing::UnitFault::KvShortage:
+            out.shortage.main_kv_pages = 1;
+            return out;
+        }
         for (const ExecutionUnit& unit : units) {
             const std::uint32_t index = lane_of(unit.sequence);
             Lane& lane                = lanes_[index];
@@ -2805,12 +2814,14 @@ public:
         return out;
     }
 
-    // After a RecoverableExecutionError: every lane is released without publishing anything (the
-    // failed round's state is unknown), the cache's transfers in flight land, and a cache the
-    // failure may have published into is emptied. False when that fails (the device itself failed;
-    // the Engine then fails everything).
-    bool recover_after_failure() noexcept {
+    // After a failed call: every lane is released without publishing anything (the failed round's
+    // state is unknown), the cache's transfers in flight land, and a cache the failure may have
+    // published into is emptied (`discard_cache`: an error raised in no known state, whose
+    // bookkeeping cannot be trusted). False when that fails (the device itself failed; the Engine
+    // then fails everything).
+    bool recover_after_failure(bool discard_cache) noexcept {
         try {
+            if (discard_cache) { clear_prefix_on_release_ = true; }
             for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
                 if (lanes_[i].phase != Phase::Free) { release(i); }
             }
@@ -3869,8 +3880,8 @@ private:
         return static_cast<std::uint64_t>(head().pool->available_pages()) + kv_grow_pages() >= need;
     }
 
-    // The pages one growth could add at most: grow_kv takes up to a quarter of the frames, and none
-    // while frames are lent (an estimate; grow_kv decides).
+    // The pages one growth could add at most: grow_kv takes up to three quarters of the frames, and
+    // none while frames are lent (an estimate; grow_kv decides).
     // A split grows every segment's planes in lockstep, so the fewest pages any segment could add.
     std::uint32_t kv_grow_pages() const noexcept {
         std::uint32_t pages = UINT32_MAX;
@@ -3885,7 +3896,8 @@ private:
             const std::uint64_t page_bytes =
                 std::max<std::uint64_t>(1, seg.kv_span.bytes / std::max<std::uint32_t>(1, seg.pool->capacity_pages()));
             const std::uint64_t frame_room =
-                static_cast<std::uint64_t>(seg.residency->frames() / 4) * seg.residency->frame_stride();
+                static_cast<std::uint64_t>(seg.residency->frames() - seg.residency->frames() / 4) *
+                seg.residency->frame_stride();
             const std::uint64_t slack  = ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * seg.plan.pool.planes.size();
             const std::uint64_t usable = frame_room > slack ? frame_room - slack : 0;
             pages = std::min(pages, static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes)));
@@ -5614,11 +5626,13 @@ private:
         return true;
     }
 
-    // Raises the pool's backed pages so `need` pages are available, taking the memory from the expert
-    // frames (never below three quarters of them). False when it cannot: a lease holds the frames, or
-    // the pool is at its capacity. A split grows every segment's planes in lockstep (the head's pool
-    // hands out the pages, every segment's tables index them), each segment from its own device's
-    // frames; the growth fails, and every segment keeps its frames, when one segment cannot grow.
+    // Raises the pool's backed pages so `need` pages are available, taking the memory from the
+    // expert frames (never below a quarter of them: the capacity plan already leaves the frames
+    // room for the whole pool, so one growth may take what a large prompt needs at once). False
+    // when it cannot: a lease holds the frames, or the pool is at its capacity. A split grows every
+    // segment's planes in lockstep (the head's pool hands out the pages, every segment's tables
+    // index them), each segment from its own device's frames; the growth fails, and every segment
+    // keeps its frames, when one segment cannot grow.
     bool grow_kv(std::uint32_t need) {
         DeviceSegment& top = head();
         if (!top.kv_vmm || top.pool->available_pages() >= need) { return top.pool->available_pages() >= need; }
@@ -5653,7 +5667,7 @@ private:
                 give = static_cast<std::uint32_t>((added - spare_bytes + ExpertResidency::kChunkBytes + stride - 1) /
                                                   stride);
             }
-            if (give > frames / 4) { return false; } // grow by at most a quarter of the cache at once
+            if (give > frames - frames / 4) { return false; } // a quarter of the cache always stays
             growth.push_back({.seg = &seg, .added = added, .frames = frames, .give = give});
         }
         synchronize();

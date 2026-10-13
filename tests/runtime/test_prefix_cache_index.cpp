@@ -1010,9 +1010,10 @@ void test_queue_holds() {
         require(first && index.valid(snaps[0]) && !index.valid(snaps[1]),
                 "an unheld snapshot yields before a held one");
         index.check_invariants();
-        // The 4 freed slabs went to `first`; b's 2 dead blocks remain, then only the held endpoint.
+        // The 4 freed slabs went to `first`; b's 2 dead blocks remain, then only the held endpoint:
+        // the reservation is refused before it reclaims anything.
         require(!index.reserve_host_image(false, kAny).has_value() && index.valid(snaps[0]) &&
-                    index.stats().held_host_refusals == 1 && index.stats().host_dead_reclaims == 2,
+                    index.stats().held_host_refusals == 1 && index.stats().host_dead_reclaims == 0,
                 "a write is refused rather than evict a held snapshot");
         index.check_invariants();
         index.set_queue_holds({});
@@ -1113,6 +1114,144 @@ void test_insert_without_attach() {
     }
     index.check_invariants();
     index.release_path(pinned);
+    index.check_invariants();
+}
+
+// replace_twin: a sequence recomputing cached blocks (resumed shallower than the cached path)
+// hands its own pages to the unpinned Device twins no snapshot depends on, and their pages go back,
+// so it holds one page per block. A twin another sequence pins, or one a snapshot depends on, keeps
+// its page and the recomputed page stays private.
+void test_device_twin_replacement() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 2), backend);
+    const auto tokens = make_tokens(64 * 4, 62);
+    const auto path   = insert_sequence(index, backend, tokens);
+    std::vector<std::uint32_t> first_ids;
+    for (const NodeRef node : path) { first_ids.push_back(index.node(node).device_id); }
+    // A snapshot at block 1 (the first two blocks have one below them); blocks 2 and 3 have none.
+    const SnapshotRef snap = publish_tap(index, path[1]);
+    index.release_path(path);
+    const std::size_t live_before = backend.live.size();
+    const auto hashes             = block_lookup_hashes(tokens, {});
+    NodeRef parent;
+    std::vector<NodeRef> again;
+    std::vector<std::uint32_t> kept_private;
+    for (std::size_t b = 0; b < hashes.size(); ++b) {
+        const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+        const std::uint32_t id    = backend.allocate();
+        const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id, true, true);
+        require(!result.inserted && result.node == path[b],
+                "the recomputed block resolves to its twin");
+        if (b < 2) {
+            require(!result.device_attached && index.node(result.node).device_id == first_ids[b],
+                    "a twin a snapshot depends on keeps its page");
+            kept_private.push_back(id);
+        } else {
+            require(result.device_attached && index.node(result.node).device_id == id,
+                    "an unpinned twin adopts the sequence's page");
+            require(std::find(backend.released.begin(), backend.released.end(), first_ids[b]) !=
+                        backend.released.end(),
+                    "the twin's previous page goes back to the backend");
+        }
+        require(index.node(result.node).pins == 1, "the sequence pins the twin");
+        again.push_back(result.node);
+        parent = result.node;
+    }
+    index.check_invariants();
+    for (const std::uint32_t id : kept_private) { backend.release_device_block(id); }
+    require(backend.live.size() == live_before, "the sequence holds one page per block");
+    require(index.stats().device_twin_replacements == 2, "two twins replaced");
+    index.release_path(again);
+    // Twins another sequence pins keep their pages.
+    const std::vector<NodeRef> holder = path;
+    index.acquire_path(holder);
+    parent = NodeRef{};
+    std::vector<NodeRef> third;
+    for (std::size_t b = 0; b < hashes.size(); ++b) {
+        const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+        const std::uint32_t id    = backend.allocate();
+        const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id, true, true);
+        require(!result.device_attached, "a pinned twin keeps its page");
+        backend.release_device_block(id);
+        third.push_back(result.node);
+        parent = result.node;
+    }
+    index.release_path(third);
+    index.release_path(holder);
+    require(index.valid(snap), "the snapshot survives");
+    index.check_invariants();
+}
+
+// successor_claim: a full Host tier whose only snapshot S is the one a lineage resumes from (its
+// hits make it worth more than any new capture's estimate) yields S's slabs to the lineage's next
+// capture, which supersedes it; a reservation that cannot be satisfied evicts nothing.
+void test_successor_claim() {
+    const auto tokens = make_tokens(64 * 4, 63);
+    for (const bool tail : {false, true}) {
+        RecordingBackend backend;
+        // 4 image slabs (S) + 2 backed path blocks; one more free slab when no tail is asked.
+        PrefixCacheIndex index(small_config(tail ? 6 : 7, 0), backend);
+        const auto path = insert_sequence(index, backend, tokens);
+        auto image      = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+        require(image.has_value(), "S's reservation");
+        const PublishResult s = index.publish_host_snapshot(
+            path[1], 128, {}, std::nullopt, std::move(*image), SnapshotKind::Endpoint);
+        require(s.created, "S published");
+        backup_node(index, path[0]);
+        backup_node(index, path[1]);
+        for (int hit = 0; hit < 5; ++hit) { index.note_hit(s.snapshot); }
+        // The lineage still pins its path (blocks 0..3): nothing on it is dead.
+        const double estimate = index.estimate_priority(128, 256, tail);
+        const double claim    = std::max(estimate, index.successor_claim(s.snapshot));
+        require(index.successor_claim(s.snapshot) > estimate,
+                "S's hits make it worth more than the estimate");
+        require(!index.reserve_host_image(tail, estimate).has_value() && index.valid(s.snapshot),
+                "an estimate below S's value does not evict it");
+        index.check_invariants();
+        if (tail) {
+            // 4 + 1 slabs needed, 4 reclaimable: refused before anything is evicted.
+            require(!index.reserve_host_image(true, claim).has_value() && index.valid(s.snapshot) &&
+                        index.stats().host_snapshot_evictions == 0,
+                    "a reservation that cannot be satisfied evicts nothing");
+            // With drop_backups the deepest block with both copies gives up its Host copy too.
+            auto next = index.reserve_host_image(true, claim, true);
+            require(next.has_value() && !index.valid(s.snapshot) &&
+                        index.stats().host_backup_drops == 1 &&
+                        index.node(path[1]).host == CopyState::Absent &&
+                        index.node(path[1]).device == CopyState::Resident &&
+                        index.node(path[0]).host == CopyState::Resident,
+                    "the deepest backup yields its Host copy, its Device copy stays");
+            index.release_host_image(std::move(*next));
+        } else {
+            auto next = index.reserve_host_image(false, claim);
+            require(next.has_value() && !index.valid(s.snapshot) &&
+                        index.stats().host_snapshot_evictions == 1,
+                    "the successor takes S's slabs");
+            const PublishResult e = index.publish_host_snapshot(
+                path[3], 256, {}, std::nullopt, std::move(*next), SnapshotKind::Endpoint);
+            require(e.created, "the successor is published");
+        }
+        index.check_invariants();
+        index.release_path(path);
+        index.check_invariants();
+    }
+    // A Boundary another conversation continued from is not retired by one lineage.
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 0), backend);
+    const auto a = make_tokens(64 * 2, 64);
+    auto b       = a;
+    b.resize(64);
+    const auto more = make_tokens(64, 65);
+    b.insert(b.end(), more.begin(), more.end());
+    const auto path_a = insert_sequence(index, backend, a);
+    const auto path_b = insert_sequence(index, backend, b);
+    auto image        = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    const PublishResult boundary = index.publish_host_snapshot(
+        path_a[0], 64, {}, std::nullopt, std::move(*image), SnapshotKind::Boundary);
+    require(boundary.created && index.successor_claim(boundary.snapshot) == 0.0,
+            "a shared Boundary is not a lineage's to retire");
+    index.release_path(path_a);
+    index.release_path(path_b);
     index.check_invariants();
 }
 
@@ -1482,6 +1621,8 @@ int main() {
         test_host_image_claims();
         test_queue_holds();
         test_insert_without_attach();
+        test_device_twin_replacement();
+        test_successor_claim();
         test_cost_model();
         test_random_stress();
         test_tap_planner();

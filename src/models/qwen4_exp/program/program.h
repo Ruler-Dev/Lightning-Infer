@@ -606,10 +606,12 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
 
     void fail_all_cleanup() noexcept;
-    // After a runtime::RecoverableExecutionError from a call: releases every lane without
-    // publishing, lets the prefix cache's transfers land and empties the cache when the failed
-    // round may have published into it. False when that fails (the Engine fails everything).
-    [[nodiscard]] bool recover_after_failure() noexcept;
+    // After a failed call (a runtime::RecoverableExecutionError, or any other error the Engine
+    // survives): releases every lane without publishing, lets the prefix cache's transfers land and
+    // empties the cache when the failed round may have published into it, or always with
+    // `discard_cache` (an error raised in no known state). False when that fails (the device
+    // itself failed: the Engine fails everything).
+    [[nodiscard]] bool recover_after_failure(bool discard_cache) noexcept;
     // Releases every lane, saves the expert cache's state and then the prefix cache's Host tier
     // when a file is attached.
     void shutdown_cleanup() noexcept;
@@ -671,6 +673,14 @@ void set_expert_fault(std::uint32_t checks) noexcept;
 // the path set here, else INFERNIX_LOGITS_HASH, else none. For engine-level tests and split checks.
 void set_logits_hash(std::filesystem::path path);
 [[nodiscard]] std::filesystem::path logits_hash();
+// Unit-reservation faults for engine-level tests: after `after` more reserve_units calls
+// (process-wide), Internal makes the next one throw a std::logic_error once (an error raised in no
+// known state), and KvShortage makes every later one report a one-page KV shortage until disarmed
+// with None (a request that cannot continue in the Engine's capacity).
+enum class UnitFault : std::uint8_t { None, Internal, KvShortage };
+void set_unit_fault(UnitFault fault, std::uint32_t after) noexcept;
+// Consumes one reserve_units call: the fault it raises (None when none).
+[[nodiscard]] UnitFault take_unit_fault() noexcept;
 // Handoff-timeout injection for layer-split tests: the next decode or verification round of a split
 // Program (process-wide) holds its first segment's stream `milliseconds` before that segment's
 // graph, so a gated handoff into the next segment outlasts its bound. 0 disarms.

@@ -766,6 +766,16 @@ commit (§7.6), each such block finds the existing node, so the private page sta
 (`Duplicate`) and is freed at finish. The tree is not modified. KV-write elision, which maps the
 existing pages and discards those writes, is an optional optimisation (§12.4).
 
+Qwen3.8-Flash-Next instead hands the sequence's page to an existing Device copy that nothing else
+holds (unpinned: no other sequence, no transfer) and no snapshot depends on
+(`live_snapshots_below == 0`): the node adopts the page and its previous page returns to the pool
+(`PrefixCacheIndex::insert_block`, `replace_twin`; stats `device_twin_replacements`). Pinned on the
+sequence's path, such a twin otherwise holds a second page per recomputed block until the sequence
+ends: a request resuming far behind its cached path (a stalled resume point at ~282K of a 410K
+conversation) needed the pages of both copies, filled the elastic pool at its capacity and could
+not obtain its next unit (the production log of 2026-10-12). Only twins nothing has resumed through
+are replaced; the sequence's page holds the KV its own state was computed from.
+
 ### 7.6 Block commit (prefill and decode)
 
 After any commit that advances every enabled pool's committed frontier across a block end
@@ -945,6 +955,31 @@ Allocation of `k` slabs:
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
 Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
+
+A snapshot that will supersede its lineage's predecessor (the snapshot the sequence resumed from or
+captured last) claims at least the predecessor's `H` (`successor_claim`): once published it serves
+every request of that lineage the predecessor served, and more. Qwen3.8-Flash-Next supersedes only
+when the Host-born image has landed, so without this a full Host tier priced every new capture of a
+long conversation below the snapshot it resumed from, whose `F(s)` grew by one per turn: every
+capture was refused and every turn resumed from the same snapshot and re-prefilled the growing
+rest (the production log of 2026-10-12: 112 turns at `cache 282,640` while the prompt grew to
+408K, 77-96 s TTFT; a 4 GiB Host tier holds ~4,500 blocks, ~288K tokens of a two-GPU INT8 KV).
+A predecessor that is a generation opener keeps its value unless the lineage echoes its turns
+(the request resumed from an endpoint): a client that re-renders the turn resumes from the opener.
+A Boundary another conversation continued from is never a lineage's to retire. The blocks past
+what the Host tier holds stay Device-only: the snapshot's path is pinned while a request resumes
+from it, and the elastic pool holds a whole `--max-context`.
+
+An image reservation first checks that the free slabs, the dead KV and the slabs of every snapshot
+its claim may evict suffice (a lower bound); otherwise it fails without evicting anything, so a
+successor's claim never retires the predecessor for an image that does not fit. Qwen3.8-Flash-Next's
+captures may, as a last resort, also take the Host copy of a block whose Device copy stays (deepest
+first, `host_backup_drops`): an endpoint with a tail needs one slab more than a tail-less tap it
+succeeds frees. Its block write-through is bounded at claim 0: free slabs, dead KV and superseded
+snapshots only, never a retained snapshot. Unbounded, the write-through after a refused endpoint
+evicted the lineage's only snapshot, and the next turn re-prefilled the whole conversation from the
+root (336K tokens, 240 s, in the first fix7 run); a block's Host copy serves only the snapshots on
+its path, and the blocks it cannot back stay on the Device.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit

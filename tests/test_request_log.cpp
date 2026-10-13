@@ -777,12 +777,28 @@ int main() {
                       "request error message missing");
 
     const OperationalRecord internal_failure = render_request_failure(
+        context, make_internal_request_failure(RequestFailurePhase::Generation,
+                                               "sentinel-internal-detail\nsecond line"));
+    // An internal failure names the Engine's error, on one line, so a dead request is diagnosable.
+    failures += check(internal_failure.severity == OperationalSeverity::Error &&
+                          internal_failure.message.find(
+                              "| error: sentinel-internal-detail second line") != std::string::npos,
+                      "operational internal failure severity or engine error text mismatch");
+    const OperationalRecord long_failure = render_request_failure(
         context,
-        make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
-    failures +=
-        check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
-              "operational internal failure severity or data policy mismatch");
+        make_internal_request_failure(RequestFailurePhase::Generation, std::string(2000, 'e')));
+    failures += check(long_failure.message.size() < 700 && long_failure.message.ends_with("..."),
+                      "operational internal failure text is unbounded");
+    ApiError unavailable;
+    unavailable.status  = 503;
+    unavailable.code    = "service_unavailable";
+    unavailable.message = "the Engine cannot admit this request";
+    const OperationalRecord unavailable_failure =
+        render_request_failure(context, make_generation_request_failure(unavailable));
+    failures += check(unavailable_failure.severity == OperationalSeverity::Warning &&
+                          unavailable_failure.message.find(
+                              "| error: the Engine cannot admit this request") != std::string::npos,
+                      "operational unavailable failure does not name the Engine's reason");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&

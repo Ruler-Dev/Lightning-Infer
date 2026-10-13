@@ -136,7 +136,9 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abo
 
 void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 
-bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
+bool Program::recover_after_failure(bool discard_cache) noexcept {
+    return impl_->recover_after_failure(discard_cache);
+}
 
 void Program::shutdown_cleanup() noexcept {
     impl_->release_all();
@@ -173,6 +175,36 @@ bool take_expert_fault() noexcept {
         if (g_expert_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
     }
     return false;
+}
+
+namespace {
+std::mutex g_unit_fault_mutex;
+UnitFault g_unit_fault        = UnitFault::None;
+std::uint32_t g_unit_fault_at = 0;
+std::atomic<bool> g_unit_fault_armed{false};
+} // namespace
+
+void set_unit_fault(UnitFault fault, std::uint32_t after) noexcept {
+    const std::lock_guard<std::mutex> lock(g_unit_fault_mutex);
+    g_unit_fault    = fault;
+    g_unit_fault_at = after;
+    g_unit_fault_armed.store(fault != UnitFault::None);
+}
+
+UnitFault take_unit_fault() noexcept {
+    if (!g_unit_fault_armed.load(std::memory_order_relaxed)) { return UnitFault::None; }
+    const std::lock_guard<std::mutex> lock(g_unit_fault_mutex);
+    if (g_unit_fault == UnitFault::None) { return UnitFault::None; }
+    if (g_unit_fault_at != 0) {
+        --g_unit_fault_at;
+        return UnitFault::None;
+    }
+    const UnitFault fault = g_unit_fault;
+    if (fault == UnitFault::Internal) {
+        g_unit_fault = UnitFault::None;
+        g_unit_fault_armed.store(false);
+    }
+    return fault;
 }
 
 namespace {

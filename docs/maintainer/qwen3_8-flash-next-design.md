@@ -8497,7 +8497,10 @@ elastic pool does the same job with no kernel change:
       units.
     - Growth first uses memory the control law would give the frames anyway. The rest it takes from
       the frames (`ExpertResidency::resize`, one 64 MiB frame chunk over so that much is
-      unmapped), at most a quarter of them per growth.
+      unmapped), leaving at least a quarter of them. (It took at most a quarter per growth until
+      2026-10-13: a cold prompt over ~370K tokens on the two-GPU split needed more at its admission
+      than one growth could add, and an idle Engine answered `cannot admit this request` with 503;
+      the capacity plan already leaves the frames room for the whole pool.)
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
   - **Shrink.**

@@ -808,6 +808,24 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     } else if (lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
     }
+    // The capture becomes what this lineage resumes from: it may take the slabs of the snapshot it
+    // supersedes, so a full Host tier moves the lineage's snapshot forward rather than keep one
+    // that every later turn resumes from and recomputes past (PrefixCacheIndex::successor_claim).
+    // An endpoint does not take a generation opener's slabs unless the lineage echoes its turns (it
+    // resumed from an endpoint, or from a snapshot captured by a request that had; the snapshot it
+    // supersedes recorded that while the resume source still existed): a client that re-renders
+    // the turn resumes from the opener, not from the endpoint. A tap past an opener always may: a
+    // deeper prompt position serves the lineage.
+    const auto echoed = [&](const std::optional<pc::SnapshotRef>& snapshot) {
+        return snapshot && prefix_.cache->index().valid(*snapshot) &&
+               prefix_.cache->meta(*snapshot).lineage_echo;
+    };
+    const bool echoes = c.meta.lineage_echo || echoed(c.supersedes) || echoed(lane.prefix.resume);
+    if (c.supersedes && prefix_.cache->index().valid(*c.supersedes) &&
+        (kind != pc::SnapshotKind::Endpoint || echoes ||
+         !prefix_.cache->meta(*c.supersedes).opener)) {
+        c.claim = std::max(c.claim, prefix_.cache->index().successor_claim(*c.supersedes));
+    }
     const std::uint64_t id = c.id;
     const bool own_tail    = c.tail_page.has_value() && !c.tail_lease.has_value();
     if (prefix_.cache->capture(index, std::move(c), prefix_.compute)) {
@@ -865,6 +883,16 @@ bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call, bool e
 // Finish or a consistent abort: the M3 flush, the remaining blocks, the endpoint and write-through.
 void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
     if (!prefix_.cache || !lane.prefix.reuse) { return; }
+    // The lineage's last capture (the prompt's last tap) lands before the endpoint is captured, so
+    // the endpoint supersedes it and may claim its slabs (prefix_capture): otherwise a full Host
+    // tier refuses the endpoint and the next turn resumes from the tap, recomputing the reply.
+    if (lane.prefix.lineage_capture != 0 &&
+        !prefix_.cache->capture_result(lane.prefix.lineage_capture)) {
+        for (const cudaEvent_t event : prefix_.cache->capture_events(lane.prefix.lineage_capture)) {
+            CUDA_CHECK(cudaEventSynchronize(event));
+        }
+        prefix_.cache->poll();
+    }
     // MR3: write the pending MTP cell when its token is known, so the endpoint is final.
     if (lane.mtp_live && lane.mtp_cells + 1U == lane.state_tokens && lane.history.size() > lane.state_tokens) {
         mtp_flush_cell(lane, index);

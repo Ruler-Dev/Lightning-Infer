@@ -192,6 +192,8 @@ struct PrefixIndexStats {
     std::uint64_t host_dead_reclaims      = 0;
     std::uint64_t host_snapshot_evictions = 0;
     std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
+    std::uint64_t device_twin_replacements = 0; // insert_block replace_twin adoptions
+    std::uint64_t host_backup_drops        = 0; // reserve_host_image drop_backups reclaims
     std::uint64_t device_slot_evictions   = 0;
     std::uint64_t snapshot_hits           = 0;
     double gdsf_inflation                 = 0.0;
@@ -269,11 +271,14 @@ public:
     // Inserts a committed full block owning `device_id`, device Resident, pinned once for the
     // inserting sequence. When an identical child already exists `inserted` is false and the child
     // is pinned; with `attach` a host-only existing child adopts `device_id` as its Device copy
-    // (device_attached), otherwise the caller keeps its page private.
+    // (device_attached), otherwise the caller keeps its page private. With `attach` and
+    // `replace_twin`, a Device-resident existing child that was unpinned and has no snapshot at or
+    // below it adopts `device_id` too, and its previous Device page is released to the backend:
+    // the sequence holds one page per block, not its own and the twin's.
     [[nodiscard]] InsertResult insert_block(NodeRef parent, std::uint64_t lookup_hash,
                                             std::span<const TokenId> block_tokens,
                                             std::uint64_t extra, std::uint32_t device_id,
-                                            bool attach);
+                                            bool attach, bool replace_twin = false);
 
     // ---- device residency of blocks (§6.4, §9.1)
     // ------------------------------------------------- Host-only pinned node receives a device
@@ -292,8 +297,10 @@ public:
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
-    // device-resident pinned node (write-through destination). Absent when no slab can be freed.
-    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
+    // device-resident pinned node (write-through destination), evicting no retained snapshot
+    // valued above `claim`. Absent when no slab can be freed.
+    [[nodiscard]] std::optional<std::uint32_t>
+    begin_host_fill(NodeRef node, double claim = std::numeric_limits<double>::infinity());
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
     // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed.
@@ -319,6 +326,14 @@ public:
     // is at `base_frontier` and which alone keeps the blocks between them (§9.3).
     [[nodiscard]] double estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
                                            bool tail) const noexcept;
+    // The least priority of a new snapshot that will supersede `predecessor` (the snapshot its
+    // lineage resumed from or captured last; supersede() at its publication): the predecessor's
+    // own priority while supersede() would retire it, since the successor then serves every
+    // request of that lineage the predecessor served, and more. 0 when it would not (invalid,
+    // already superseded, or a Boundary another conversation continued from). A capture claims the
+    // larger of this and estimate_priority, so a conversation whose Host tier is full keeps
+    // moving its snapshot forward instead of resuming from the same one, whose hits only grow.
+    [[nodiscard]] double successor_claim(SnapshotRef predecessor) const noexcept;
     void release_device_slot(std::uint32_t slot);
     // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
@@ -331,8 +346,13 @@ public:
     // Host-born snapshots: the image (and tail) is copied straight to Host slabs, with no Device
     // slot. Reserves the image's slabs, plus one tail slab when `tail` (which needs host_blocks),
     // evicting like begin_snapshot_host_fill but no retained snapshot valued above `claim` (the
-    // new snapshot's estimate_priority). Absent when they cannot be freed.
-    [[nodiscard]] std::optional<HostImageReservation> reserve_host_image(bool tail, double claim);
+    // new snapshot's estimate_priority, or its successor_claim). Absent when they cannot be freed;
+    // then nothing is evicted.
+    // `drop_backups`: as a last resort, also the Host copies of blocks whose Device copy stays
+    // (deepest first): a full Host tier then keeps the prefix from the root and the newest
+    // snapshot, and the rest of the path lives on the Device.
+    [[nodiscard]] std::optional<HostImageReservation> reserve_host_image(bool tail, double claim,
+                                                                         bool drop_backups = false);
     // Returns a reservation's slabs to the free list; the reservation is left empty.
     void release_host_image(HostImageReservation&& reservation) noexcept;
     // Publishes a snapshot whose image and tail already landed in `image`'s slabs: Host Resident,
@@ -482,11 +502,17 @@ private:
     void dead_append(std::uint32_t node);
 
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
+    // Slabs allocate_slabs could free for `claim` without cascades: the free ones, one per dead
+    // node, and the slabs of every snapshot it may evict (a lower bound).
+    [[nodiscard]] std::uint64_t reclaimable_slabs(double claim, bool drop_backups) const noexcept;
+    // The deepest unheld node with both copies (kNoId: none).
+    [[nodiscard]] std::uint32_t deepest_backup() const noexcept;
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
     // slabs are free, but no retained snapshot with a priority above `claim`.
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
-                                      double claim = std::numeric_limits<double>::infinity());
+                                      double claim      = std::numeric_limits<double>::infinity(),
+                                      bool drop_backups = false);
     void free_slab(std::uint32_t slab);
 
     // The publication shared by publish_snapshot and publish_host_snapshot: exactly one of

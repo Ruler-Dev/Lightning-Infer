@@ -539,7 +539,7 @@ void PrefixCacheIndex::set_slot(std::uint32_t slot, SlotState state) noexcept {
 InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup_hash,
                                             std::span<const TokenId> block_tokens,
                                             std::uint64_t extra, std::uint32_t device_id,
-                                            bool attach) {
+                                            bool attach, bool replace_twin) {
     const std::uint32_t parent_index = parent.valid() ? parent.index : kNoId;
     if (parent.valid() && require(parent).pins == 0) {
         invariant("prefix cache insertion parent is not pinned by the inserting sequence");
@@ -547,6 +547,7 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     if (device_id == kNoId) { throw std::invalid_argument("prefix cache block has no device id"); }
     if (const auto existing = find_child(parent, lookup_hash, block_tokens, extra)) {
         Node& node = nodes_[existing->index];
+        const bool unpinned = node.pins == 0;
         ++node.pins;
         bool attached = false;
         if (attach && node.device == CopyState::Absent) {
@@ -554,6 +555,18 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
             attached = true;
+        } else if (attach && replace_twin && node.device == CopyState::Resident && unpinned &&
+                   node.live_below == 0) {
+            // A Device twin nothing else holds (no sequence, no transfer) and no snapshot depends
+            // on: the sequence's own page becomes its Device copy and the twin's page goes back.
+            // Pinned on the sequence's path, the twin would otherwise hold a second page for the
+            // same block until the sequence ends, so a sequence recomputing a cached range (a
+            // resume shallower than the cached path) would need up to twice its pages.
+            const std::uint32_t previous = node.device_id;
+            node.device_id               = device_id;
+            attached                     = true;
+            ++counters_.device_twin_replacements;
+            backend_->release_device_block(previous);
         }
         refresh_node(existing->index);
         return InsertResult{*existing, false, attached};
@@ -713,10 +726,56 @@ void PrefixCacheIndex::free_slab(std::uint32_t slab) {
     std::push_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
 }
 
+std::uint32_t PrefixCacheIndex::deepest_backup() const noexcept {
+    std::uint32_t best = kNoId;
+    for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
+        const Node& node = nodes_[i];
+        if (!node.occupied || node.host != CopyState::Resident ||
+            node.device != CopyState::Resident || node.hold != kNoHold) {
+            continue;
+        }
+        if (best == kNoId || node.depth > nodes_[best].depth) { best = i; }
+    }
+    return best;
+}
+
+std::uint64_t PrefixCacheIndex::reclaimable_slabs(double claim, bool drop_backups) const noexcept {
+    std::uint64_t slabs = free_slabs_.size();
+    if (drop_backups) {
+        for (const Node& node : nodes_) {
+            if (node.occupied && node.host == CopyState::Resident &&
+                node.device == CopyState::Resident && node.hold == kNoHold && !node.in_dead) {
+                ++slabs;
+            }
+        }
+    }
+    for (std::uint32_t node = dead_head_; node != kNoId; node = nodes_[node].dead_next) { ++slabs; }
+    for (const Snapshot& snapshot : snapshots_) {
+        if (!snapshot.occupied || snapshot.pins != 0 || snapshot.hold != kNoHold ||
+            snapshot.host != CopyState::Resident ||
+            (!snapshot.superseded && snapshot.priority > claim)) {
+            continue;
+        }
+        slabs += snapshot.host_slabs.size();
+    }
+    return slabs;
+}
+
 bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                      std::uint32_t protect_snapshot, double claim) {
+                                      std::uint32_t protect_snapshot, double claim,
+                                      bool drop_backups) {
     out.clear();
     if (count > config_.host_slabs) { return false; }
+    // Last resort with `drop_backups`: the Host copy of a block whose Device copy stays, deepest
+    // first, so the Host keeps the prefix from the root (§9.3).
+    const auto drop_backup = [&] {
+        if (!drop_backups) { return false; }
+        const std::uint32_t node = deepest_backup();
+        if (node == kNoId) { return false; }
+        drop_node_host_copy(node);
+        ++counters_.host_backup_drops;
+        return true;
+    };
     while (free_slabs_.size() < count) {
         if (dead_head_ != kNoId) {
             const std::uint32_t victim = dead_head_;
@@ -730,6 +789,10 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
             continue;
         }
         const std::uint32_t victim = pick_victim(true, protect_snapshot);
+        if (victim == kNoId ||
+            (!snapshots_[victim].superseded && snapshots_[victim].priority > claim)) {
+            if (drop_backup()) { continue; }
+        }
         if (victim == kNoId) {
             // A held snapshot's slabs serve a queued request sooner than anything new would.
             if (std::any_of(holds_.begin(), holds_.end(), [&](std::uint32_t held) {
@@ -772,14 +835,14 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
     return true;
 }
 
-std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
+std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref, double claim) {
     Node& node = require(ref);
     if (node.device != CopyState::Resident || node.host != CopyState::Absent || node.pins == 0) {
         invariant("prefix cache host fill requires a pinned device-only node");
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
-    if (!allocate_slabs(1, slab, kNoId)) { return std::nullopt; }
+    if (!allocate_slabs(1, slab, kNoId, claim)) { return std::nullopt; }
     Node& filled     = nodes_[ref.index];
     filled.host      = CopyState::Filling;
     filled.host_slab = slab.front();
@@ -953,6 +1016,15 @@ double PrefixCacheIndex::estimate_priority(std::uint32_t base_frontier, std::uin
     return inflation_ + std::max(0.0, saved) / std::max(size, 1.0);
 }
 
+double PrefixCacheIndex::successor_claim(SnapshotRef predecessor) const noexcept {
+    if (!valid(predecessor)) { return 0.0; }
+    const Snapshot& entry = snapshots_[predecessor.index];
+    if (entry.superseded || (entry.kind == SnapshotKind::Boundary && shared_below(entry))) {
+        return 0.0;
+    }
+    return entry.priority;
+}
+
 void PrefixCacheIndex::release_device_slot(std::uint32_t slot) {
     if (slot >= slot_state_.size() || slot_state_[slot] != SlotState::Staging) {
         invariant("prefix cache releases a device slot it did not stage");
@@ -974,15 +1046,27 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind);
 }
 
-std::optional<HostImageReservation> PrefixCacheIndex::reserve_host_image(bool tail, double claim) {
+std::optional<HostImageReservation> PrefixCacheIndex::reserve_host_image(bool tail, double claim,
+                                                                         bool drop_backups) {
     // A Host-resident snapshot always has its tail on the Host (snapshot_valid, refresh_tail).
     if (tail && !config_.host_blocks) {
         throw std::invalid_argument("prefix cache Host-born snapshot tail requires Host blocks");
     }
     if (config_.host_slabs == 0) { return std::nullopt; }
+    const std::uint32_t count = config_.image_slabs + (tail ? 1U : 0U);
+    // A reservation that would fail must not evict on its way there: a successor's claim may
+    // retire the very snapshot its lineage resumes from (successor_claim).
+    if (reclaimable_slabs(claim, drop_backups) < count) {
+        if (std::any_of(holds_.begin(), holds_.end(), [&](std::uint32_t held) {
+                return held != kNoId && snapshots_[held].host == CopyState::Resident;
+            })) {
+            ++counters_.held_host_refusals; // as allocate_slabs counts a refusal held slabs caused
+        }
+        return std::nullopt;
+    }
     HostImageReservation reservation;
     reservation.tail = tail;
-    if (!allocate_slabs(config_.image_slabs + (tail ? 1U : 0U), reservation.slabs, kNoId, claim)) {
+    if (!allocate_slabs(count, reservation.slabs, kNoId, claim, drop_backups)) {
         return std::nullopt;
     }
     for (const std::uint32_t slab : reservation.slabs) { slab_reserved_[slab] = true; }
