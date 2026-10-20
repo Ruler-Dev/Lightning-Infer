@@ -15,6 +15,7 @@
 #include "models/qwen4_exp/program/program.h"
 
 #include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
@@ -78,7 +79,16 @@ struct SpecLayout {
 // columns [B], catch-up cells [W, B]. Everything before `drafts` is uploaded per draft round.
 struct MtpIo {
     std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, drafts = 0, up_ids = 0, gather = 0,
-                up_cells = 0, logprobs = 0, words = 0;
+                up_cells = 0, logprobs = 0, sample_rows = 0, sample_logprobs = 0,
+                draft_candidates = 0, draft_q = 0, verify_candidates = 0, verify_q = 0, words = 0;
+};
+
+// I32/FP32 word offsets of the DFlash2 companion drafter's proposal, selector and context io.
+struct DFlash2Io {
+    std::size_t anchors = 0, frontiers = 0, valid = 0, slots = 0, ids = 0, positions = 0,
+                drafts = 0, confidence = 0, candidates = 0, q = 0, verify_candidates = 0,
+                verify_q = 0, context_positions = 0, context_count = 0, context_slot = 0,
+                words = 0;
 };
 
 // Every fixed device allocation of a Program's segment and the layouts in it (design §19.3.7). One
@@ -86,8 +96,8 @@ struct MtpIo {
 // segment's spec alone: before the weights are read, for the startup check, and in the constructor,
 // which allocates exactly it.
 struct DeviceLayout {
-    std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
-                 pages_per_row = 0, mtp_columns = 0;
+    std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0,
+                 dflash_k = 0, max_width = 1, columns = 0, pages_per_row = 0, mtp_columns = 0;
     // The segment's roles (SegmentSpec): the head's buffers (logits, sampling, constraints, the
     // drafter when `mtp`) and the PLE segment's gate statistics are planned only where they run.
     bool owns_head = true, owns_ple = true;
@@ -115,6 +125,13 @@ struct DeviceLayout {
     bool kv_elastic             = false;
     std::uint32_t kv_base_pages = 0;
     std::size_t mtp_column_bytes = 0, mtp_selection = 0, mtp_ones = 0;
+    bool dflash2 = false;
+    std::int32_t dflash_round_columns = 0, dflash_columns = 0;
+    std::size_t dflash_features = 0, dflash_ring = 0;
+    CyclicKVCacheLayout dflash_ring_layout;
+    DFlash2Io dflash_io;
+    std::optional<DFlash2Config> dflash2_config;
+    std::size_t score_residuals = 0, score_logits = 0, score_io = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -228,6 +245,9 @@ struct DeviceSegment {
     // ---- per-call inputs, and the head's logits, sampling, penalty counts, n-gram gate statistics,
     // constraint controls and grammar masks ----
     DeviceBuffer io_device, logits32, logits16, sampled, sample_pos, configs, token_counts;
+    // DFlash2 target taps local to this GPU. Split programs pass populated columns forward instead
+    // of writing remotely across the PCIe boundary.
+    DeviceBuffer dflash_features;
     DeviceBuffer grammar_masks;
     DeviceBuffer constraint;
 

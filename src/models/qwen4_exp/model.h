@@ -27,6 +27,8 @@ struct InstanceInfo {
     std::string metadata_json;
     std::string provenance_json;
     artifact::ArtifactId artifact_id{};
+    // The DFlash2 companion artifact's id (--draft-model), when one is loaded.
+    std::optional<artifact::ArtifactId> draft_artifact_id;
 };
 
 // The routed experts of one MoE layer: the pinned host bank and each expert's scalars. alpha is
@@ -83,10 +85,12 @@ private:
           std::vector<BoundWeight> bound, std::vector<ExpertBank> banks,
           FrontendResources resources, InstanceInfo info,
           std::optional<qwen3_5::VisionOverlayAssets> overlay_vision,
-          artifact::MaterializedArtifact backing, std::optional<ExpertStore> expert_store);
+          artifact::MaterializedArtifact backing, std::optional<ExpertStore> expert_store,
+          std::optional<artifact::MaterializedArtifact> draft_backing);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
+    std::optional<artifact::MaterializedArtifact> draft_backing_; // the DFlash2 companion's weights
     std::optional<ExpertStore> expert_store_; // the streamed banks' multipliers back banks_
     Config config_;
     LoadOptions options_;

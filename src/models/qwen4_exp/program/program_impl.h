@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/cuda_vmm.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/vmm_arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -21,7 +22,9 @@
 #include "core/weight_view.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
+#include "models/qwen4_exp/program/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -269,6 +272,103 @@ inline constexpr std::size_t kGateStatsBytes     = 16;          // per lane: U64
 inline constexpr std::size_t kHandoffStatsBytes  = 16;          // a receiving segment: U64 wait ns, U64 waits
 inline constexpr std::uint64_t kSlowGatedReadNs  = 100000000;   // a gated round's reads warn past 100 ms
 
+#if 0 // Single-device upstream layouts; LightningInfer keeps the segment-aware forms in device_segment.h.
+// Device I32 arrays of a verification round, each with room for every lane and width.
+struct SpecLayout {
+    std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
+                accepted = 0, commit = 0, words = 0;
+};
+
+// I32 MTP drafter io: chain ids [B], cells [K, B], per draft step the cells' RoPE positions and
+// pooled-block starts [K][3][B] (axis-major per step), drafts [K, B], catch-up ids [W, B], gather
+// columns [B], catch-up cells [W, B], the drafts' FP32 log-probabilities [K, B]. Everything before
+// `drafts` is uploaded per draft round. Sampled drafts add, per draft step, the head's top ranks
+// and their FP32 log-probabilities [kSampledDraftRanks, B] and the proposal's candidates and FP32 q
+// [16, B] (step j at j * rows * B), then the verify layout of candidates and q [16, W - 1, B].
+struct MtpIo {
+    std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, drafts = 0, up_ids = 0, gather = 0,
+                up_cells = 0, logprobs = 0, sample_rows = 0, sample_logprobs = 0, draft_candidates = 0, draft_q = 0,
+                verify_candidates = 0, verify_q = 0, words = 0;
+};
+
+// I32 DFlash2 drafter io (FP32 words where noted): per row its anchor, frontier, live block columns
+// and ring lane [L] (L lanes; a round of B rows uses the first B of each); the block's ids and
+// positions [W, L] (W = drafts + 1); the drafts [K, L] and their FP32 selector probabilities [K, L],
+// their candidates and FP32 laws [16, K, L];
+// the verification layout of candidates and laws [16, V - 1, L] (V the widest round: a round
+// verifying fewer drafts than proposed, n-gram rows' one-hot laws); then a prefill call's, forced
+// tokens' or layer walk's context positions [window], its count and its lane. Everything before `ids`
+// is uploaded per proposal.
+struct DFlash2Io {
+    std::size_t anchors = 0, frontiers = 0, valid = 0, slots = 0, ids = 0, positions = 0, drafts = 0, confidence = 0,
+                candidates = 0,
+                q = 0, verify_candidates = 0, verify_q = 0, context_positions = 0, context_count = 0, context_slot = 0,
+                words = 0;
+};
+
+// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
+// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §19.3.24).
+inline constexpr std::int32_t kSampledDraftRanks = 4;
+
+// Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
+// (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
+// weights are read, for the startup check, and in the constructor, which allocates exactly it.
+struct DeviceLayout {
+    std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
+                 pages_per_row = 0, mtp_columns = 0;
+    bool mtp = false;
+    std::uint32_t kv_pages = 0, kv_layers = 0;
+    std::uint64_t record_stride = 0; // the largest expert record
+    std::uint64_t frame_bytes   = 0; // the expert cache's average frame
+    LinearAttentionStatePoolLayout gdn;
+    DeviceKVPagePoolLayout pool;
+    KVExecutionTableLayout tables;
+    GdnReplayRecordLayout records;
+    IoLayout io;
+    SpecLayout spec;
+    MtpIo mtp_io;
+    std::size_t gdn_bytes = 0, ple = 0, tails = 0, kv = 0, records_bytes = 0, ple_records = 0, qsa_records = 0;
+    // The vq2/k4v2 exact window of every KV layer and lane (prefix::KvWindowGeometry; zero otherwise).
+    std::size_t window = 0;
+    std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
+    std::int32_t staging_slots = 0; // misses staged per pass of a layer's experts
+    // The arena wide prefill calls swap in (columns above static_columns), lent from expert frames
+    // while a prompt runs such calls; zero when the static arena covers every call.
+    std::size_t wide_work = 0;
+    std::int32_t static_columns = 0;
+    // Elastic KV (design §19.3.11): the backing reserves `kv` bytes of address space and maps the
+    // chunks pages [0, n) of every plane (and the block tables) need; `kv_base_pages` are mapped at
+    // startup and counted as fixed, the rest grows from the expert frames when admissions need it.
+    bool kv_elastic             = false;
+    std::uint32_t kv_base_pages = 0;
+    std::size_t mtp_column_bytes = 0, mtp_ones = 0;
+    // DFlash2 (docs/maintainer/dflash.md): drafts per proposal; the feature columns, a round region
+    // (every column of a decode or verification round) then a call region (a prefill call's or layer
+    // walk's last window), and their bytes; the context ring of every lane, the drafter's io and its
+    // configuration.
+    bool dflash2 = false;
+    std::int32_t dflash_k = 0, dflash_round_columns = 0, dflash_columns = 0;
+    std::size_t dflash_features = 0, dflash_ring = 0;
+    CyclicKVCacheLayout dflash_ring_layout;
+    DFlash2Io dflash_io;
+    std::optional<DFlash2Config> dflash2_config;
+    // Causal scoring: the window's final residuals (BF16 [S*H, max_context]), one tile's FP32 logits
+    // and its targets, log-probabilities and distributions (ProgramImpl::causal_score).
+    std::size_t score_residuals = 0, score_logits = 0, score_io = 0;
+    ProgramDevicePlan bytes;
+};
+
+// Causal scoring's logits tile: 64 columns of FP32 logits (64 MB at 248,320 rows).
+inline constexpr std::int32_t kScoreTileColumns = 64;
+// The tile's I32/FP32 words: targets and their log-probabilities, then top ids and log-probabilities
+// and candidate ids and log-probabilities of up to kMaximumScoreTopTokens per column.
+inline constexpr std::size_t kScoreIoWords =
+    static_cast<std::size_t>(kScoreTileColumns) * (2 + 4 * kMaximumScoreTopTokens);
+
+#endif
+inline constexpr std::int32_t kScoreTileColumns = 64;
+inline constexpr std::size_t kScoreIoWords =
+    static_cast<std::size_t>(kScoreTileColumns) * (2 + 4 * kMaximumScoreTopTokens);
 inline std::uint64_t elapsed_ns(Clock::time_point start) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
@@ -309,6 +409,8 @@ struct ResumeStateImpl {
     SpeculativeStats speculative;
     std::array<double, 8> mtp_accept{};
     std::uint64_t mtp_policy_rounds = 0;
+    SelectorCalibration dflash_calibration; // DFlash2: acceptance by selector-probability decile
+    std::array<double, 4> ngram_accept{}; // the n-gram copies' acceptance per match-length bucket
     std::vector<ConstrainedDraw> constraint_trace;
     ExpertResidency::Stats cache_at_admission;
     std::uint64_t cpu_served_at_admission = 0;
@@ -367,9 +469,18 @@ public:
         // (state_tokens - 1: the next call or round writes it).
         std::uint32_t mtp_cells = 0;
         bool mtp_live           = false;
+        // DFlash2: the context ring holds every position below this one (state_tokens at every
+        // settled point, except after a resume from a tap inside a prefill layer walk).
+        std::uint32_t dflash_frontier = 0;
         // Draft-length policy (design 11.3): conditional acceptance of each draft position.
         std::array<double, 8> mtp_accept{};
         std::uint64_t mtp_policy_rounds = 0;
+        // DFlash2 (--draft-tokens auto): a draft's acceptance (given the earlier ones') by its
+        // selector probability's decile.
+        SelectorCalibration dflash_calibration;
+        // Conditional acceptance of an n-gram copy
+        // position by the proposal's match length (kNgramBuckets).
+        std::array<double, 4> ngram_accept{};
         LanePrefix prefix;
     };
 
@@ -407,6 +518,17 @@ public:
         if (config.mtp && (o.mtp_draft_tokens == 0 || o.mtp_draft_tokens > 7)) {
             throw std::invalid_argument("Qwen4Exp: MTP needs 1..7 draft tokens");
         }
+        // Verification widths up to 8 keep the dense routes column-invariant (design 11.3).
+        if (config.dflash2 && (o.dflash2_draft_tokens == 0 || o.dflash2_draft_tokens > 7 || config.mtp)) {
+            throw std::invalid_argument("Qwen4Exp: DFlash2 needs 1..7 draft tokens and no MTP drafter");
+        }
+        // Its drafts are verified with their laws (sparse acceptance, which serves one token domain).
+        if (config.dflash2 &&
+            !sparse_acceptance(public_tokens, 1 + std::max(static_cast<std::int32_t>(o.ngram_draft_tokens),
+                                                          static_cast<std::int32_t>(o.dflash2_draft_tokens)),
+                               static_cast<std::int32_t>(o.max_concurrency))) {
+            throw std::invalid_argument("Qwen4Exp: DFlash2 needs the sparse acceptance's token domain");
+        }
         DeviceLayout d;
         d.lanes         = static_cast<std::int32_t>(o.max_concurrency);
         d.token_domain  = public_tokens;
@@ -417,7 +539,11 @@ public:
         d.chunk         = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
         // The round's drafts, the same on every segment (its width); the drafter runs on the head.
         d.mtp_k         = config.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
-        d.max_width     = 1 + std::max(static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k);
+        // DFlash2 itself belongs to the head, but every segment executes the same verification width.
+        d.dflash2       = segment.head && config.dflash2.has_value();
+        d.dflash_k      = config.dflash2 ? static_cast<std::int32_t>(o.dflash2_draft_tokens) : 0;
+        d.dflash2_config = config.dflash2;
+        d.max_width     = 1 + std::max({static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k, d.dflash_k});
         d.columns       = std::max(d.chunk, d.lanes * d.max_width);
         d.pages_per_row = (dim(o.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const auto kv_tokens = o.kv_capacity_tokens != 0 ? o.kv_capacity_tokens : o.max_context * o.max_concurrency;
@@ -561,6 +687,45 @@ public:
             d.mtp_io.words     = d.mtp_io.logprobs + lanes * k;
         }
 
+        // Every segment captures its own target taps into a local feature image; a split passes the
+        // populated columns forward. The ring and drafter io themselves live only on the head.
+        if (config.dflash2) {
+            const DFlash2Config& f = *config.dflash2;
+            d.dflash_round_columns = lanes * W;
+            d.dflash_columns       = d.dflash_round_columns + dim(f.window);
+            d.dflash_features      = align(2ULL * f.feature_width(c.hidden_size) * static_cast<std::size_t>(d.dflash_columns));
+        }
+        if (d.dflash2) {
+            const DFlash2Config& f = *config.dflash2;
+            LayoutBuilder ring_builder;
+            d.dflash_ring_layout = plan_cyclic_kv_cache(ring_builder, f.layers, f.window, dim(f.attention.kv_heads),
+                                                        dim(f.attention.head_dim), lanes);
+            d.dflash_ring        = ring_builder.finish(256);
+            const auto L = static_cast<std::size_t>(lanes), K = static_cast<std::size_t>(d.dflash_k);
+            const auto C = static_cast<std::size_t>(ops::kSparseSpeculativeCandidates);
+            auto take = [at = std::size_t{0}](std::size_t words) mutable {
+                const std::size_t begin = at;
+                at += (words + 63) / 64 * 64;
+                return begin;
+            };
+            d.dflash_io.anchors           = take(L);
+            d.dflash_io.frontiers         = take(L);
+            d.dflash_io.valid             = take(L);
+            d.dflash_io.slots             = take(L);
+            d.dflash_io.ids               = take((K + 1) * L);
+            d.dflash_io.positions         = take((K + 1) * L);
+            d.dflash_io.drafts            = take(K * L);
+            d.dflash_io.confidence        = take(K * L);
+            d.dflash_io.candidates        = take(C * K * L);
+            d.dflash_io.q                 = take(C * K * L);
+            d.dflash_io.verify_candidates = take(C * static_cast<std::size_t>(W - 1) * L);
+            d.dflash_io.verify_q          = take(C * static_cast<std::size_t>(W - 1) * L);
+            d.dflash_io.context_positions = take(f.window);
+            d.dflash_io.context_count     = take(1);
+            d.dflash_io.context_slot      = take(1);
+            d.dflash_io.words             = take(0);
+        }
+
         // Staging slots for each layer call's misses (design 8.6), one expert record each.
         const std::uint64_t shape[] = {c.moe.experts, c.hidden_size, c.moe.intermediate};
         d.record_stride = weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, shape).record_stride;
@@ -574,12 +739,15 @@ public:
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes + d.mtp_selection : 0);
+        if (config.dflash2) { b.state += d.dflash_features; }
+        if (d.dflash2) { b.state += d.dflash_ring; }
         // The head's logits, sampled tokens and positions, sampling configs, penalty counts,
         // constraint controls and grammar masks; the PLE segment's gate statistics.
         const std::size_t head_io = d.owns_head ? d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                                                  sizeof(ops::SamplingConfig) * lanes + d.token_counts
                                            : 0;
         b.io = d.io.bytes + head_io + 4ULL * d.spec.words + d.mtp_ones + 4ULL * d.mtp_io.words +
+               (d.dflash2 ? 4ULL * d.dflash_io.words : 0) +
                (d.owns_ple ? kGateStatsBytes * lanes : 0) + (segment.embed ? 0 : kHandoffStatsBytes) +
                (d.owns_head ? constraint_bytes(lanes, W) + grammar_mask_bytes(d.token_domain, lanes, W) : 0);
         b.residency            = ExpertResidency::table_bytes(c, d.columns, segment.layers.size());
@@ -587,7 +755,9 @@ public:
         b.max_frames           = ExpertResidency::max_frames(c, segment.layers.size());
         // Decode and verification graphs on every segment, the drafter's on the head.
         b.graph_bound = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
-                                    d.mtp ? static_cast<std::uint32_t>(d.mtp_k) : 0U);
+                                    d.mtp ? static_cast<std::uint32_t>(d.mtp_k) : 0U,
+                                    o.sampled_mtp_drafts && d.mtp,
+                                    d.dflash2 ? static_cast<std::uint32_t>(d.dflash_k) : 0U);
         return d;
     }
 
@@ -627,13 +797,35 @@ public:
         if (!d.owns_head) { return bytes; } // sampling, acceptance and the drafter run on the head
         bytes += ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
-            bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+            std::size_t accept =
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+            if (((o.sampled_mtp_drafts && d.mtp) || d.dflash2) && sparse_acceptance(d.token_domain, W, lanes)) {
+                accept = std::max(accept, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                              d.token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1,
+                                              lanes));
+            }
+            bytes += accept;
         }
         if (d.mtp) {
             bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
+        // The DFlash2 drafter runs between Forward calls, in the same arena.
+        if (d.dflash2) {
+            bytes = std::max(bytes, execution::DFlash2::workspace_bytes(c, *d.dflash2_config, lanes, d.dflash_k + 1,
+                                                                        dim(d.dflash2_config->window), o.max_context));
+        }
         return bytes;
+    }
+
+    static bool sparse_acceptance(std::int32_t token_domain, std::int32_t W, std::int32_t lanes) {
+        try {
+            (void)ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1, lanes);
+            return true;
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
     }
 
     static void allocate(DeviceBuffer& buffer, std::size_t bytes, std::uint64_t& tally) {
@@ -696,8 +888,23 @@ public:
         const execution::Parameters& head_parameters = *head().parameters;
         const auto& draft_head                       = head_parameters.draft_head;
         mtp_                                         = head_parameters.mtp.has_value();
+        dflash2_                                     = head_parameters.dflash2.has_value();
+        if (dflash2_ != head().plan.dflash2) {
+            throw std::logic_error("Qwen4Exp: the bound DFlash2 drafter differs from its configuration");
+        }
         if (mtp_ != head().plan.mtp ||
             (mtp_ && (draft_head.rows ? dim(draft_head.rows->weight.n) : dim(c_.vocab_size)) != head().plan.head_rows)) {
+#if 0 // Upstream's single-device constructor; LightningInfer builds one DeviceSegment per GPU.
+    ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
+        : parameters_(parameters), device_(device), c_(parameters.model.config().text), options_(std::move(options)),
+          volume_(options_.ngram_volume, ngram_table(), options_.ngram_in_ram), hash_(c_.ple.ngram, 0),
+          plan_(plan_device(options_, parameters.model.config(), dim(parameters.model.resources().public_token_count))) {
+        const auto& head = parameters_.draft_head;
+        mtp_             = parameters_.mtp.has_value();
+        dflash2_         = parameters_.dflash2.has_value();
+        if (dflash2_ != plan_.dflash2) { throw std::logic_error("Qwen4Exp: the bound DFlash2 drafter differs from its configuration"); }
+        if (mtp_ != plan_.mtp || (mtp_ && (head.rows ? dim(head.rows->weight.n) : dim(c_.vocab_size)) != plan_.head_rows)) {
+#endif
             throw std::logic_error("Qwen4Exp: the bound drafter differs from its configuration");
         }
         // The call shapes, the same in every segment's plan.
@@ -707,10 +914,21 @@ public:
         token_domain_  = plan.token_domain;
         chunk_         = plan.chunk;
         mtp_k_         = plan.mtp_k;
+        dflash_k_      = plan.dflash_k;
         max_width_     = plan.max_width;
         columns_       = plan.columns;
         pages_per_row_ = plan.pages_per_row;
         kv_pages_      = plan.kv_pages;
+#if 0 // Single-device aliases.
+        token_domain_  = plan_.token_domain;
+        chunk_         = plan_.chunk;
+        mtp_k_         = plan_.mtp_k;
+        dflash_k_      = plan_.dflash_k;
+        max_width_     = plan_.max_width;
+        columns_       = plan_.columns;
+        pages_per_row_ = plan_.pages_per_row;
+        kv_pages_      = plan_.kv_pages;
+#endif
         width_         = dim(c_.residual_width());
         span_          = dim(c_.ple.conv_span());
         di_            = dim(c_.qsa.index_head_dim);
@@ -726,6 +944,132 @@ public:
                 throw std::runtime_error("Qwen4Exp: cannot create the logits hash file " + options_.logits_hash.string());
             }
         }
+#if 0 // Single-device fixed allocations; build_segment() owns the per-GPU allocations below.
+        draft_min_logprob_ = options_.draft_min_p > 0.0 ? std::log(options_.draft_min_p)
+                                                        : -std::numeric_limits<double>::infinity();
+        sampled_drafts_ = options_.sampled_mtp_drafts && plan_.mtp && max_width_ > 1 &&
+                          sparse_acceptance(plan_.token_domain, max_width_, plan_.lanes);
+        if (options_.sampled_mtp_drafts && plan_.mtp && !sampled_drafts_) {
+            diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
+                       DiagnosticLevel::Warning);
+        }
+
+        // Every fixed allocation below is checked against the plan and against device free memory
+        // (an allocation the driver placed in system memory fails startup, design §19.3.7).
+        vram_ = open_vram_budget_source(device_.device, options_.vram_past_budget);
+        SpillGuard guard(*vram_);
+        guard.begin();
+        std::uint64_t allocated = 0;
+
+        allocate(state_backing_, plan_.gdn_bytes, allocated);
+        state_backing_.fill(0);
+        gdn_ = std::make_unique<LinearAttentionStatePool>(DeviceSpan{state_backing_.p, state_backing_.bytes}, plan_.gdn);
+        allocate(ple_backing_, plan_.ple, allocated);
+        ple_backing_.fill(0);
+        allocate(tails_backing_, plan_.tails, allocated);
+        tails_backing_.fill(0);
+        window_geometry_ = prefix::kv_window_geometry(c_, options_.kv_cache, mtp_,
+                                                      static_cast<std::uint32_t>(options_.max_concurrency));
+        if (window_geometry_.present()) {
+            allocate(window_backing_, plan_.window, allocated);
+            window_backing_.fill(0); // zero tags never match a row's (tags are odd)
+        }
+
+        kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_);
+        if (plan_.kv_elastic) {
+            kv_vmm_  = std::make_unique<VmmRange>(device_.device, plan_.kv, kKvChunkBytes);
+            kv_span_ = DeviceSpan{kv_vmm_->base(), plan_.kv};
+            if (!map_kv(plan_.kv_base_pages)) { throw std::runtime_error("Qwen4Exp: the KV pool's base pages do not fit"); }
+            allocated += kv_vmm_->mapped_bytes();
+        } else {
+            allocate(kv_backing_, plan_.kv, allocated);
+            kv_backing_.fill(0);
+            kv_span_ = DeviceSpan{kv_backing_.p, kv_backing_.bytes};
+        }
+        pool_   = std::make_unique<DeviceKVPagePool>(kv_span_, plan_.pool);
+        tables_ = std::make_unique<KVExecutionTablePool>(kv_span_, plan_.tables, *pool_);
+        if (plan_.kv_elastic) { pool_->set_backed_pages(plan_.kv_base_pages); }
+
+        io_layout_ = plan_.io;
+        allocate(io_device_, io_layout_.bytes, allocated);
+        io_host_ = PinnedHostBuffer(io_layout_.bytes);
+        allocate(logits32_, plan_.logits32, allocated);
+        allocate(logits16_, plan_.logits16, allocated);
+        allocate(sampled_, 4ULL * lanes, allocated);
+        allocate(sample_pos_, 4ULL * lanes, allocated);
+        allocate(configs_, sizeof(ops::SamplingConfig) * lanes, allocated);
+        allocate(token_counts_, plan_.token_counts, allocated);
+        token_counts_.fill(0);
+        host_sampled_ = PinnedHostBuffer(4ULL * lanes);
+        host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
+        allocate(gate_stats_, kGateStatsBytes * lanes, allocated);
+        gate_stats_.fill(0);
+        // Another FP8 volume's per-tensor scale (resolve_ngram_volume): the artifact's ngram_scale serves only
+        // its own table.
+        if (const auto scale = ngram_table().fp8_scale) {
+            allocate(ngram_scale_, sizeof(*scale), allocated);
+            ngram_scale_.copy_from_host(&*scale, sizeof(*scale), 0);
+        }
+        allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
+        allocate(grammar_masks_, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
+        grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
+        if (options_.causal_scoring) {
+            allocate(score_residuals_, plan_.score_residuals, allocated);
+            allocate(score_logits_, plan_.score_logits, allocated);
+            allocate(score_io_, plan_.score_io, allocated);
+            score_host_ = PinnedHostBuffer(plan_.score_io);
+        }
+        constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
+        publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
+
+        execution::ForwardState state;
+        state.gdn      = gdn_.get();
+        state.ple_conv = Tensor(ple_backing_.p, DType::BF16, {width_, span_, lanes});
+        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+            state.qsa_tails.push_back(Tensor(static_cast<std::byte*>(tails_backing_.p) +
+                                                 static_cast<std::size_t>(l) * di_ * (r_ - 1) * lanes * 2,
+                                             DType::BF16, {di_, r_ - 1, lanes}));
+        }
+        const auto layout   = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
+        const auto kv_heads = dim(c_.attention.kv_heads);
+        execution::ForwardKV kv;
+        kv.block_tables  = tables_->matrix();
+        for (std::uint32_t l = 0; l < plan_.kv_layers; ++l) {
+            const prefix::PlaneRange planes = prefix::kv_layer_planes(kv_geometry_, l);
+            std::size_t plane               = planes.begin;
+            ops::QsaKVLayer layer;
+            layer.kv.storage      = options_.kv_cache;
+            layer.kv.head_dim     = dim(c_.attention.head_dim);
+            layer.kv.num_kv_heads = kv_heads;
+            layer.kv.k_pages      = pool_->plane(plane++);
+            if (layout.key.has_scale()) { layer.kv.k_scale_pages = pool_->plane(plane++); }
+            layer.kv.v_pages = pool_->plane(plane++);
+            if (layout.value.has_scale()) { layer.kv.v_scale_pages = pool_->plane(plane++); }
+            layer.pooled_pages = pool_->plane(plane++);
+            if (window_geometry_.present()) { layer.kv.window = prefix::kv_window_view(window_geometry_, window_backing_.p, l); }
+            if (plane != planes.end) { throw std::logic_error("Qwen4Exp: KV planes do not match the page geometry"); }
+            if (l < c_.attention_layers) {
+                kv.layers.push_back(layer);
+            } else {
+                kv.mtp = layer;
+            }
+        }
+        if (mtp_) {
+            state.mtp_tails = Tensor(static_cast<std::byte*>(tails_backing_.p) +
+                                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * lanes * 2,
+                                     DType::BF16, {di_, r_ - 1, lanes});
+            allocate_mtp(lanes, allocated);
+            state.mtp_ones = Tensor(mtp_ones_.p, DType::FP32, {dim(c_.hc.streams), mtp_columns_});
+        }
+        execution::ForwardExperts experts;
+        experts.frames.assign(c_.num_hidden_layers, nullptr);
+        if (max_width_ > 1) { allocate_verification(lanes, allocated); }
+        if (plan_.dflash2) { allocate_dflash2(lanes, allocated); }
+        work_capacity_ = plan_.work;
+        wide_work_     = plan_.wide_work;
+        work_          = std::make_unique<WorkspaceArena>(work_capacity_);
+        allocated += work_capacity_;
+#endif
 
         if (timing_.on) {
             timing_.graph_ms.assign(segments_.size(), 0.0);
@@ -999,12 +1343,20 @@ public:
         if (split) {
             const std::size_t round_bytes = 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(lanes) *
                                             static_cast<std::size_t>(max_width_);
+            const std::size_t feature_round_bytes =
+                dflash2_ ? 2ULL * static_cast<std::size_t>(dflash_feature_rows()) *
+                               static_cast<std::size_t>(lanes) * static_cast<std::size_t>(max_width_)
+                         : 0;
             for (std::size_t s = 0; s + 1 < segments_.size(); ++s) {
                 DeviceSegment& sender   = *segments_[s];
                 DeviceSegment& receiver = *segments_[s + 1];
                 channels_.push_back(
                     std::make_unique<HandoffChannel>(sender.device->device, receiver.device->device, round_bytes));
                 bulk_.push_back(std::make_unique<BulkHandoff>(sender.device->device, receiver.device->device));
+                if (dflash2_) {
+                    feature_channels_.push_back(std::make_unique<HandoffChannel>(
+                        sender.device->device, receiver.device->device, feature_round_bytes));
+                }
                 sender.out      = channels_.back().get();
                 receiver.in     = channels_.back().get();
                 sender.bulk_out = bulk_.back().get();
@@ -1043,6 +1395,10 @@ public:
                                                                segment);
         }
         if (moe_offload_) { prepare_moe_offload(); }
+        if (dflash2_) {
+            const SegmentWork on_head(*this, head());
+            create_dflash2_drafter();
+        }
         synchronize();
         report_lane_cost(lanes, record_stride);
     }
@@ -1206,6 +1562,7 @@ private:
         }
 
         allocate(seg.io_device, io_layout_.bytes, allocated);
+        allocate(seg.dflash_features, seg.plan.dflash_features, allocated);
         if (spec.index == 0) { io_host_ = PinnedHostBuffer(io_layout_.bytes); }
         if (spec.head) {
             allocate(seg.logits32, seg.plan.logits32, allocated);
@@ -1279,6 +1636,7 @@ private:
         execution::ForwardExperts& experts = build.experts;
         experts.frames.assign(spec.layers.size(), nullptr);
         if (max_width_ > 1) { allocate_verification(seg, lanes, allocated); }
+        if (seg.plan.dflash2) { allocate_dflash2(lanes, allocated); }
         seg.work_capacity = seg.plan.work;
         seg.wide_work     = seg.plan.wide_work;
         seg.work          = std::make_unique<WorkspaceArena>(seg.work_capacity);
@@ -1842,6 +2200,7 @@ public:
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
+        lane.dflash_frontier = 0;
         acquire_rows(lane, index);
         const auto shortage_of = [&](std::uint32_t need) {
             runtime::ResourceReservation out;
@@ -1895,6 +2254,8 @@ public:
         lane.next_call = 0;
         lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
+        lane.dflash_calibration.reset();
+        lane.ngram_accept      = kNgramAcceptancePriors;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 lane.proposer =
@@ -1902,7 +2263,9 @@ public:
                 for (const auto token : lane.history) { lane.proposer->append(token); }
             }
             lane.speculative.enabled      = true;
-            lane.speculative.backend      = mtp_ ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+            lane.speculative.backend      = mtp_       ? SpeculativeBackend::Mtp
+                                            : dflash2_ ? SpeculativeBackend::DFlash2
+                                                       : SpeculativeBackend::None;
             lane.speculative.draft_window = static_cast<std::uint32_t>(max_width_ - 1);
             lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
         }
@@ -1958,6 +2321,8 @@ public:
         r.speculative             = lane.speculative;
         r.mtp_accept              = lane.mtp_accept;
         r.mtp_policy_rounds       = lane.mtp_policy_rounds;
+        r.dflash_calibration      = lane.dflash_calibration;
+        r.ngram_accept            = lane.ngram_accept;
         r.constraint_trace        = lane.constraint_trace;
         r.cache_at_admission      = lane.cache_at_admission;
         r.cpu_served_at_admission = lane.cpu_served_at_admission;
@@ -1974,6 +2339,8 @@ public:
         lane.speculative             = r.speculative;
         lane.mtp_accept              = r.mtp_accept;
         lane.mtp_policy_rounds       = r.mtp_policy_rounds;
+        lane.dflash_calibration      = r.dflash_calibration;
+        lane.ngram_accept            = r.ngram_accept;
         lane.constraint_trace        = r.constraint_trace;
         lane.cache_at_admission      = r.cache_at_admission;
         lane.cpu_served_at_admission = r.cpu_served_at_admission;
@@ -2029,6 +2396,7 @@ public:
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
+        lane.dflash_frontier = 0;
         acquire_rows(lane, index);
         if (selection) {
             lane.prefix.reuse          = b.reuse;
@@ -2353,6 +2721,7 @@ public:
         if (last && lane.vision) { vision_release(lane); }
         if (last && !prefilling_besides(index)) { return_leases(); }
         lane.state_tokens += static_cast<std::uint32_t>(width);
+        if (dflash2_) { lane.dflash_frontier = lane.state_tokens; }
         prefix_after_prefill_call(lane, index, last);
         if (!last) {
             {
@@ -2495,21 +2864,23 @@ public:
         // - three or more rows decode plain (one draft each measured slower at four rows).
         // A plain round's W = 1 catch-up keeps each drafter current.
         const std::int32_t pair_k =
-            batch == 2 && mtp_ ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]]) : 0;
+            batch == 2 && (mtp_ || dflash2_) && options_.pair_speculation
+                ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]])
+                : 0;
         const bool speculate = batch == 1 || pair_k > 0;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
         std::int32_t steps = 0;
-        if (mtp_) {
+        if (mtp_ || dflash2_) {
             for (std::int32_t b = 0; b < batch; ++b) {
                 Lane& lane = lanes_[lanes[b]];
-                wanted[b]  = speculate && lane.mtp_live ? (batch == 1 ? choose_draft_length(lane) : pair_k) : 0;
+                wanted[b]  = speculate && drafter_live(lane) ? (batch == 1 ? choose_draft_length(lane) : pair_k) : 0;
                 steps      = std::max(steps, wanted[b]);
             }
         }
         // Each row's draft count and source are fixed before the drafter runs (an MTP row's count
         // is its draft length; a longer n-gram copy proposal replaces its drafts), so the round's
         // width, and with it every row's n-gram landing columns, is known while it drafts.
-        std::array<std::int32_t, kMaximumConcurrency> extents{};
+        std::array<std::int32_t, kMaximumConcurrency> extents{}, limits{};
         std::int32_t width = 1;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
             Lane& lane = lanes_[lanes[b]];
@@ -2520,7 +2891,8 @@ public:
             if (remaining < 2) { continue; }
             auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
             if (batch > 1) { limit = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(pair_k)); }
-            if (mtp_ && lane.mtp_live && wanted[b] > 0) {
+            limits[b] = static_cast<std::int32_t>(limit);
+            if (drafter_live(lane) && wanted[b] > 0) {
                 extents[b] = static_cast<std::int32_t>(std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b])));
             }
             if (speculate && lane.proposer) {
@@ -2573,6 +2945,35 @@ public:
                 drafts_[0].resize(static_cast<std::size_t>(extents[0]));
                 width = 1 + extents[0];
             }
+        } else if (dflash2_ && width > 1) {
+            // One proposal for every row that takes the drafter's tokens (none when every speculating
+            // row copies an n-gram), while the host stages the verification's n-gram rows.
+            bool neural = false;
+            for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
+            const auto stage_rows = [&] {
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    staged[b] = from_ngram_[b] ? width : 1;
+                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
+                }
+            };
+            if (neural) {
+                dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    if (!from_ngram_[b] && extents[b] > 0) {
+                        drafts_[b].assign(dflash_drafts_[b].begin(), dflash_drafts_[b].begin() + extents[b]);
+                    }
+                }
+                // A one-row round verifies its drafts up to the first whose selector probability is
+                // below --spec-min-p, and with --draft-tokens auto only the calibrated length of them
+                // (draft_length.h). The proposal staged only column 0's n-gram rows.
+                if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
+                    extents[0] = std::min(extents[0], dflash_confident_[0]);
+                    if (options_.auto_draft_length) { extents[0] = dflash2_auto_length(lanes_[lanes[0]], extents[0]); }
+                    drafts_[0].resize(static_cast<std::size_t>(extents[0]));
+                    width = 1 + extents[0];
+                }
+            }
+            dflash_round_ = neural && width > 1;
         }
         if (width > 1) {
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
@@ -2658,6 +3059,7 @@ public:
             after_call(static_cast<std::int32_t>(stride), promotions);
             apply_vram_target(false);
             lane.state_tokens += stride;
+            if (dflash2_) { lane.dflash_frontier = lane.state_tokens; }
         }
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -2683,7 +3085,7 @@ public:
         out.row_count = rows.size();
         // After a plain decode round the drafter writes the round's cell (its pending cell moves
         // one position); after the prefill's first token the pending cell stays the prompt's last.
-        const bool catch_up = mtp_ && plain_round_;
+        const bool catch_up = (mtp_ || dflash2_) && plain_round_;
         std::int32_t* commit = catch_up ? spec_host(spec_layout_.commit) : nullptr;
         bool any_cell        = false;
         for (std::size_t row = 0; row < rows.size(); ++row) {
@@ -2710,7 +3112,7 @@ public:
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
             commit_constraint_draws(lane, 1);
             lane.history.push_back(pending_tokens_[row]);
-            if (commit != nullptr && lane.mtp_live) {
+            if (commit != nullptr && (lane.mtp_live || dflash2_)) {
                 commit[row] = 1;
                 any_cell    = true;
             }
@@ -2725,7 +3127,11 @@ public:
         }
         if (any_cell) {
             upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), head().device->stream);
-            mtp_catch_up(rows, 1, commit);
+            if (mtp_) {
+                mtp_catch_up(rows, 1, commit);
+            } else {
+                dflash2_catch_up(rows, 1, commit);
+            }
         }
         on_head.reset(); // the head's work is enqueued; each segment settles on its own
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
@@ -3586,9 +3992,9 @@ private:
 
     // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
     // (design 19.3.5): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
-    // and QSA-tail state; its verification and drafter records; its logit columns and penalty
-    // counts; and its share of the workspace. Every other allocation is independent of the lane
-    // count, so one more lane costs these frames.
+    // and QSA-tail state; its verification and drafter records (DFlash2: its context ring and round
+    // feature columns); its logit columns and penalty counts; and its share of the workspace. Every
+    // other allocation is independent of the lane count, so one more lane costs these frames.
     void report_lane_cost(std::int32_t lanes, std::uint64_t record_stride) noexcept {
         for (const auto& segment : segments_) { report_lane_cost(*segment, lanes, record_stride); }
     }
@@ -3597,11 +4003,18 @@ private:
             const auto n             = static_cast<std::size_t>(lanes);
             const bool fixed_kv      = options_.kv_capacity_tokens != 0;
             const std::size_t kv     = fixed_kv ? 0 : seg.kv_span.bytes / n;
+            // DFlash2's context ring is per lane. Its round feature columns are per lane too; the
+            // call-region window is shared and therefore is not part of the marginal lane cost.
+            const std::size_t dflash_round =
+                seg.plan.dflash2 ? 2ULL * seg.plan.dflash2_config->feature_width(c_.hidden_size) *
+                                       static_cast<std::size_t>(seg.plan.dflash_round_columns)
+                                 : 0;
             const std::size_t state =
                 (seg.state_backing.bytes + seg.ple_backing.bytes + seg.tails_backing.bytes + seg.logits32.bytes +
                  seg.logits16.bytes + seg.token_counts.bytes + seg.records_backing.bytes + seg.ple_records.bytes +
                  seg.qsa_records.bytes + seg.mtp_residuals.bytes + seg.mtp_saved.bytes + seg.mtp_chain.bytes +
-                 seg.mtp_records.bytes + seg.mtp_selection.bytes) /
+                  seg.mtp_records.bytes + seg.mtp_selection.bytes +
+                  (seg.spec.head ? dflash_ring_backing_.bytes + dflash_round : 0)) /
                 n;
             // The workspace grows with the lane count by its sampling, acceptance and drafter rows:
             // the mean step from one lane to this count, or the second lane's at one lane.
@@ -4111,6 +4524,7 @@ private:
         ~HandoffRelease() {
             if (owner == nullptr) { return; }
             for (const auto& channel : owner->channels_) { channel->release(word); }
+            for (const auto& channel : owner->feature_channels_) { channel->release(word); }
         }
     };
 
@@ -4152,7 +4566,14 @@ private:
         seg.split_call = streamed && seg.split_policy && batch * width <= split_columns(seg);
         if (streamed) { seg.expert_stream->begin(ring_span(seg), seg.residency->host_table(), s, seg.split_call); }
         const WideWork wide(*this, seg, batch * width);
-        forward_call(seg, batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+        try {
+            forward_call(seg, batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+            if (dflash2_) { dflash2_call_context(batch, width); }
+        } catch (...) {
+            if (streamed) { seg.expert_stream->end(); }
+            seg.split_call = false;
+            throw;
+        }
         if (streamed) { seg.expert_stream->end(); }
         seg.split_call = false;
         seg.residency->enqueue_route_download(s, batch * width);
@@ -4446,6 +4867,12 @@ private:
                 DeviceSegment& sender = *segments_[i - 1];
                 sender.bulk_out->transfer(shares[i - 1].residual.data, share.residual.data, share.residual.bytes(),
                                           sender.device->stream, seg.device->stream);
+                if (dflash2_) {
+                    sender.bulk_out->transfer(shares[i - 1].batch.draft_features.data,
+                                              share.batch.draft_features.data,
+                                              share.batch.draft_features.bytes(), sender.device->stream,
+                                              seg.device->stream);
+                }
                 const DeviceGuard on(sender.device->device);
                 sender.device->flush();
                 end_share(sender, shares[i - 1], columns);
@@ -4462,6 +4889,7 @@ private:
         DeviceSegment& last = head();
         const DeviceGuard on(last.device->device);
         end_share(last, shares.back(), columns);
+        if (dflash2_) { dflash2_call_context(batch, width); }
     }
 
     // Segment i's share up to its residual, with its device current: the wait for a previous share on
@@ -4513,6 +4941,10 @@ private:
         fb.split  = streamed && seg.split_call;
         if (mtp_ && chunk == nullptr && seg.spec.head) {
             fb.residual_out = Tensor(seg.mtp_residuals.p, DType::BF16, {width_, batch * width});
+        }
+        if (dflash2_) {
+            const auto [column, n] = dflash_call_region(batch * width);
+            fb.draft_features      = dflash_feature_columns(seg, column, n);
         }
         return fb;
     }
@@ -4674,6 +5106,11 @@ private:
         } else if (at < 0 && (at = route_trace_index(seg.mtp_catch_graphs, &graph)) >= 0) {
             family = RouteTraceGraph::MtpCatchUp;
             stride = max_width_;
+        } else if (at < 0 && (at = route_trace_index(dflash_propose_graphs_, &graph)) >= 0) {
+            family = RouteTraceGraph::DFlashPropose;
+        } else if (at < 0 && (at = route_trace_index(dflash_context_graphs_, &graph)) >= 0) {
+            family = RouteTraceGraph::DFlashCatchUp;
+            stride = max_width_;
         }
         if (at < 0) { return; }
         trace_->graph(family, static_cast<std::uint32_t>(at / stride + 1), static_cast<std::uint32_t>(at % stride + 1),
@@ -4708,8 +5145,27 @@ private:
         if (mtp_ && chunk == nullptr && seg.spec.head) {
             fb.residual_out = Tensor(seg.mtp_residuals.p, DType::BF16, {width_, cols});
         }
+        // Each segment captures the target taps it owns. In a split, its feature image is handed
+        // forward just like the residual, so the head sees all taps before running DFlash2.
+        if (dflash2_) {
+            const auto [column, n] = gate != nullptr ? std::pair<std::int32_t, std::int32_t>{0, cols}
+                                                     : dflash_call_region(cols);
+            fb.draft_features = dflash_feature_columns(seg, column, n);
+            if (!seg.spec.embed) {
+                feature_channels_.at(seg.spec.index - 1)->receive(
+                    fb.draft_features.data, fb.draft_features.bytes(), handoff_, fb.handoff_word,
+                    PinnedGateBound{.timeout_ns  = 1'000'000ULL * options_.handoff_timeout_ms,
+                                    .error_word  = static_cast<std::uint32_t*>(expert_error_.data()),
+                                    .error_value = (seg.spec.layers.begin << 16U) | kErrorHandoffTimeout},
+                    static_cast<std::uint64_t*>(seg.handoff_stats.p), seg.device->stream);
+            }
+        }
         if (!seg.spec.head) {
             seg.forward->run(fb, nullptr);
+            if (dflash2_) {
+                feature_channels_.at(seg.spec.index)->send(fb.draft_features.data, fb.draft_features.bytes(), handoff_,
+                                                           fb.handoff_word, seg.device->stream);
+            }
             return;
         }
         Tensor logits(seg.logits32.p, DType::FP32, {vocab_, logit_columns});
@@ -4863,7 +5319,27 @@ private:
         Tensor licensed(spec_device(spec_layout_.licensed), DType::I32, {W, batch});
         Tensor counts(spec_device(spec_layout_.counts), DType::I32, {batch});
         Tensor accepted(spec_device(spec_layout_.accepted), DType::I32, {batch});
-        {
+        // A sampled row's DFlash2 drafts were drawn from the selector's laws: such a round verifies
+        // by sparse rejection sampling with them (greedy rows' laws are one-hot, n-gram rows' copies
+        // one-hot too). A round of greedy rows drafted deterministically and takes the greedy Op.
+        bool dflash_sampled = false;
+        if (std::exchange(dflash_round_, false)) {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                dflash_sampled = dflash_sampled || lanes_[lanes[b]].sampling.temperature > 0.0F;
+            }
+        }
+        const bool sparse = dflash_sampled;
+        if (dflash_sampled) {
+            constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
+            const auto [at_candidates, at_q] = dflash2_verify_planes(batch, K);
+            Tensor candidates(dflash_device(at_candidates), DType::I32, {C, K, batch});
+            Tensor q(dflash_device(at_q), DType::FP32, {C, K, batch});
+            auto scope = head().work->scope();
+            ops::speculative_accept_sparse_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+                                                  candidates, q, extents, lengths, anchors, licensed, counts, accepted,
+                                                  token_domain_, static_cast<const ops::SamplingConfig*>(head().configs.p),
+                                                  ops::SpeculativeAcceptExecutionEnvelope{}, *head().work, s);
+        } else {
             auto scope = head().work->scope();
             ops::speculative_accept_greedy_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
                                                   extents, lengths, anchors, licensed, counts, accepted,
@@ -4895,6 +5371,13 @@ private:
                 live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
             }
             pending_counts_[b] = L;
+            if (sparse && lane.sampling.token_counts != nullptr) {
+                // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts
+                // each licensed token itself): count them before the next round's penalties.
+                Tensor ids(spec_device(spec_layout_.licensed) + static_cast<std::size_t>(b) * W, DType::I32, {L});
+                Tensor token_counts(lane.sampling.token_counts, DType::I32, {token_domain_});
+                ops::increment_token_counts(ids, token_counts, s);
+            }
             if (constrained) {
                 take_constraint_draws(lane, static_cast<std::size_t>(b * W),
                                       std::span<const std::int32_t>(&pending_tokens_[static_cast<std::size_t>(b * W)],
@@ -4913,6 +5396,11 @@ private:
                 for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
                     double& a = lane.mtp_accept[static_cast<std::size_t>(j)];
                     a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * (j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0);
+                }
+                if (dflash2_) {
+                    lane.dflash_calibration.observe(std::span<const float>(dflash_confidence_[b].data(), n),
+                                                    static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(A),
+                                                    kAcceptanceWeight);
                 }
             }
             if (from_ngram_[b]) {
@@ -5018,6 +5506,10 @@ private:
             // later segments commit and the head catches up and drafts, not just before its next
             // round (a batched driver model, WDDM, holds launches until a flush or a blocking call).
             if (segments_.size() > 1 && !seg.spec.head) { seg.device->flush(); }
+        }
+        if (dflash2_) {
+            const SegmentWork on_head(*this, head());
+            dflash2_catch_up(rows, W, commit);
         }
         for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         for (std::int32_t row = 0; row < batch; ++row) {
@@ -5129,10 +5621,13 @@ private:
     // kProbeInterval rounds a row drafts one token more than its choice, so the estimate of the
     // next position stays current (K = 0 then probes one draft).
     std::int32_t choose_draft_length(Lane& lane) const {
+        const std::int32_t most = neural_k();
+        // DFlash2 proposes its whole block; its length is chosen after the proposal (dflash2_auto_length).
+        if (!options_.auto_draft_length || dflash2_) { return most; }
         std::int32_t best = 0;
         double best_score = 1.0;
         double reach = 1.0, tokens = 1.0;
-        for (std::int32_t k = 1; k <= mtp_k_; ++k) {
+        for (std::int32_t k = 1; k <= most; ++k) {
             reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
             const double score = tokens / (1.0 + width_cost_ * k);
@@ -5141,7 +5636,7 @@ private:
                 best       = k;
             }
         }
-        if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, mtp_k_); }
+        if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }
 
@@ -5150,8 +5645,9 @@ private:
     // two-row rounds. Every kProbeInterval pair rounds it drafts one token more than its choice, so
     // the rows' estimates of the next position stay current.
     std::int32_t choose_pair_draft_length(const Lane& a, const Lane& b) {
-        if (!a.mtp_live || !b.mtp_live) { return 0; }
-        const std::int32_t most = std::min(kPairMaxDrafts, mtp_k_);
+        if (!drafter_live(a) || !drafter_live(b)) { return 0; }
+        const std::int32_t most = std::min(kPairMaxDrafts, neural_k());
+        if (!options_.auto_draft_length) { return most; }
         std::int32_t best = 0;
         double best_score = 2.0;
         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
@@ -5960,6 +6456,9 @@ private:
     // A layer split's boundaries, one per pair of consecutive segments (DeviceSegment::in, out and
     // bulk_out point at them): declared before the segments, whose Forwards and streams use them.
     std::vector<std::unique_ptr<HandoffChannel>> channels_;
+    // DFlash2's target features cross independently of the residual so both transfers remain
+    // capturable in decode and verification graphs.
+    std::vector<std::unique_ptr<HandoffChannel>> feature_channels_;
     std::vector<std::unique_ptr<BulkHandoff>> bulk_;
     // The MoE offload's crossings (DeviceSegment::moe_out, moe_back), both on the first segment.
     std::vector<std::unique_ptr<BulkHandoff>> moe_bulk_;
@@ -5987,6 +6486,7 @@ private:
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
     std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts above kDraftMinLogprob
     std::array<bool, kMaximumConcurrency> from_ngram_{};
+    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.75, 0.88, 0.93, 0.96};
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
     // rounds, design 19.2).
@@ -6019,17 +6519,107 @@ private:
         throw std::invalid_argument(std::string("INFERNIX_MTP_QSA_SHARE must be 0 or 1, not '") + value + "'");
     }
     const bool mtp_qsa_share_ = mtp_qsa_share_from_environment();
+    // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
+    // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
+    // (2026-10-20): fixed lengths 2-7 took 14.2-27.7 ms rounds against 8.4 ms plain ones, about 2.6 ms
+    // a draft and 0.6-1 ms of proposal. The online fit (width_cost) chose shorter lengths and was
+    // 6 % slower, so the priors stand.
+    static constexpr double kDFlashDraftCost    = 0.31;
+    static constexpr double kDFlashProposalCost = 0.1;
+    // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of
+    // K's variance (of the mean square) it needs, its ceiling, and the cycle that counts as a gap.
+    static constexpr double kCostDecay     = 0.98;
+    static constexpr double kCostMinRounds = 16.0;
+    static constexpr double kCostMinSpread = 0.02;
+    static constexpr double kCostMax       = 2.0;
+    static constexpr double kCostGapRatio  = 3.0;
     // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
     static constexpr double kPairWidthCost       = 0.47;
-    // A one-row round verifies its drafts up to the first whose draft-head probability is below 0.5
-    // (Strata's --spec-min-p rule; C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
+    // A one-row round verifies its drafts up to the first whose draft-head probability is below
+    // ProgramOptions::draft_min_p, held as its log (-inf at 0: every draft). The 0.5 default is
+    // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
     // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
     static constexpr double kDraftMinLogprob = -0.6931471805599453; // log(0.5)
     std::uint64_t pair_policy_rounds_            = 0;
     bool plain_round_ = false;
+
+    // The neural drafter's most drafts per round (MTP's or DFlash2's), and whether a lane drafts.
+    [[nodiscard]] std::int32_t neural_k() const noexcept { return mtp_ ? mtp_k_ : dflash_k_; }
+    [[nodiscard]] bool drafter_live(const Lane& lane) const noexcept { return mtp_ ? lane.mtp_live : dflash2_; }
+
+    // ---------------------------------------------------------------- DFlash2 drafter (dflash2_program.cpp)
+    void allocate_dflash2(std::int32_t lanes, std::uint64_t& allocated);
+    void create_dflash2_drafter();
+    [[nodiscard]] std::int32_t dflash_feature_rows() const noexcept {
+        return dim(head().plan.dflash2_config->feature_width(c_.hidden_size));
+    }
+    // Feature columns [column, column + n) (BF16 [taps * H, n]).
+    [[nodiscard]] Tensor dflash_feature_columns(const DeviceSegment& seg, std::int32_t column, std::int32_t n) const {
+        return Tensor(static_cast<std::byte*>(seg.dflash_features.p) +
+                          2ULL * static_cast<std::size_t>(dflash_feature_rows()) * static_cast<std::size_t>(column),
+                      DType::BF16, {dflash_feature_rows(), n});
+    }
+    [[nodiscard]] Tensor dflash_feature_columns(std::int32_t column, std::int32_t n) const {
+        return dflash_feature_columns(head(), column, n);
+    }
+    // Where a prefill call or forced tokens of `cols` columns leave their features: the call region's
+    // last window. During another lane's layer walk, whose span holds the call region, forced tokens
+    // use the round region (no round is pending between rounds) and keep its columns.
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> dflash_call_region(std::int32_t cols) const noexcept {
+        const DeviceLayout& plan = head().plan;
+        if (walk_.span.active) { return {0, std::min(cols, plan.dflash_round_columns)}; }
+        return {plan.dflash_round_columns, std::min(cols, dim(plan.dflash2_config->window))};
+    }
+    std::int32_t* dflash_host(std::size_t offset) const { return static_cast<std::int32_t*>(dflash_host_.data()) + offset; }
+    std::int32_t* dflash_device(std::size_t offset) const { return static_cast<std::int32_t*>(dflash_device_.p) + offset; }
+    // One proposal of dflash_k_ drafts for every row of a decode round (the rows' drafts land in
+    // dflash_drafts_, their candidates and laws in the io); `while_drafting` runs on the host after
+    // it is submitted, before its wait.
+    void dflash2_propose(std::span<const std::uint32_t> lanes, const std::function<void()>& while_drafting);
+    // After a round's commit: each row's committed columns' features into its ring (`commit`: the
+    // committed columns per row, already on the device at spec_layout_.commit).
+    void dflash2_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit);
+    // After a prefill call or forced tokens (one row): its last window's features into the ring.
+    void dflash2_call_context(std::int32_t batch, std::int32_t width);
+    // A layer walk: a tapped layer's completed residual for the span's last window, and after the
+    // span the window into the ring.
+    void dflash2_walk_features(std::size_t first, std::size_t end, std::uint32_t layer, const Tensor& residual);
+    void dflash2_walk_context(Lane& lane, std::uint32_t index);
+    // n consecutive positions from `first` of lane `slot`, whose features stand at `column`, into the ring.
+    void dflash2_context(std::int32_t column, std::int32_t n, std::int32_t first, std::int32_t slot);
+    // The stream waits for the prefix cache's copies of the lane's ring in flight (a restore, a copy-out).
+    void dflash2_wait_copies(const Lane& lane);
+    // A DFlash2 round's verification candidates and laws [16, K, batch] (their io offsets): a DFlash2
+    // row's first drafts' from the proposal, an n-gram row's one-hot at its copied tokens. The
+    // proposal's own planes when every drafting row is DFlash2's and K is the proposal's.
+    std::pair<std::size_t, std::size_t> dflash2_verify_planes(std::int32_t batch, std::int32_t K);
+    bool dflash2_          = false;
+    bool dflash_round_     = false; // this verification's neural drafts are DFlash2's
+    std::int32_t dflash_k_ = 0;
+    DeviceBuffer dflash_ring_backing_, dflash_device_;
+    PinnedHostBuffer dflash_host_{1};
+    DFlash2Io dflash_io_;
+    std::unique_ptr<CyclicKVCache> dflash_ring_;
+    std::unique_ptr<execution::DFlash2> drafter_;
+    std::array<std::vector<std::int32_t>, kMaximumConcurrency> dflash_drafts_;
+    std::array<std::int32_t, kMaximumConcurrency> dflash_confident_{}; // per row: drafts above draft_min_p
+    std::array<std::array<float, 8>, kMaximumConcurrency> dflash_confidence_{}; // per row: each draft's
+    // --draft-tokens auto: the calibrated length of row 0's proposal (draft_length.h), one draft more
+    // every kProbeInterval rounds, so the deciles of longer drafts keep being measured.
+    std::int32_t dflash2_auto_length(Lane& lane, std::int32_t most) {
+        std::int32_t best = calibrated_draft_length(
+            lane.dflash_calibration, std::span<const float>(dflash_confidence_[0].data(), static_cast<std::size_t>(most)),
+            most, kDFlashDraftCost, kDFlashProposalCost);
+        if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }
+        return best;
+    }
+    std::vector<DecodeGraph> dflash_propose_graphs_; // batch - 1
+    std::vector<DecodeGraph> dflash_context_graphs_; // (batch - 1) * max_width_ + width - 1
+    // The DFlash2 frontier of the lane a layer walk started (its inner taps capture that ring).
+    std::uint32_t walk_dflash_frontier_ = 0;
 
     // Speculative verification (max_width_ > 1).
     std::int32_t max_width_   = 1;

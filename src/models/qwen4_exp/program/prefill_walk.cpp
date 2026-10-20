@@ -137,6 +137,18 @@ execution::ForwardBatch ProgramImpl::walk_batch(const DeviceSegment& seg, std::s
     // frees its events (a landed batch needs no wait). Each segment's layers wait for their own
     // entries, recorded on that segment's streams.
     if (c == 0) { fb.layer_waits = prefix_waits(lanes_[walk_.span.lane]); }
+    if (dflash2_) {
+        const DeviceLayout& plan = head().plan;
+        const std::int32_t total = walk_.span.offsets.back() + walk_.span.widths.back();
+        const std::int32_t from  = total - std::min(total, dim(plan.dflash2_config->window));
+        const std::int32_t lo    = walk_.span.offsets[c];
+        const std::int32_t hi    = lo + walk_.span.widths[c];
+        const std::int32_t begin = std::max(lo, from);
+        if (begin < hi) {
+            fb.draft_features = dflash_feature_columns(
+                seg, plan.dflash_round_columns + begin - from, hi - begin);
+        }
+    }
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.span.widths.size();
     return fb;
@@ -352,6 +364,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         walk_.host     = PinnedHostBuffer(n * walk_.span.io_stride);
         walk_.prefetch = WalkState::WalkPrefetch{};
     }
+    walk_dflash_frontier_ = lane.dflash_frontier;
     walk_.span.active = true;
 
     auto* host_area = static_cast<std::byte*>(walk_.host.data());
@@ -549,6 +562,17 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
         seg.bulk_out->transfer(residual.data,
                                walk_area(next) + column_bytes * static_cast<std::size_t>(walk_.span.offsets[c]),
                                residual.bytes(), seg.device->stream, next.device->stream);
+        if (dflash2_ && fb.draft_features.data != nullptr) {
+            const DeviceLayout& plan = head().plan;
+            const std::int32_t total = walk_.span.offsets.back() + walk_.span.widths.back();
+            const std::int32_t from  = total - std::min(total, dim(plan.dflash2_config->window));
+            const std::int32_t lo    = walk_.span.offsets[c];
+            const std::int32_t begin = std::max(lo, from);
+            Tensor destination = dflash_feature_columns(
+                next, plan.dflash_round_columns + begin - from, fb.draft_features.ne[1]);
+            seg.bulk_out->transfer(fb.draft_features.data, destination.data, fb.draft_features.bytes(),
+                                   seg.device->stream, next.device->stream);
+        }
     }
 }
 
@@ -718,6 +742,7 @@ void ProgramImpl::walk_offload_layers(std::uint32_t from, std::uint32_t to, std:
         CUDA_CHECK(cudaStreamWaitEvent(a.device->stream, a.side.events[c], 0));
         Tensor residual = residual_of(c);
         a.forward->layer_back(l, residual, inject_of(c), y_of(c));
+        if (dflash2_) { dflash2_walk_features(c, c + 1, l, residual); }
     };
     for (std::uint32_t l = from; l < to; ++l) {
         for (std::size_t c = 0; c < n; ++c) {
@@ -751,6 +776,14 @@ void ProgramImpl::walk_offload_cross() {
         a.bulk_out->transfer(walk_area(a) + at, walk_area(b) + at,
                              column_bytes * static_cast<std::size_t>(walk_.span.widths[c]), a.device->stream,
                              b.device->stream);
+    }
+    if (dflash2_) {
+        const DeviceLayout& plan = head().plan;
+        const std::int32_t total = walk_.span.offsets.back() + walk_.span.widths.back();
+        const std::int32_t n     = std::min(total, dim(plan.dflash2_config->window));
+        const Tensor from = dflash_feature_columns(a, plan.dflash_round_columns, n);
+        const Tensor to   = dflash_feature_columns(b, plan.dflash_round_columns, n);
+        a.bulk_out->transfer(from.data, to.data, from.bytes(), a.device->stream, b.device->stream);
     }
     {
         const DeviceGuard on(a.device->device);
@@ -865,6 +898,10 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         const SegmentWork on(*this, *segment);
         segment->residency->enqueue_route_download(segment->device->stream, width);
         segment->expert_stream->end();
+    }
+    if (dflash2_) {
+        const SegmentWork on_head(*this, head());
+        dflash2_walk_context(lane, index);
     }
     walk_.span.active = false;
     host_lanes_[0]    = static_cast<std::int32_t>(index);

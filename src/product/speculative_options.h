@@ -3,12 +3,47 @@
 #include "infernix/types.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace infernix::product {
+
+// --draft-tokens accepts the ordinary fixed width or "auto", which leaves the model-specific
+// ceiling to Engine normalization.
+inline void apply_draft_tokens(SpeculativeOptions& options, std::string_view value) {
+    if (value == "auto") {
+        options.draft_tokens_auto = true;
+        options.draft_tokens      = 0;
+        return;
+    }
+    if (value.empty() || value.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument("--draft-tokens takes a nonnegative integer or auto");
+    }
+    const unsigned long parsed = std::stoul(std::string(value));
+    if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("--draft-tokens is too large");
+    }
+    options.draft_tokens_auto = false;
+    options.draft_tokens      = static_cast<std::uint32_t>(parsed);
+}
+
+[[nodiscard]] inline float parse_draft_min_p(std::string_view value) {
+    std::size_t consumed = 0;
+    float parsed         = 0.0F;
+    try {
+        parsed = std::stof(std::string(value), &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("--spec-min-p must be in [0,1]");
+    }
+    if (consumed != value.size() || !std::isfinite(parsed) || parsed < 0.0F || parsed > 1.0F) {
+        throw std::invalid_argument("--spec-min-p must be in [0,1]");
+    }
+    return parsed;
+}
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
@@ -125,6 +160,18 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             }
         }
     }
+    if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
+    }
+    // auto with dflash2: Qwen3.8-Flash-Next's per-round policy (the Engine refuses it elsewhere).
+    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp or dflash2");
+    }
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2");
+    }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
     }
@@ -146,8 +193,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DFlash2:
+        if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] (auto: Qwen3.8-Flash-Next)");
         }
         return;
     }

@@ -340,6 +340,149 @@ def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
         _assign(recipe, name, Q8)
 
 
+def qwen3_8_flash_next_fp8(model, recipe, sources):
+    """Qwen3.8-Flash-Next's official FP8 checkpoint (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25): Qwen's official
+    FP8 checkpoint bit-exact. The routed experts keep their E4M3FN codes and BF16 128 x 128 tile scales
+    (``fp8_e4m3fn_b128`` in ``fp8_expert_b128_v1``, run W8A16 with exact arithmetic); every BF16 or
+    FP32 tensor keeps its dtype; the n-gram table is the FP8 volume recipes A-C write. Only the MTP
+    drafter is re-quantized (``_flash_next_drafter``), its routed experts in ``q2_g64_fp16``: the
+    0.63 GB saved against ``q4_g64_fp16`` goes to expert-cache frames."""
+
+    from .qwen4_exp import Fp8ExpertBankSource, import_fp8_expert_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(isinstance(model.parameters[name].source, Fp8ExpertBankSource) for name in banks):
+        raise ValueError("the FP8 recipe imports Qwen's block-FP8 experts (Qwen/Qwen3.8-Flash-Next-FP8)")
+    for name in banks:
+        recipe.assign(name, format="fp8_e4m3fn_b128", layout="fp8_expert_b128_v1", method=import_fp8_expert_bank,
+                      activation_policy="A16Only")
+        recipe.group(name, shape=model.parameters[name].shape)
+    _flash_next_drafter(model, recipe, experts=Q2)
+
+
+def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
+    """Recipe C of Qwen3.8-Flash-Next (design §6.1): orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4,
+    a weight-only compressed-tensors export of the abliterated model, served with BF16 activations.
+
+    Bit-exact where the checkpoint is quantized: the routed experts' NVFP4 codes and block scales (a
+    W4A16 bank, design §16.2.1: the global scale stored as its FP32 reciprocal, no activation scales)
+    and the row-scaled FP8 GDN, QSA and shared-expert projections (W8A16). Its BF16 classes follow
+    recipe B: the hyper-connection mixers, the PLE projections and ``lm_head`` in ``q8_g32_fp16``;
+    the router, shared-expert gate, GDN a/b, QSA indexer, embedding and vision tower stay BF16. The
+    n-gram table is quantized per tensor (qwen4_exp.NgramTable), which reproduces NVIDIA's FP8 table
+    of the same base model word for word. The drafter is recipe A's, from the checkpoint's BF16 MTP.
+
+    The QSA query/gate/key/value projections (FP8) and the indexer (BF16) form two parents, which the
+    model runs as two projections."""
+
+    from .qwen4_exp import import_expert_bank, weight_only_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(weight_only_bank(model.parameters[name].source) for name in banks):
+        raise ValueError("recipe C imports weight-only compressed-tensors experts (W4A16 banks)")
+    base = sources["base"]
+    fp8 = (
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/query", "/attention/gate", "/attention/key", "/attention/value", "/attention/output",
+        "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+    )
+    dense8 = (
+        "/attn_hc/down", "/attn_hc/inject", "/attn_hc/up",
+        "/mlp_hc/down", "/mlp_hc/inject", "/mlp_hc/up",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="A16Only",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(fp8):
+            recipe.assign(
+                name,
+                format=FP8,
+                method=import_encoded,
+                source=model.source(name, base, FP8),
+                activation_policy="A16Only",
+            )
+        elif name.endswith(dense8):
+            _assign(recipe, name, Q8)
+    for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
+        _assign(recipe, name, Q8)
+    for layer, kind in enumerate(model.config["layer_types"]):
+        if kind == "full_attention":
+            p = f"text/layers/{layer}/attention/"
+            recipe.group([p + "query", p + "gate", p + "key", p + "value"])
+            recipe.group([p + "index_query", p + "index_key"])
+    _flash_next_drafter(model, recipe)
+
+
+def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
+    """ISTA-DASLab's GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next, bit-exact
+    (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). Every GGUF block format is stored verbatim:
+    dense matrices of the tiled formats (Q4_K, Q5_K, Q6_K, IQ4_XS) in ``ggml_tiles16_v1`` (the same
+    blocks in 16-row tiles, so a tile's block is one contiguous run for the narrow kernels), the
+    others and the token embedding (a row gather) in ``ggml_rows_v1``, each in its own per-tensor
+    ggml format; the routed experts as ``ggml_expert_*_v1`` banks (gate/up format, the layout naming
+    the down format), the one Q8_0 tensor as the identical ``q8_g32_fp16`` words, BF16 and FP32
+    tensors in their dtype, and the zero-centred norms as the BF16 values llama.cpp shifted by one
+    (qwen4_exp_gguf checks every one is exact). The arithmetic is A16 everywhere. Only the MTP
+    drafter, which the GGUF lacks, is built from Qwen's checkpoint and re-quantized as recipes A-C
+    build it (``_flash_next_drafter``), its routed experts in ``q2_g64_fp16`` (Strata's 2.25-bit
+    drafter precision): the drafter only proposes tokens, and against ``q4_g64_fp16`` experts MTP 4
+    + n-gram 7 decoded 201.4-203.1 against 196.1-196.7 tok/s (2026-10-16), with 0.63 GB of VRAM more
+    for expert-cache frames.
+    """
+
+    from tools.artifact.layouts import GGML_TILES16_FORMATS
+
+    from .qwen4_exp_gguf import GgmlExpertBank, import_ggml_expert_bank
+    from .methods import import_ggml_rows
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"] or model.config.get("gdn_a") != "direct":
+        raise ValueError("this recipe requires a Qwen4Exp model built from a GGUF (tools.convert --gguf)")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        source = parameter.source
+        if isinstance(source, GgmlExpertBank):
+            recipe.assign(name, format=source.gate_up_format, layout=source.layout, method=import_ggml_expert_bank,
+                          activation_policy="A16Only")
+            recipe.group(name, shape=parameter.shape)
+        elif source.read_encoded is not None:
+            stored = source.read_encoded(0, 1).format
+            if stored == Q8:
+                recipe.assign(name, format=stored, method=import_encoded)
+            elif stored in GGML_TILES16_FORMATS and name != "text/token_embedding":
+                recipe.assign(name, format=stored, layout="ggml_tiles16_v1", method=import_ggml_rows)
+            else:
+                recipe.assign(name, format=stored, method=import_ggml_rows)
+    _flash_next_drafter(model, recipe, experts=Q2)
+
+
+def qwen3_8_flash_next_dflash2(model, recipe, sources):
+    """A Qwen3.8-Flash-Next DFlash2 drafter as a companion artifact (``tools.convert --components
+    dflash2``), quantized as NInfer's official Qwen3.8-27B artifact stores its DFlash2: every
+    projection in ``q8_g32_fp16`` (absmax group scales; the context K/V roles share the query
+    block's K/V words) except the dynamic-convolution kernel projections and the selector's hidden
+    projection, which stay BF16 with the norms, base kernels and codebooks. The drafter only
+    proposes tokens the main model verifies, so its precision changes acceptance, never output."""
+
+    if set(model.components) != {"dflash2"} or model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this recipe converts a Qwen4Exp DFlash2 companion (--components dflash2)")
+    _optional(model, recipe)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -351,4 +494,8 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
+    "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
+    "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
+    "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
+    "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
 }

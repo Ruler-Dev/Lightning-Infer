@@ -103,3 +103,14 @@ infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+infernix_add_test(infernix_qwen4_exp_draft_length_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_length.cpp"
+  LIBRARIES infernix_model_runtime
+)
+
+infernix_add_test(infernix_qwen4_exp_dflash2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
+  LIBRARIES infernix_engine
+)
+set_tests_properties(infernix_qwen4_exp_dflash2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)

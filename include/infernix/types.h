@@ -147,7 +147,15 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
+    // With --draft-tokens auto, draft_tokens is the startup ceiling and the runtime may stop
+    // earlier using the drafter's confidence. draft_min_p overrides the backend default gate.
+    bool draft_tokens_auto = false;
+    std::optional<float> draft_min_p;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Qwen3.8-Flash-Next DFlash2 (--draft-model): the companion artifact holding the drafter
+    // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
+    // bundle their DFlash and DFlash2 drafters and refuse it.
+    std::filesystem::path draft_model;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;

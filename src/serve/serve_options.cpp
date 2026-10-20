@@ -300,7 +300,9 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
-           "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
+           "  --draft-tokens N|auto      draft tokens per round (Qwen3.8 DFlash2: 1-7 or auto)\n"
+           "  --draft-model FILE         companion DFlash2 artifact for Qwen3.8-Flash-Next\n"
+           "  --spec-min-p P             drafter confidence gate in [0,1]\n"
            "  --lm-head-draft            use the optimized proposal head\n"
            "  --draft-tree-nodes auto|LIST\n"
            "                             dflash2: verify a small tree of alternative drafts\n"
@@ -679,8 +681,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+            product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model =
+                std::filesystem::path(std::string(require_value("--draft-model")));
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(require_value("--spec-min-p"));
         } else if (arg == "--draft-tree-nodes") {
             product::apply_draft_tree_nodes(options.speculative,
                                             require_value("--draft-tree-nodes"));

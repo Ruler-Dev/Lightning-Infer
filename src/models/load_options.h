@@ -4,6 +4,7 @@
 #include "infernix/types.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -26,6 +27,8 @@ struct LoadOptions {
     // [segment_ends[s-1], segment_ends[s]) (from 0) in its own arena, on the s-th device given to
     // materialize_model. The ends ascend to the layer count; empty = one segment.
     std::vector<std::uint32_t> segment_ends;
+    // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
+    std::filesystem::path draft_model;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -77,7 +80,7 @@ struct LoadOptions {
     return mode == VisionOffload::On || (mode == VisionOffload::Auto && architecture == Architecture::Qwen4Exp);
 }
 
-[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options, Architecture architecture) noexcept {
+[[nodiscard]] inline LoadOptions load_options(const EngineOptions& options, Architecture architecture) {
     return {.purpose                  = options.purpose,
             .vision                   = options.enable_vision,
             .vision_offload           = resolve_vision_offload(options.vision_offload, architecture),
@@ -85,7 +88,8 @@ struct LoadOptions {
             .speculative              = options.speculative.backend,
             .proposal_head            = options.speculative.proposal_head,
             .rope_yarn_factor         = options.rope_yarn_factor,
-            .a16_activations          = options.a16_activations};
+            .a16_activations          = options.a16_activations,
+            .draft_model              = options.speculative.draft_model};
 }
 
 } // namespace infernix::models

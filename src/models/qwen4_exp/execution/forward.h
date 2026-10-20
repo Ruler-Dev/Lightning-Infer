@@ -202,6 +202,10 @@ struct ForwardBatch {
     std::int32_t width = 0;
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
+    // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
+    // for the call's last n columns, the stream mean of each tapped layer's completed residual
+    // (tap i at rows [i * H, (i + 1) * H)). n <= T.
+    Tensor draft_features;
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
     // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each
     // empty or one event per decoder layer of the whole model, then one for the MTP block. Layer l
@@ -329,7 +333,6 @@ public:
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
-
     // A layer whose MoE another device computes (MoeFront): layer_front is layer() up to the MoE's
     // input (with `inject`, FP32 [S, T] outside the workspace, as layer()'s), then the router and
     // the routing (copied to the route log); `front`'s tensors live in the workspace until this
@@ -357,6 +360,11 @@ public:
 
     // The segment with its range resolved ({0, L} for the whole model).
     [[nodiscard]] const ForwardSegment& segment() const noexcept { return segment_; }
+
+    // DFlash2: when `layer` is one of the drafter's target layers, the stream mean of its completed
+    // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
+    // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
+    void capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
@@ -410,6 +418,7 @@ private:
     ForwardSegment segment_;
     std::uint32_t gdn_count_ = 0, attention_count_ = 0; // the segment's layers of each kind
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
+    std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
     // event that lands them, and the per-expert columns and CPU marks derived from them.

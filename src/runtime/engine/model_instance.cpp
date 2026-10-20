@@ -250,6 +250,28 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // Qwen3.8-Flash-Next verifies at most eight columns (anchor plus seven drafts). Qwen3.5's
+    // captured MTP planner supports five. A nonzero value supplied with "auto" is a ceiling.
+    if (options.speculative.draft_tokens_auto) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp &&
+            !(qwen4_exp && options.speculative.backend == SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "--draft-tokens auto requires --spec mtp (Qwen3.8-Flash-Next: also dflash2)");
+        }
+        if (options.speculative.draft_tokens == 0) {
+            options.speculative.draft_tokens = qwen4_exp ? 7U : 5U;
+        }
+    }
+    if (const auto& p = options.speculative.draft_min_p) {
+        if (!(*p >= 0.0F && *p <= 1.0F)) {
+            throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
+        }
+        if (!qwen4_exp || (options.speculative.backend != SpeculativeBackend::Mtp &&
+                           options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp or dflash2 only");
+        }
+    }
     if (qwen4_exp && cache.enabled && cache.mode == ContextCacheMode::Original) {
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next has no original prefix cache: use the hybrid prefix cache or "

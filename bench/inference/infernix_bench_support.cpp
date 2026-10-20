@@ -378,7 +378,9 @@ std::string usage_text(std::string_view program) {
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
-        << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
+        << "  --draft-tokens <n>|auto    draft tokens (Qwen3.8 DFlash2: 1..7 or auto)\n"
+        << "  --draft-model <path>       companion DFlash2 artifact for Qwen3.8-Flash-Next\n"
+        << "  --spec-min-p <p>           drafter confidence gate in [0,1]\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
         << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
@@ -529,7 +531,11 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+            product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(value("--draft-model")));
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);

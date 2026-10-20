@@ -105,10 +105,14 @@ void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation only (causal scoring is not wired yet)");
     }
-    if ((options.speculative.backend != SpeculativeBackend::None &&
-         options.speculative.backend != SpeculativeBackend::Mtp) ||
+    if (options.speculative.backend == SpeculativeBackend::DFlash ||
         options.speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter and n-gram copy proposals");
+        throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter, a DFlash2 drafter "
+                                    "(--spec dflash2 --draft-model FILE) and n-gram copy proposals");
+    }
+    if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 7)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next DFlash2 drafts 1-7 tokens per round (--draft-tokens)");
     }
     // Its loader binds the stored activation permissions as recorded (canonical W4A4 experts); a
     // 16-bit-activation reference route is not built, so the option is refused, not ignored.
@@ -252,6 +256,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;
+    program_options.dflash2_draft_tokens = options.speculative.backend == SpeculativeBackend::DFlash2
+                                               ? options.speculative.draft_tokens
+                                               : 0U;
+    program_options.auto_draft_length = options.speculative.draft_tokens_auto;
+    program_options.draft_min_p = options.speculative.draft_min_p.value_or(
+        options.speculative.draft_tokens_auto && options.speculative.backend == SpeculativeBackend::Mtp
+            ? 0.5F
+            : 0.0F);
     if (!options.expert_state_path.empty()) {
         // The state belongs to the artifact: its experts and their records, not the build or KV format.
         std::error_code error;
@@ -467,8 +479,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options,
     LoadSummary::PrefixCacheRestore restore;
     if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid && !file.empty()) {
+        std::string signature = "qwen4_exp";
+        // DFlash2's rolling feature ring is part of every prefix snapshot. Tie persisted snapshots
+        // to the exact companion artifact so changing drafters cannot restore incompatible state.
+        if (const auto& draft = instance->model->info().draft_artifact_id) {
+            signature += ";draft=";
+            for (const std::byte byte : *draft) {
+                constexpr char kHex[] = "0123456789abcdef";
+                signature += kHex[std::to_integer<unsigned>(byte) >> 4U];
+                signature += kHex[std::to_integer<unsigned>(byte) & 15U];
+            }
+        }
         const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
-            file, hybrid_cache_fingerprint(options, "qwen4_exp"), options.startup_observer);
+            file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{
             .attempted           = true,
             .restored            = loaded.ok,

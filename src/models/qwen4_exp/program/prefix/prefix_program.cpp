@@ -42,12 +42,26 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
-    prefix_.image_layout = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
+    // DFlash2's context ring is owned by the head segment alongside the drafter.
+    prefix::DraftRingGeometry ring;
+    std::vector<std::byte*> ring_k, ring_v;
+    if (dflash2_) {
+        ring.layers = dflash_ring_->layer_count();
+        for (std::uint32_t l = 0; l < ring.layers; ++l) {
+            const CyclicKVCacheLayerView view = dflash_ring_->layer_view(l);
+            ring.k_bytes = view.k.bytes() / lanes;
+            ring.v_bytes = view.v.bytes() / lanes;
+            ring_k.push_back(static_cast<std::byte*>(view.k.data));
+            ring_v.push_back(static_cast<std::byte*>(view.v.data));
+        }
+    }
+    prefix_.image_layout =
+        prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache, ring));
     std::vector<prefix::LaneStateBuffers> buffers;
     std::vector<prefix::PrefixSegment> parts;
     for (const auto& segment : segments_) {
         DeviceSegment& seg = *segment;
-        buffers.push_back(prefix::LaneStateBuffers{
+        prefix::LaneStateBuffers state{
             .layer_begin     = seg.spec.layers.begin,
             .layer_end       = seg.spec.layers.end,
             .gdn_base        = seg.spec.gdn_base,
@@ -59,7 +73,12 @@ void ProgramImpl::create_prefix_cache() {
             .tails           = static_cast<std::byte*>(seg.tails_backing.p),
             .mtp_saved       = seg.spec.mtp ? static_cast<std::byte*>(seg.mtp_saved.p) : nullptr,
             .window          = static_cast<std::byte*>(seg.window_backing.p),
-            .window_geometry = seg.window_geometry});
+            .window_geometry = seg.window_geometry};
+        if (seg.spec.head) {
+            state.ring_k = ring_k;
+            state.ring_v = ring_v;
+        }
+        buffers.push_back(std::move(state));
         parts.push_back(prefix::PrefixSegment{.device         = seg.device->device,
                                               .pool           = seg.pool.get(),
                                               .pages          = seg.kv_geometry,
@@ -623,6 +642,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         }
         if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_.cache->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
+        lane.dflash_frontier = std::min(meta.draft_frontier, s.frontier);
         // Penalty counts restart with the request; the lane's state came from the snapshot.
         const SegmentWork on_head(*this, head());
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(head().token_counts.p) +
@@ -799,6 +819,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
     c.meta.mtp_accept = lane.mtp_accept;
+    c.meta.draft_frontier = std::min(lane.dflash_frontier, F);
     // The lineage's previous snapshot serves only requests diverging before this one: this request's
     // last capture, else the snapshot it resumed from (never an earlier request's capture on the slot).
     if (const auto previous = lane.prefix.lineage_capture != 0 ? prefix_.cache->capture_result(lane.prefix.lineage_capture)

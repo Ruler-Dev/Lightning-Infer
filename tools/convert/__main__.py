@@ -128,7 +128,8 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2; dflash2 alone writes a Qwen4Exp "
+        "DFlash2 companion artifact (--model: the target checkpoint)",
     )
     parser.add_argument(
         "--resource",
@@ -171,7 +172,24 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
-        if qwen4:
+        companion = "text" not in components
+        if companion and (
+            components != ("dflash2",)
+            or not qwen4
+            or args.proposal
+            or args.ngram_out
+            or args.ngram_reuse
+            or overrides
+        ):
+            raise ValueError(
+                "without text, --components dflash2 writes a Qwen4Exp DFlash2 companion: --model is "
+                "the target checkpoint and --source dflash2=PATH the drafter; no proposal, n-gram "
+                "or resource options apply"
+            )
+        ngram_out = None
+        if companion:
+            model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
+        elif qwen4:
             model = qwen4_exp.build_model(
                 base, components=components, resource_overrides=overrides
             )
