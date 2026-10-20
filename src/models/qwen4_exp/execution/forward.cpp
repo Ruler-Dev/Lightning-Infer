@@ -720,14 +720,21 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                   .update_tails     = call.update_tails};
     ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
     if (call.kv_only) { return Tensor{}; }
-    ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
+    if (!call.reuse_qsa_selection) {
+        ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
+    }
 
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
     const DeviceSpan span     = work_.alloc_bytes(scratch);
+    const bool shared = call.qsa_selection_blocks.data != nullptr;
+    const ops::QsaSelection selection{.blocks    = call.qsa_selection_blocks,
+                                      .counts    = call.qsa_selection_counts,
+                                      .positions = call.qsa_selection_positions,
+                                      .reuse     = call.reuse_qsa_selection};
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr);
+                       span.bytes, out, s, vq ? &append : nullptr, shared ? &selection : nullptr);
     // Output gate: out * sigmoid(gate), then o_proj.
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);
@@ -880,7 +887,12 @@ void Forward::run_mtp(const MtpCall& call) {
     if (call.batch <= 0 || call.width <= 0 || call.ids.numel() != call.batch * call.width ||
         call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1) ||
         call.rope_positions.ne[0] != call.batch * call.width || call.rope_positions.ne[1] != 3 ||
-        call.block_start_rope.ne[0] != call.batch || call.block_start_rope.ne[1] != 3) {
+        call.block_start_rope.ne[0] != call.batch || call.block_start_rope.ne[1] != 3 ||
+        (call.reuse_qsa_selection && call.qsa_selection_blocks.data == nullptr) ||
+        (call.qsa_selection_blocks.data != nullptr &&
+         (call.kv_only || call.qsa_selection_blocks.ne[0] != dim(config_.qsa.block_budget()) ||
+          call.qsa_selection_blocks.ne[1] != call.batch || call.qsa_selection_counts.ne[0] != call.batch ||
+          call.qsa_selection_positions.ne[0] != call.batch))) {
         throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");
     }
     eager_chunk_ = false;
@@ -929,6 +941,10 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                            .block_start_rope = call.block_start_rope,
                                            .slots            = call.slots,
                                            .table_rows   = call.table_rows,
+                                           .qsa_selection_blocks    = call.qsa_selection_blocks,
+                                           .qsa_selection_counts    = call.qsa_selection_counts,
+                                           .qsa_selection_positions = call.qsa_selection_positions,
+                                           .reuse_qsa_selection     = call.reuse_qsa_selection,
                                            .batch        = call.batch,
                                            .width        = call.width};
         Tensor y = attention(p.attention, xa, attention_call);

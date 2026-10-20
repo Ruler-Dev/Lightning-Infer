@@ -72,6 +72,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -545,6 +546,7 @@ public:
         if (d.mtp) {
             d.mtp_columns      = std::max(lanes * W, std::min(d.chunk, 512));
             d.mtp_column_bytes = 2ULL * width;
+            d.mtp_selection    = 4ULL * (c.qsa.block_budget() + 1ULL) * lanes;
             d.mtp_ones         = sizeof(float) * c.hc.streams * static_cast<std::size_t>(d.mtp_columns);
             const auto k       = static_cast<std::size_t>(d.mtp_k);
             d.mtp_io.ids              = 0;
@@ -571,7 +573,7 @@ public:
         b.workspace = d.work;
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
-                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
+                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes + d.mtp_selection : 0);
         // The head's logits, sampled tokens and positions, sampling configs, penalty counts,
         // constraint controls and grammar masks; the PLE segment's gate statistics.
         const std::size_t head_io = d.owns_head ? d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
@@ -3599,7 +3601,7 @@ private:
                 (seg.state_backing.bytes + seg.ple_backing.bytes + seg.tails_backing.bytes + seg.logits32.bytes +
                  seg.logits16.bytes + seg.token_counts.bytes + seg.records_backing.bytes + seg.ple_records.bytes +
                  seg.qsa_records.bytes + seg.mtp_residuals.bytes + seg.mtp_saved.bytes + seg.mtp_chain.bytes +
-                 seg.mtp_records.bytes) /
+                 seg.mtp_records.bytes + seg.mtp_selection.bytes) /
                 n;
             // The workspace grows with the lane count by its sampling, acceptance and drafter rows:
             // the mean step from one lane to this count, or the second lane's at one lane.
@@ -5042,6 +5044,7 @@ private:
         allocate(seg.mtp_saved, column * lanes, allocated);
         allocate(seg.mtp_chain, column * lanes, allocated);
         allocate(seg.mtp_records, 2ULL * di_ * max_width_ * lanes, allocated);
+        allocate(seg.mtp_selection, seg.plan.mtp_selection, allocated);
         seg.mtp_saved.fill(0);
         std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * mtp_columns_, 1.0F);
         allocate(seg.mtp_ones, seg.plan.mtp_ones, allocated);
@@ -5239,6 +5242,14 @@ private:
             return;
         }
         drafter_event(head().draft_begin, timing_.draft_recorded);
+        const bool share_qsa = mtp_qsa_share_ && steps > 1;
+        const std::int32_t qsa_blocks = dim(c_.qsa.block_budget());
+        auto* selection = static_cast<std::byte*>(head().mtp_selection.p);
+        const Tensor selection_blocks = share_qsa ? Tensor(selection, DType::I32, {qsa_blocks, batch}) : Tensor{};
+        const Tensor selection_counts =
+            share_qsa ? Tensor(selection + 4ULL * qsa_blocks * head().plan.lanes, DType::I32, {batch}) : Tensor{};
+        const Tensor selection_positions =
+            share_qsa ? Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}) : Tensor{};
         replay(head(), head().mtp_draft_graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
         for (std::int32_t j = 0; j < steps; ++j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
@@ -5260,7 +5271,11 @@ private:
                                      .drafts       = drafts,
                                      .draft_logprobs =
                                          Tensor(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j) * batch), DType::FP32,
-                                                {1, batch})});
+                                                {1, batch}),
+                                     .qsa_selection_blocks    = selection_blocks,
+                                     .qsa_selection_counts    = selection_counts,
+                                     .qsa_selection_positions = selection_positions,
+                                     .reuse_qsa_selection     = share_qsa && j > 0});
         }
         });
         drafter_event(head().draft_end, timing_.draft_recorded);
@@ -5994,6 +6009,16 @@ private:
         return cost;
     }
     const double width_cost_ = width_cost_from_environment();
+    // Qwen3.8-Flash-Next supports freezing the first MTP step's QSA token list for the rest of the
+    // draft round. It removes the later index-query normalization/RoPE and selection pipeline;
+    // INFERNIX_MTP_QSA_SHARE=0 is the controlled fallback and A/B knob.
+    static bool mtp_qsa_share_from_environment() {
+        const char* value = std::getenv("INFERNIX_MTP_QSA_SHARE");
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "1") { return true; }
+        if (std::string_view(value) == "0") { return false; }
+        throw std::invalid_argument(std::string("INFERNIX_MTP_QSA_SHARE must be 0 or 1, not '") + value + "'");
+    }
+    const bool mtp_qsa_share_ = mtp_qsa_share_from_environment();
     // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).

@@ -146,6 +146,19 @@ struct QsaAppend {
     Tensor v;
 };
 
+/// Caller-owned selection for sharing one query's sparse context with later queries. `blocks` is
+/// I32 [budget / ratio, T], `counts` is I32 [T], and `positions` is I32 [T]: the query positions
+/// whose selected blocks and incomplete-block tails define the frozen token lists. When `reuse` is
+/// false qsa_attention writes blocks/counts before consuming them; when true it only consumes the
+/// existing selection and `index_q` may be empty. The current QsaBatch::positions still controls
+/// the query position, K/V append and exact-window lookup.
+struct QsaSelection {
+    Tensor blocks;
+    Tensor counts;
+    Tensor positions;
+    bool reuse = false;
+};
+
 /// q: BF16 [head_dim, heads, T] (normalized, rotated); index_q: BF16 [Di, index_heads, T] from
 /// qsa_index_query. out: BF16 [head_dim, heads, T]. The call's pooled keys are already in their
 /// plane. Keys and values:
@@ -160,6 +173,7 @@ struct QsaAppend {
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
+                   const QsaSelection* selection = nullptr);
 
 } // namespace infernix::ops

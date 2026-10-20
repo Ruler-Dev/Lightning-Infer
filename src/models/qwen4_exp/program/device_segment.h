@@ -114,7 +114,7 @@ struct DeviceLayout {
     // startup and counted as fixed, the rest grows from the expert frames when admissions need it.
     bool kv_elastic             = false;
     std::uint32_t kv_base_pages = 0;
-    std::size_t mtp_column_bytes = 0, mtp_ones = 0;
+    std::size_t mtp_column_bytes = 0, mtp_selection = 0, mtp_ones = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -312,7 +312,7 @@ struct DeviceSegment {
 
     // ---- the MTP drafter (design 11.2): residual columns, saved and chain columns, its QSA records,
     // the HC ones and its io ----
-    DeviceBuffer mtp_residuals, mtp_saved, mtp_chain, mtp_records, mtp_ones, mtp_device;
+    DeviceBuffer mtp_residuals, mtp_saved, mtp_chain, mtp_records, mtp_selection, mtp_ones, mtp_device;
 
     // ---- speculative verification: GDN replay, PLE and QSA records, the round's I32 arrays ----
     DeviceBuffer records_backing, ple_records, qsa_records, spec_device;

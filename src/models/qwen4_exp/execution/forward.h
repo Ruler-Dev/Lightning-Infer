@@ -248,6 +248,12 @@ struct MtpCall {
     // Optional: each draft's log-probability under the draft head (FP32 [1, T]), the confidence
     // a draft-length cut reads.
     Tensor draft_logprobs;
+    // Optional MTP-round QSA selection. Step 0 writes it; later steps freeze its selected blocks
+    // and incomplete-block tail while using their own attention queries.
+    Tensor qsa_selection_blocks;    // I32 [QSA block budget, batch]
+    Tensor qsa_selection_counts;    // I32 [batch]
+    Tensor qsa_selection_positions; // I32 [batch]: step 0 positions
+    bool reuse_qsa_selection = false;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };
@@ -381,6 +387,10 @@ private:
         const Tensor& block_start_rope;
         const Tensor& slots;
         const Tensor& table_rows;
+        Tensor qsa_selection_blocks;
+        Tensor qsa_selection_counts;
+        Tensor qsa_selection_positions;
+        bool reuse_qsa_selection = false;
         std::int32_t batch = 0, width = 0;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);

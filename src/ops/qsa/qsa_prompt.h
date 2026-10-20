@@ -58,7 +58,8 @@ struct QsaVqWindow {
 /// `vq`: the vector-quantized storages' window and staging (unused otherwise).
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
-                          const std::int32_t* counts, Tensor& out, cudaStream_t stream,
+                          const std::int32_t* counts, const std::int32_t* selection_positions,
+                          Tensor& out, cudaStream_t stream,
                           const QsaVqWindow& vq);
 
 } // namespace infernix::ops::detail

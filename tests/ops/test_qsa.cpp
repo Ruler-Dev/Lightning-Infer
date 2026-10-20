@@ -1179,6 +1179,41 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
+    // MTP selection sharing: step 0 writes the selected blocks and fixes its incomplete-block
+    // frontier; later one-column calls use their own attention queries but neither read an index
+    // query nor add tokens that became visible after step 0. Position 4093 makes the four steps
+    // cross a micro-block boundary, where accidentally recomputing the tail would be observable.
+    std::vector<double> shared_got;
+    if (rows == 1 && width == 4 && c.starts[0] == 4093) {
+        DeviceBuffer shared_selection(4ULL * (kTopBlocks + 1));
+        DeviceBuffer shared_out(static_cast<std::size_t>(kD) * kHeads * width * 2);
+        const Tensor blocks(shared_selection.p, DType::I32, {kTopBlocks, 1});
+        const Tensor counts(static_cast<std::int32_t*>(shared_selection.p) + kTopBlocks, DType::I32, {1});
+        const Tensor first_position(dpos.p, DType::I32, {1});
+        for (int j = 0; j < width; ++j) {
+            const ops::QsaBatch step{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, 1}),
+                                     .table_rows   = Tensor(drows.p, DType::I32, {1}),
+                                     .positions = Tensor(static_cast<std::int32_t*>(dpos.p) + j, DType::I32, {1}),
+                                     .tail_slots = Tensor(dslots.p, DType::I32, {1}),
+                                     .batch      = 1,
+                                     .width      = 1};
+            const ops::QsaSelection frozen{.blocks    = blocks,
+                                           .counts    = counts,
+                                           .positions = first_position,
+                                           .reuse     = j != 0};
+            Tensor step_out(static_cast<std::uint16_t*>(shared_out.p) + static_cast<std::size_t>(j) * kD * kHeads,
+                            DType::BF16, {kD, kHeads, 1});
+            const Tensor step_iq =
+                j == 0 ? Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, 1}) : Tensor{};
+            ops::qsa_attention(
+                Tensor(static_cast<std::uint16_t*>(dq.p) + static_cast<std::size_t>(j) * kD * kHeads,
+                       DType::BF16, {kD, kHeads, 1}),
+                step_iq, layer, step, kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes,
+                step_out, nullptr, nullptr, &frozen);
+        }
+        synchronize("attention shared selection");
+        shared_got = t::from_device_bf16(shared_out, static_cast<std::size_t>(kD) * kHeads * width);
+    }
     // Width invariance inside the unsplit class: the row's last 100 columns as a call of their own
     // (also unsplit) give the same bits; the prefix cache resumes rely on it.
     if (rows == 1 && width >= 186) {
@@ -1315,7 +1350,7 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         expect(spaced_got == got, tag + ": pages in host and lent spaces give the pool's bits");
         cudaFreeHost(host_mem);
     }
-    std::vector<double> ref(got.size());
+    std::vector<double> ref(got.size()), shared_ref(shared_got.size());
     for (int r = 0; r < rows; ++r) {
         const int keys     = c.starts[r] + width;
         const auto page_of = [&](int token) {
@@ -1359,8 +1394,30 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
             [&](int d, int h, int j, double v) {
                 ref[((static_cast<std::size_t>(r) * width + j) * kHeads + h) * kD + d] = v;
             });
+        if (!shared_got.empty()) {
+            t::naive_dense_softmax_attention(
+                ops::AttentionHeadGeometry{.head_dim = kD, .query_heads = kHeads, .kv_heads = kKvHeads},
+                width, keys, 1.0 / 16.0,
+                [&](int d, int h, int j) {
+                    return from_bf16(q[(static_cast<std::size_t>(j) * kHeads + h) * kD + d]);
+                },
+                [&](int d, int h, int token) {
+                    return key[(static_cast<std::size_t>(h) * keys + token) * kD + d];
+                },
+                [&](int d, int h, int token) {
+                    return value[(static_cast<std::size_t>(h) * keys + token) * kD + d];
+                },
+                [&](int, int token) { return attended[0][token] != 0; },
+                [&](int d, int h, int j, double v) {
+                    shared_ref[(static_cast<std::size_t>(j) * kHeads + h) * kD + d] = v;
+                });
+        }
     }
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
+    if (!shared_got.empty()) {
+        g_failures += t::verify_reduction(tag + " shared MTP selection", shared_got, shared_ref,
+                                          kAttentionCriterion);
+    }
 }
 
 } // namespace
@@ -1394,6 +1451,7 @@ int main() {
                                        {"decode W=1 B=8", 1, {2051, 2300, 2700, 3001, 3500, 4000, 4500, 5003}},
                                        {"verify W=4 B=2", 4, {2500, 3700}},
                                        {"verify W=5 B=2", 5, {3001, 4093}},
+                                       {"MTP shared selection W=4 B=1", 4, {4093}},
                                        {"prefill W=192 B=1", 192, {1900}},
                                        {"prefill W=40 B=1", 40, {5000}},
                                        {"prompt W=256 B=1 dense", 256, {0}},

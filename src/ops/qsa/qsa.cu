@@ -478,8 +478,9 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
                      const std::int32_t* __restrict__ tables, int table_stride,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      int width, int ratio, const std::int32_t* __restrict__ selected,
-                     const std::int32_t* __restrict__ counts, int top_blocks, int splits, float scale,
-                     float* __restrict__ partial, bf16* __restrict__ out, detail::QsaVqWindow vq) {
+                     const std::int32_t* __restrict__ counts,
+                     const std::int32_t* __restrict__ selection_positions, int top_blocks, int splits,
+                     float scale, float* __restrict__ partial, bf16* __restrict__ out, detail::QsaVqWindow vq) {
     using Tile   = KVTile<Storage>;
     using Shared = AttentionShared<Storage, Group, Stages>;
     static_assert(Group % 2 == 0, "two threads per dimension split the heads");
@@ -488,8 +489,9 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     const int split = blockIdx.x, kv_head = blockIdx.y, t = blockIdx.z;
     const int group = Exact ? Group : heads / kv_heads;
     const int p = positions[t];
+    const int selection_p = selection_positions != nullptr ? selection_positions[t] : p;
     const int count = counts[t];
-    const int total = attended_count(count, ratio, p);
+    const int total = attended_count(count, ratio, selection_p);
     const int per_split = (total + splits - 1) / splits;
     const int begin = split * per_split, end = min(total, begin + per_split);
     const int tiles = begin < end ? (end - begin + kTokenTile - 1) / kTokenTile : 0;
@@ -512,7 +514,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     const auto prepare = [&](int i, int buf) {
         const int first = begin + i * kTokenTile;
         if (threadIdx.x < min(kTokenTile, end - first)) {
-            const int token          = attended_token(first + threadIdx.x, count, list, ratio, p);
+            const int token          = attended_token(first + threadIdx.x, count, list, ratio, selection_p);
             tokens[buf][threadIdx.x] = token;
             ids[buf][threadIdx.x]    = table[token >> kPagedKVPageShift];
         }
@@ -1066,13 +1068,16 @@ std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int3
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append) {
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append,
+                   const QsaSelection* selection) {
     require_geometry(geometry);
     const int columns = q.ne[2];
     require_batch(batch, columns);
+    const bool reuse = selection != nullptr && selection->reuse;
     require(contiguous(q, DType::BF16) && q.ne[0] == kHeadDim && q.ne[1] == geometry.heads &&
-                contiguous(index_q, DType::BF16) && index_q.ne[0] == kIndexDim &&
-                index_q.ne[1] == geometry.index_heads && index_q.ne[2] == columns && contiguous(out, DType::BF16) &&
+                (reuse || (contiguous(index_q, DType::BF16) && index_q.ne[0] == kIndexDim &&
+                           index_q.ne[1] == geometry.index_heads && index_q.ne[2] == columns)) &&
+                contiguous(out, DType::BF16) &&
                 out.ne[0] == kHeadDim && out.ne[1] == geometry.heads && out.ne[2] == columns,
             "attention shapes disagree");
     require(layer.kv.num_kv_heads == geometry.kv_heads && layer.kv.head_dim == kHeadDim, "KV geometry differs");
@@ -1084,6 +1089,19 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     std::size_t need = 0;
     Workspace ws     = carve(workspace, geometry, columns, max_context, staged, need);
     require(workspace != nullptr && workspace_bytes >= need, "workspace is too small");
+    const int top_blocks = geometry.budget / geometry.ratio;
+    const std::int32_t* selection_positions = nullptr;
+    if (selection != nullptr) {
+        require(contiguous(selection->blocks, DType::I32) && selection->blocks.ne[0] == top_blocks &&
+                    selection->blocks.ne[1] == columns && contiguous(selection->counts, DType::I32) &&
+                    selection->counts.ne[0] == columns && contiguous(selection->positions, DType::I32) &&
+                    selection->positions.ne[0] == columns &&
+                    (selection->reuse || selection->positions.data == batch.positions.data),
+                "shared selection is I32 [top blocks, T], [T], [T]");
+        ws.selected        = static_cast<std::int32_t*>(selection->blocks.data);
+        ws.counts          = static_cast<std::int32_t*>(selection->counts.data);
+        selection_positions = static_cast<const std::int32_t*>(selection->positions.data);
+    }
     // The vector-quantized append: paged codes, and the window slots of a narrow call or the staged
     // rows of a wide one (committed after attention).
     PagedKVBatchLayerView cache{.k_pages       = layer.kv.k_pages,
@@ -1129,19 +1147,20 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
             detail::kv_cache_vq_window_commit_launch(ws.staging, positions2, Tensor{}, cache, columns, stream);
         }
     };
-    const int top_blocks = geometry.budget / geometry.ratio;
     const auto* tables   = static_cast<const std::int32_t*>(batch.block_tables.data);
     const int stride     = batch.block_tables.ne[0];
     const auto* rows     = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* pos      = static_cast<const std::int32_t*>(batch.positions.data);
-    detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
-                       {ws.selected, ws.counts}, stream, layer.spaces);
+    if (!reuse) {
+        detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
+                           {ws.selected, ws.counts}, stream, layer.spaces);
+    }
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
     // width-invariance class, so a column's bits still do not depend on its call's width there.
     const int splits = attention_splits(columns, geometry);
     if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
-        detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
-                                     vq_args);
+        detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts,
+                                     selection_positions, out, stream, vq_args);
         commit();
         return;
     }
@@ -1163,8 +1182,8 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         const cudaError_t error = pdl::launch_consumer(
             {grid, dim3(kAttentionThreads), bytes, stream}, kernel, static_cast<const bf16*>(q.data), geometry.heads,
             geometry.kv_heads, layer.kv, layer.spaces, tables, stride, rows, pos, batch.width, geometry.ratio,
-            static_cast<const std::int32_t*>(ws.selected), static_cast<const std::int32_t*>(ws.counts), top_blocks,
-            splits, scale, ws.partial, static_cast<bf16*>(out.data), vq_args);
+            static_cast<const std::int32_t*>(ws.selected), static_cast<const std::int32_t*>(ws.counts),
+            selection_positions, top_blocks, splits, scale, ws.partial, static_cast<bf16*>(out.data), vq_args);
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa attention: ") + cudaGetErrorString(error)); }
     };
     // Two stages only where a split holds more than one tile and both fit; one stage otherwise

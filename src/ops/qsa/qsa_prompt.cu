@@ -270,7 +270,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                       int table_stride, const std::int32_t* __restrict__ table_rows,
                       const std::int32_t* __restrict__ positions, int width, int ratio,
                       const std::int32_t* __restrict__ selected, const std::int32_t* __restrict__ counts,
-                      int top_blocks, float scale, bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
+                      const std::int32_t* __restrict__ selection_positions, int top_blocks, float scale,
+                      bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
     using Shape                 = PromptShape<Storage>;
     using S                     = Stage<Storage>;
     using K                     = Row<Shape::Key>;
@@ -286,8 +287,9 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     const int gid = lane >> 2, lid = lane & 3;
     const int group = heads / kv_heads;
     const int p     = positions[t];
+    const int selection_p = selection_positions != nullptr ? selection_positions[t] : p;
     const int count = counts[t];
-    const int total = count < 0 ? p + 1 : count * ratio + (p + 1) % ratio;
+    const int total = count < 0 ? selection_p + 1 : count * ratio + (selection_p + 1) % ratio;
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
     const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
 
@@ -343,7 +345,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         const int row      = lane & 15;
         const int index    = i * kTile + row;
         const bool valid   = index < total;
-        const int token    = valid ? attended_token(index, count, list, ratio, p) : 0;
+        const int token    = valid ? attended_token(index, count, list, ratio, selection_p) : 0;
         const int id       = table[token >> kPagedKVPageShift];
         int page;
         const auto* k_plane =
@@ -884,8 +886,8 @@ void require(bool condition, const char* message) {
 
 template <KvCacheStorage Storage>
 void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
-            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-            const QsaVqWindow& vq) {
+            const std::int32_t* selected, const std::int32_t* counts,
+            const std::int32_t* selection_positions, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
     const auto run = [&]<int Stages>() {
         constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
@@ -903,7 +905,7 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
             static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
             static_cast<const std::int32_t*>(batch.table_rows.data),
             static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
-            g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
+            selection_positions, g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
     };
     // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide each
     // tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
@@ -940,29 +942,37 @@ bool qsa_prompt_supported(const QsaKVLayer& layer, const QsaGeometry& geometry) 
 
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
-                          const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
+                          const std::int32_t* counts, const std::int32_t* selection_positions,
+                          Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
     require(qsa_prompt_supported(layer, geometry), "the prompt route does not serve this layer");
     switch (layer.kv.storage) {
     case KvCacheStorage::Int8Group64:
-        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts,
+                                            selection_positions, out, stream, vq);
         break;
     case KvCacheStorage::Fp8E4M3Row256:
-        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts,
+                                              selection_positions, out, stream, vq);
         break;
     case KvCacheStorage::Nvfp4Group16:
-        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts,
+                                             selection_positions, out, stream, vq);
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts,
+                                                 selection_positions, out, stream, vq);
         break;
     case KvCacheStorage::Vq2:
-        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts,
+                                    selection_positions, out, stream, vq);
         break;
     case KvCacheStorage::Q4KeyVq2Value:
-        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts,
+                                              selection_positions, out, stream, vq);
         break;
     default:
-        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts,
+                                         selection_positions, out, stream, vq);
         break;
     }
 }
