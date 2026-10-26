@@ -47,6 +47,13 @@ public:
         std::sort(boundaries_.begin(), boundaries_.end());
     }
 
+    // Opt-in recency order (0, the default, keeps the longest match first). With a cap, propose
+    // extends a match backward at most max(cap, minimum_match) tokens and ranks candidates by
+    // their length capped at `cap`, then their continuation's length, then their end: a newer
+    // match beats an older, longer one (HyperQwen's lookup scores min(len, NMAX) * 2^32 + end).
+    // Ties are total (equal ends are one candidate), so the choice never depends on probe order.
+    void set_recency(std::uint32_t cap) { recency_cap_ = cap; }
+
     void append(Token token) {
         if (!store(token)) { return; }
         for (const auto n : widths_) {
@@ -113,6 +120,12 @@ public:
                                 std::uint32_t minimum_match = 12) const {
         Match best;
         if (maximum == 0) { return best; }
+        // Recency order only: the bounded extension, and the best candidate's capped length and end.
+        const std::size_t extent =
+            recency_cap_ == 0 ? history.size()
+                              : std::min<std::size_t>(history.size(), std::max(recency_cap_, minimum_match));
+        std::uint32_t best_score = 0;
+        std::uint64_t best_end   = 0;
         for (const auto n : widths_) {
             if (history.size() < n) { continue; }
             const auto tail = history.last(n);
@@ -135,10 +148,29 @@ public:
                 }
                 if (!equal) { continue; }
                 std::uint32_t matched = n;
-                while (matched < history.size() && entry.end - matched > live_begin()) {
+                while (matched < extent && entry.end - matched > live_begin()) {
                     const auto token = at(entry.end - matched - 1);
                     if (token < 0 || token != history[history.size() - matched - 1]) { break; }
                     ++matched;
+                }
+                if (recency_cap_ != 0) {
+                    if (matched < minimum_match) { continue; }
+                    const std::uint32_t score = std::min(matched, recency_cap_);
+                    if (score < best_score) { continue; }
+                    std::vector<Token> draft;
+                    for (std::uint64_t p = entry.end; p < end_ && draft.size() < maximum; ++p) {
+                        const auto token = at(p);
+                        if (token < 0) { break; }
+                        draft.push_back(token);
+                    }
+                    if (draft.empty()) { continue; }
+                    if (score > best_score || draft.size() > best.tokens.size() ||
+                        (draft.size() == best.tokens.size() && entry.end > best_end)) {
+                        best       = {std::move(draft), matched};
+                        best_score = score;
+                        best_end   = entry.end;
+                    }
+                    continue;
                 }
                 if (matched < minimum_match || matched < best.matched) { continue; }
                 std::vector<Token> draft;
@@ -169,6 +201,7 @@ private:
     std::uint64_t token_mask_    = 0;
     std::uint64_t end_           = 0;
     std::uint64_t segment_start_ = 0;
+    std::uint32_t recency_cap_   = 0;
 
     [[nodiscard]] static bool power_of_two(std::size_t value) {
         return value != 0 && (value & (value - 1)) == 0;

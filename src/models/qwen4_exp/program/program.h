@@ -405,16 +405,18 @@ struct ProgramOptions {
     std::uint64_t expert_ram_bytes = 0;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
-    // ngram_min_match tokens (4..64) earlier in the request.
+    // ngram_min_match tokens (4..64) earlier in the request; which rows verify a copy instead of
+    // their neural drafts is program/ngram_round.h's rule.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
-    // n-gram proposal, when enabled, replaces a round's MTP drafts.
+    // n-gram copy, when enabled, replaces a round's MTP drafts (ngram_round.h).
     std::uint32_t mtp_draft_tokens = 0;
     // DFlash2 (--spec dflash2 --draft-model, docs/maintainer/dflash.md): the drafter proposes this
     // many tokens per round (1..7) in one block of dflash2_draft_tokens + 1 columns; a round verifies
-    // them all, or with auto_draft_length the prefix its draft-length policy chooses. A longer n-gram
-    // proposal, when enabled, replaces a round's drafts as it replaces MTP's.
+    // them all, or with auto_draft_length the prefix its draft-length policy chooses. A whole n-gram
+    // copy (its source runs two tokens past its drafts), when enabled, replaces a round's drafts even
+    // when it is as long as the block; a partial one only when longer (ngram_round.h).
     std::uint32_t dflash2_draft_tokens = 0;
     // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
     // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair

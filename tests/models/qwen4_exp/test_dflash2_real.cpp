@@ -9,6 +9,9 @@
 //                 drafts are accepted (a drafter reading wrong features accepts next to nothing).
 //   concurrency   Four greedy requests in flight on a four-lane engine (plain rounds of several rows,
 //                 whose catch-up writes several rings at once) give the one-lane tokens.
+//   n-gram        DFlash2 7 auto with --ngram-draft-tokens 7 (production's drafting): a prompt that
+//                 copies itself verifies accepted n-gram copies, and every greedy output (the copy
+//                 prompt's, the two prompts') equals plain decoding's, as does DFlash2 without copies.
 //   tap resume    With the prefix cache (512-token calls), a request resuming from another's tap at
 //                 1024 restores the drafter's context ring with the rest of the state: its tokens and
 //                 its drafted and accepted counts equal a cold run's (same call boundaries).
@@ -45,6 +48,29 @@ constexpr const char* kGreedyPrompts[] = {
     "Write a Python function that returns the n-th Fibonacci number, then explain its complexity.",
     "The three most important causes of the French Revolution were"};
 constexpr std::uint32_t kDrafts = 7;
+// A prompt whose greedy continuation copies text from itself (a function, then its unchanged copy
+// begun): with --ngram-draft-tokens 7 beside DFlash2 7 some rounds verify copies (ngram_round.h).
+constexpr const char* kCopyPrompt =
+    "def merge_intervals(intervals):\n"
+    "    \"\"\"Merge overlapping closed intervals and return them sorted by start.\"\"\"\n"
+    "    if not intervals:\n"
+    "        return []\n"
+    "    ordered = sorted(intervals, key=lambda pair: pair[0])\n"
+    "    merged = [list(ordered[0])]\n"
+    "    for start, end in ordered[1:]:\n"
+    "        last = merged[-1]\n"
+    "        if start <= last[1]:\n"
+    "            last[1] = max(last[1], end)\n"
+    "        else:\n"
+    "            merged.append([start, end])\n"
+    "    return [tuple(pair) for pair in merged]\n"
+    "\n"
+    "\n"
+    "# The same function again, copied verbatim for the second module:\n"
+    "def merge_intervals(intervals):\n"
+    "    \"\"\"Merge overlapping closed intervals";
+constexpr std::uint32_t kCopyTokens  = 160;
+constexpr std::uint32_t kCopyNgram   = 7;
 
 int check(bool ok, const std::string& what) {
     std::printf("%s %s\n", ok ? "  ok  " : "  FAIL", what.c_str());
@@ -150,7 +176,8 @@ struct Setup {
 
 enum class Drafter { None, TextHead, ProposalHead };
 
-infernix::EngineOptions engine_options(const Setup& setup, Drafter drafter, std::uint32_t concurrency) {
+infernix::EngineOptions engine_options(const Setup& setup, Drafter drafter, std::uint32_t concurrency,
+                                       std::uint32_t ngram = 0) {
     infernix::EngineOptions options;
     options.artifact_path = setup.artifact;
     if (setup.ngram != nullptr) { options.ngram_volume_path = setup.ngram; }
@@ -165,6 +192,11 @@ infernix::EngineOptions engine_options(const Setup& setup, Drafter drafter, std:
         options.speculative.draft_model  = setup.drafter;
         if (drafter == Drafter::ProposalHead) { options.speculative.proposal_head = infernix::ProposalHead::Optimized; }
     }
+    if (ngram > 0) {
+        // Production's drafting: --draft-tokens auto --ngram-draft-tokens 7.
+        options.speculative.ngram_draft_tokens = ngram;
+        options.speculative.draft_tokens_auto  = true;
+    }
     return options;
 }
 
@@ -178,6 +210,11 @@ infernix::RequestOptions request(float temperature, std::uint64_t seed, std::uin
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
+}
+
+// The copy prompt's greedy tokens.
+infernix::GenerationResult copy_run(infernix::Engine& engine) {
+    return engine.generate(engine.prepare_tokens(engine.tokenize_text(kCopyPrompt)), request(0.0F, 0, kCopyTokens));
 }
 
 struct Outputs {
@@ -295,11 +332,12 @@ int main(int argc, char** argv) {
     try {
         int failures = 0;
         Outputs plain_greedy, plain, cold;
-        Tokens prompt;
+        Tokens prompt, plain_copy;
         {
             std::printf("== plain decoding\n");
             infernix::Engine engine(engine_options(setup, Drafter::None, greedy_only ? 1 : 8));
             plain_greedy = greedy(engine);
+            plain_copy   = copy_run(engine).generated_token_ids;
             prompt       = engine.tokenize_text(kPrompt);
             if (!greedy_only) {
                 plain = sample(engine, prompt, 1.0F, 1, trials, tokens, 8);
@@ -319,6 +357,9 @@ int main(int argc, char** argv) {
             failures += check(drafted.speculative.drafted_tokens > 0 &&
                                   4 * drafted.speculative.accepted_tokens > drafted.speculative.drafted_tokens,
                               "more than a quarter of the greedy drafts are accepted");
+            const Tokens copied = copy_run(engine).generated_token_ids;
+            failures += check(copied == plain_copy, "the copy prompt (n-gram 0) equals plain decoding (" +
+                                                        first_difference(copied, plain_copy) + ")");
             if (!greedy_only) {
                 const Outputs sampled = sample(engine, prompt, 1.0F, trials + 1ULL, trials, tokens, 1);
                 print_acceptance(sampled.speculative);
@@ -344,6 +385,31 @@ int main(int argc, char** argv) {
                 failures += check(got == plain_greedy.tokens[i % 2],
                                   "concurrent request " + std::to_string(i) + " equals one-lane decoding (" +
                                       first_difference(got, plain_greedy.tokens[i % 2]) + ")");
+            }
+        }
+        {
+            // The production drafting (--draft-tokens auto --ngram-draft-tokens 7): copies replace
+            // whole DFlash2 blocks (ngram_round.h; master never verified one), and greedy tokens stay
+            // plain decoding's, on the copy prompt and on the greedy prompts.
+            std::printf("== DFlash2 %u auto with n-gram copies %u\n", kDrafts, kCopyNgram);
+            infernix::Engine engine(engine_options(setup, Drafter::TextHead, 1, kCopyNgram));
+            const infernix::GenerationResult copy = copy_run(engine);
+            const infernix::SpeculativeStats& s = copy.speculative;
+            print_acceptance(s);
+            std::printf("  n-gram: %llu rounds, accepted %llu of %llu drafts\n",
+                        static_cast<unsigned long long>(s.ngram_rounds),
+                        static_cast<unsigned long long>(s.ngram_accepted_tokens),
+                        static_cast<unsigned long long>(s.ngram_drafted_tokens));
+            failures += check(copy.generated_token_ids == plain_copy,
+                              "the copy prompt with n-gram 7 equals plain decoding (" +
+                                  first_difference(copy.generated_token_ids, plain_copy) + ")");
+            failures += check(s.ngram_rounds > 0 && s.ngram_accepted_tokens > 0,
+                              "the copy prompt verifies accepted n-gram copies beside DFlash2");
+            const Outputs drafted = greedy(engine);
+            for (std::size_t i = 0; i < drafted.tokens.size(); ++i) {
+                failures += check(drafted.tokens[i] == plain_greedy.tokens[i],
+                                  "greedy prompt " + std::to_string(i) + " with n-gram 7 equals plain decoding (" +
+                                      first_difference(drafted.tokens[i], plain_greedy.tokens[i]) + ")");
             }
         }
         std::optional<infernix::Engine> proposal;

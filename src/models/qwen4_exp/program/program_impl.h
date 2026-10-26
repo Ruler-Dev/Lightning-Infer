@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/draft_length.h"
+#include "models/qwen4_exp/program/ngram_round.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -875,6 +876,17 @@ public:
             moe_offload_ = map.size() == 2 && split_walk_ != SplitWalk::ChunkMajor && moe_offload_from_environment();
         }
         timing_.on = split_timing_from_environment();
+        // Copy sources end at special tokens (chat framing, vision placeholders), as qwen3_5's do
+        // (its frontend's ngram_boundaries): a copy never runs into, nor is matched across, one.
+        if (options_.ngram_draft_tokens > 0 && !ngram_legacy_) {
+            if (const auto& tokenizer = parameters_.model.resources().tokenizer) {
+                for (std::size_t id = 0; id < tokenizer->vocab_size(); ++id) {
+                    if (tokenizer->is_special_token(static_cast<int>(id))) {
+                        ngram_boundaries_.push_back(static_cast<std::int32_t>(id));
+                    }
+                }
+            }
+        }
         ple_segment_ = map.ple().index;
         const auto public_tokens = dim(parameters_.model.resources().public_token_count);
         for (std::size_t s = 0; s < map.size(); ++s) {
@@ -2257,11 +2269,7 @@ public:
         lane.dflash_calibration.reset();
         lane.ngram_accept      = kNgramAcceptancePriors;
         if (max_width_ > 1) {
-            if (options_.ngram_draft_tokens > 0) {
-                lane.proposer =
-                    std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
-                for (const auto token : lane.history) { lane.proposer->append(token); }
-            }
+            if (options_.ngram_draft_tokens > 0) { lane.proposer = make_proposer(lane.history); }
             lane.speculative.enabled      = true;
             lane.speculative.backend      = mtp_       ? SpeculativeBackend::Mtp
                                             : dflash2_ ? SpeculativeBackend::DFlash2
@@ -2446,10 +2454,7 @@ public:
                              .ends;
         }
         lane.next_call = 0;
-        if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
-            lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
-            for (const auto token : lane.history) { lane.proposer->append(token); }
-        }
+        if (max_width_ > 1 && options_.ngram_draft_tokens > 0) { lane.proposer = make_proposer(lane.history); }
         lane.sampling = b.sampling;
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(head().token_counts.p) + static_cast<std::size_t>(index) * token_domain_;
@@ -2855,8 +2860,9 @@ public:
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
         // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
-        // fewer than it may still emit, so every verified position lies in its reservation. A longer
-        // n-gram copy proposal replaces a row's MTP drafts. By round size (design 11.3, 19.3.5):
+        // fewer than it may still emit, so every verified position lies in its reservation. An n-gram
+        // copy proposal replaces a row's neural drafts by ngram_round.h's rule. By round size (design
+        // 11.3, 19.3.5):
         // - one row: its own draft length, maximizing its expected tokens per round time;
         // - two rows: one draft length for both (choose_pair_draft_length), so no row is padded to the
         //   other's; its at most 2 x 3 = 6 columns stay on the column-invariant dense routes, so greedy
@@ -2878,8 +2884,11 @@ public:
             }
         }
         // Each row's draft count and source are fixed before the drafter runs (an MTP row's count
-        // is its draft length; a longer n-gram copy proposal replaces its drafts), so the round's
-        // width, and with it every row's n-gram landing columns, is known while it drafts.
+        // is its draft length, a DFlash2 row's its block; a copy proposal that copy_drafts takes
+        // replaces its drafts), so the round's width, and with it every row's n-gram landing
+        // columns, is known while it drafts. A copy is matched over the last kNgramMatchWindow
+        // committed tokens and verifies at most --ngram-draft-tokens; INFERNIX_NGRAM_DFLASH2=0
+        // restores master's rule (whole history, no lookahead, longer copies only).
         std::array<std::int32_t, kMaximumConcurrency> extents{}, limits{};
         std::int32_t width = 1;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
@@ -2896,11 +2905,20 @@ public:
                 extents[b] = static_cast<std::int32_t>(std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b])));
             }
             if (speculate && lane.proposer) {
-                auto copy = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
-                if (copy.size() > static_cast<std::size_t>(extents[b])) {
+                const std::span<const std::int32_t> history(lane.history);
+                const std::uint32_t maximum =
+                    ngram_legacy_ ? limit : std::min<std::uint32_t>(limit, options_.ngram_draft_tokens);
+                auto copy = lane.proposer
+                                ->propose(ngram_legacy_ ? history : history.last(std::min(kNgramMatchWindow, history.size())),
+                                          copy_proposal_tokens(maximum, copy_rule()), options_.ngram_min_match)
+                                .tokens;
+                const std::uint32_t take =
+                    copy_drafts(copy.size(), maximum, static_cast<std::uint32_t>(extents[b]), copy_rule());
+                if (take > 0) {
+                    copy.resize(take);
                     drafts_[b]     = std::move(copy);
                     from_ngram_[b] = true;
-                    extents[b]     = static_cast<std::int32_t>(drafts_[b].size());
+                    extents[b]     = static_cast<std::int32_t>(take);
                 }
             }
             width = std::max(width, 1 + extents[b]);
@@ -2947,7 +2965,11 @@ public:
             }
         } else if (dflash2_ && width > 1) {
             // One proposal for every row that takes the drafter's tokens (none when every speculating
-            // row copies an n-gram), while the host stages the verification's n-gram rows.
+            // row copies an n-gram), while the host stages the verification's n-gram rows. A round
+            // of copies only runs no proposal and stages nothing here, as MTP's copies-only round
+            // (mtp_draft returns before while_drafting when it runs no steps): verify reads all its
+            // rows behind the gate, after the launch, while the GPU embeds and runs layer 0, which
+            // costs no more than reading them on the host first with no drafter work to overlap.
             bool neural = false;
             for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
             const auto stage_rows = [&] {
@@ -6519,6 +6541,44 @@ private:
         throw std::invalid_argument(std::string("INFERNIX_MTP_QSA_SHARE must be 0 or 1, not '") + value + "'");
     }
     const bool mtp_qsa_share_ = mtp_qsa_share_from_environment();
+    // n-gram copy rounds (ngram_round.h). INFERNIX_NGRAM_DFLASH2=0 is the A/B knob that restores
+    // master 69ef2495's copies (matched over the whole history, longest match first, through special
+    // tokens, verified only when longer than the row's neural drafts, so never beside a full DFlash2
+    // block); INFERNIX_NGRAM_MATCH_CAP=<n> (0..64) the recency cap (0: longest match first). Only
+    // proposals change: a copy is verified like any draft, so greedy output is the same.
+    static bool ngram_legacy_from_environment() {
+        const char* value = std::getenv("INFERNIX_NGRAM_DFLASH2");
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "1") { return false; }
+        if (std::string_view(value) == "0") { return true; }
+        throw std::invalid_argument(std::string("INFERNIX_NGRAM_DFLASH2 must be 0 or 1, not '") + value + "'");
+    }
+    static std::uint32_t ngram_match_cap_from_environment() {
+        const char* value = std::getenv("INFERNIX_NGRAM_MATCH_CAP");
+        if (value == nullptr || *value == '\0') { return kNgramMatchCap; }
+        char* end        = nullptr;
+        const auto cap   = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || cap > 64) {
+            throw std::invalid_argument(std::string("INFERNIX_NGRAM_MATCH_CAP must be an integer in [0, 64], not '") +
+                                        value + "'");
+        }
+        return static_cast<std::uint32_t>(cap);
+    }
+    const bool ngram_legacy_             = ngram_legacy_from_environment();
+    const std::uint32_t ngram_match_cap_ = ngram_match_cap_from_environment();
+    std::vector<std::int32_t> ngram_boundaries_; // the tokenizer's special tokens end copy sources
+    [[nodiscard]] CopyRule copy_rule() const noexcept {
+        return ngram_legacy_ ? CopyRule::legacy() : mtp_ ? CopyRule::mtp() : CopyRule::dflash2();
+    }
+    // A lane's copy proposer over `history` (prompt, then committed output).
+    [[nodiscard]] std::unique_ptr<qwen3_5::detail::NgramProposer> make_proposer(std::span<const std::int32_t> history) const {
+        auto proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+        if (!ngram_legacy_) {
+            proposer->set_boundaries(ngram_boundaries_);
+            proposer->set_recency(ngram_match_cap_);
+        }
+        for (const auto token : history) { proposer->append(token); }
+        return proposer;
+    }
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
     // (2026-10-20): fixed lengths 2-7 took 14.2-27.7 ms rounds against 8.4 ms plain ones, about 2.6 ms

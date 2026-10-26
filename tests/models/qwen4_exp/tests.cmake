@@ -108,6 +108,10 @@ infernix_add_test(infernix_qwen4_exp_draft_length_test
   LIBRARIES infernix_model_runtime
 )
 
+# n-gram copy rounds (program/ngram_round.h) and the proposer's window, boundaries and recency. CPU only.
+infernix_add_test(infernix_qwen4_exp_ngram_round_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_round.cpp")
+
 infernix_add_test(infernix_qwen4_exp_dflash2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
   LIBRARIES infernix_engine
