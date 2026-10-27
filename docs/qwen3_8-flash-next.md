@@ -124,6 +124,20 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   spread, with the same replies. Seven drafts are the most that
   keep a round at 8 columns, on the column-invariant dense routes, so it gives plain decode's
   tokens. See [ngram copy proposals](ngram.md).
+  - Beside `--spec dflash2 --draft-tokens auto`, a whole copy (7 drafts plus 2 lookahead source
+    tokens) replaces the row's DFlash2 block even when it is as long; a partial copy wins only if
+    longer. Before ff02a2a8 a copy had to be strictly longer than the full 7-token block, so none
+    was ever verified (599 production DFlash2 requests, 0 n-gram rounds).
+    `INFERNIX_NGRAM_DFLASH2=0` restores that behaviour.
+  - Measured on RTX PRO 4000 + RTX 5080 at `K = 28` with the production flags (`--long`, int8 KV,
+    vision, prefix cache), T = 0, two runs per arm, against the previous build: replies
+    byte-identical on all 38 (20-turn code agent, 12-turn prose with reasoning, 4 verbatim
+    copies). Code agent 117.1 to 120.8 tok/s (+3.2 %, 3.9 % fewer rounds; 94.5 % of copy drafts
+    accepted); verbatim copy of two files 121.9 to 163.1 tok/s (+34 %); verbatim copy at 53.5K
+    context 105.6 to 141.5 tok/s (+34 %); prose 81.2 to 83.1 tok/s (within noise).
+  - `--ngram-draft-tokens 15` (16-column rounds) was slower than 7 on the same runs (code agent
+    -5 %, copies -7 %) and not byte-identical: a 16-column round costs 2.06-2.14x an 8-column one
+    for 1.96x the tokens. Keep 7.
 - `--max-concurrency N` (1-8) runs up to N requests at once. Its main gain is a shorter wait for
   requests that would otherwise queue (time to first token): requests that decode together share
   each round's dense weight reads, but their routed experts barely overlap.
