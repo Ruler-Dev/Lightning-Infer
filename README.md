@@ -136,15 +136,18 @@ launch on the decode chain (+0.13 %, noise), a 256-thread QSA kernel for the PRO
 16-column copy rounds (slower, and not byte-identical), a RAM cache for n-gram rows (no gain once the
 volume is warm).
 
-### One GPU (RTX 5090)
+### One GPU (RTX 5090, Infernix base engine)
 
-RTX 5090 (32 GB) on PCIe Gen5 x8, Core i9-13900K, 96 GB DDR5, Windows 11. Lightning-Infer runs the
-Dense8 conversion; Strata runs Unsloth's UD-Q4_K_XL GGUF, its native format. Both use the model's
-MTP drafter and INT8 KV at 262,144 tokens.
+These figures are not measured on the reference machine above. They are copied from
+[README.infernix.md](README.infernix.md#benchmarks): the Infernix engine that Lightning-Infer is
+built on, at commits `3b35ccf9` and `63c672e4` (before the two-GPU work), on an RTX 5090 (32 GB) on
+PCIe Gen5 x8, Core i9-13900K, 96 GB DDR5, Windows 11. Infernix runs the Dense8 conversion; Strata
+runs Unsloth's UD-Q4_K_XL GGUF, its native format. Both use the model's MTP drafter and INT8 KV at
+262,144 tokens.
 
-**Context length** (one request, greedy, 1,024 output tokens):
+**Context length** (one request, greedy, 1,024 output tokens; Infernix `3b35ccf9`, Strata 0.1.40):
 
-| Context | Time to first token | Strata | Decode tok/s | Strata |
+| Context | Time to first token, Infernix | Strata | Decode tok/s, Infernix | Strata |
 |---|---:|---:|---:|---:|
 | ~8K | **1.9 s** | 12.3 s | **138.8** | 86.4 |
 | ~128K | **17.9 s** | 103.3 s | **136.2** | 77.2 |
@@ -152,9 +155,10 @@ MTP drafter and INT8 KV at 262,144 tokens.
 
 **Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md): three coding-agent sessions
 and eleven subagents with tool calls, compactions, retries and aborts, up to eight requests in
-flight, temperature 1.0; three seeds, 68 requests each, range in brackets):
+flight, temperature 1.0; three seeds, 68 requests each, range in brackets; Infernix `63c672e4`,
+Strata 0.1.41):
 
-| Metric | Strata | Lightning-Infer | Change |
+| Metric | Strata | Infernix | Change |
 |---|---:|---:|---:|
 | Average time to first token | 32.9 s (30.9-36.8) | **5.9 s** (5.5-6.2) | -82 % |
 | 90th-percentile time to first token | 67.8 s (62.0-75.1) | **13.3 s** (12.9-13.7) | -80 % |
