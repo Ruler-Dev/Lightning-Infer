@@ -136,41 +136,6 @@ launch on the decode chain (+0.13 %, noise), a 256-thread QSA kernel for the PRO
 16-column copy rounds (slower, and not byte-identical), a RAM cache for n-gram rows (no gain once the
 volume is warm).
 
-### One GPU (RTX 5090, Infernix base engine)
-
-These figures are not measured on the reference machine above. They are copied from
-[README.infernix.md](README.infernix.md#benchmarks): the Infernix engine that Lightning-Infer is
-built on, at commits `3b35ccf9` and `63c672e4` (before the two-GPU work), on an RTX 5090 (32 GB) on
-PCIe Gen5 x8, Core i9-13900K, 96 GB DDR5, Windows 11. Infernix runs the Dense8 conversion; Strata
-runs Unsloth's UD-Q4_K_XL GGUF, its native format. Both use the model's MTP drafter and INT8 KV at
-262,144 tokens.
-
-**Context length** (one request, greedy, 1,024 output tokens; Infernix `3b35ccf9`, Strata 0.1.40):
-
-| Context | Time to first token, Infernix | Strata | Decode tok/s, Infernix | Strata |
-|---|---:|---:|---:|---:|
-| ~8K | **1.9 s** | 12.3 s | **138.8** | 86.4 |
-| ~128K | **17.9 s** | 103.3 s | **136.2** | 77.2 |
-| ~250K | **34.2 s** | 158.1 s | **153.3** | 95.8 |
-
-**Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md): three coding-agent sessions
-and eleven subagents with tool calls, compactions, retries and aborts, up to eight requests in
-flight, temperature 1.0; three seeds, 68 requests each, range in brackets; Infernix `63c672e4`,
-Strata 0.1.41):
-
-| Metric | Strata | Infernix | Change |
-|---|---:|---:|---:|
-| Average time to first token | 32.9 s (30.9-36.8) | **5.9 s** (5.5-6.2) | -82 % |
-| 90th-percentile time to first token | 67.8 s (62.0-75.1) | **13.3 s** (12.9-13.7) | -80 % |
-| Prompt tokens served from cache | 53.8 % | **84.6 %** | +31 points |
-| Prefill tok/s, requests with no cache hit | 1,423 | **5,879** | 4.1x |
-| Output tok/s, one request decoding | 86 (83-88) | **125** (121-128) | +45 % |
-| Output tok/s, at the run's own batching | 86 (83-88) | **143** (140-147) | +67 % |
-| Workload wall time | 22.3 min | **7.8 min** | -65 % |
-
-More single-GPU results, including Qwen3.8-27B against NInfer, are in
-[README.infernix.md](README.infernix.md#benchmarks).
-
 ### Quality
 
 Teacher-forced perplexity on three frozen texts (2,557 positions, INT8 KV, lower is better):
@@ -254,7 +219,7 @@ model `qwen3.8-flash-next`.
 - [docs/serving.md](docs/serving.md): server, APIs and every serving flag
 - [docs/cli.md](docs/cli.md): command line
 - [docs/qwen3_8-flash-next.md](docs/qwen3_8-flash-next.md): model guide, conversion and tuning
-- [README.infernix.md](README.infernix.md): the underlying Infernix engine and single-GPU benchmarks
+- [README.infernix.md](README.infernix.md): the underlying Infernix engine
 
 ## Credits and license
 
